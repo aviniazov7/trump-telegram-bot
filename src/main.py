@@ -3,8 +3,8 @@
 Trump Truth Social → Hebrew Telegram Bot
 
 Fetches Trump's latest posts from Truth Social (via trumpstruth.org RSS),
-translates them to Hebrew, and sends them to a Telegram chat with inline buttons.
-Also handles Telegram bot commands (/start, /recent, /help).
+translates them to Hebrew, and sends them to a Telegram chat.
+Includes bot menu with /start, /recent, /help commands.
 """
 
 from __future__ import annotations
@@ -114,6 +114,20 @@ def _xml_tag(text: str, tag: str) -> str:
     return ""
 
 
+def _is_meaningful_text(text: str) -> bool:
+    """Check if text has actual content (not just a URL or RT link)."""
+    cleaned = text.strip()
+    if not cleaned:
+        return False
+    # Skip posts that are only "RT: <url>" with no other content
+    if re.match(r"^RT:\s*https?://\S+$", cleaned):
+        return False
+    # Skip "[No Title]" placeholder posts
+    if cleaned.startswith("[No Title]"):
+        return False
+    return True
+
+
 def fetch_posts_trumpstruth() -> list[dict[str, Any]]:
     """Fetch posts from trumpstruth.org RSS feed (primary source)."""
     log.info("Fetching posts from trumpstruth.org RSS feed")
@@ -122,7 +136,7 @@ def fetch_posts_trumpstruth() -> list[dict[str, Any]]:
 
     posts: list[dict[str, Any]] = []
     items = re.findall(r"<item>(.*?)</item>", xml_text, re.DOTALL)
-    for item in items[:FETCH_LIMIT]:
+    for item in items:
         title = _xml_tag(item, "title")
         description = _xml_tag(item, "description")
         link = _xml_tag(item, "link") or _xml_tag(item, "guid")
@@ -131,10 +145,12 @@ def fetch_posts_trumpstruth() -> list[dict[str, Any]]:
         original_id = _xml_tag(item, "truth:originalId")
 
         text = strip_html(description or title or "")
-        if not text:
+
+        # Skip empty, RT-only, or placeholder posts
+        if not _is_meaningful_text(text):
+            log.debug("Skipping non-meaningful post: %s", original_id)
             continue
 
-        # Use original Truth Social ID if available, otherwise extract from link
         post_id = original_id or (link.rstrip("/").split("/")[-1] if link else "")
 
         posts.append({
@@ -144,6 +160,9 @@ def fetch_posts_trumpstruth() -> list[dict[str, Any]]:
             "url": original_url or link or "",
             "media_urls": [],
         })
+
+        if len(posts) >= FETCH_LIMIT:
+            break
 
     log.info("Fetched %d posts from trumpstruth.org", len(posts))
     return posts
@@ -155,11 +174,10 @@ def fetch_posts_cnn_archive() -> list[dict[str, Any]]:
     raw = http_get(CNN_ARCHIVE_JSON)
     data = json.loads(raw)
 
-    # CNN archive is a list of post objects, newest first
     posts: list[dict[str, Any]] = []
-    for item in data[:FETCH_LIMIT]:
+    for item in data:
         text = strip_html(item.get("content", "") or item.get("text", ""))
-        if not text:
+        if not _is_meaningful_text(text):
             continue
 
         post_id = str(item.get("id", ""))
@@ -180,13 +198,15 @@ def fetch_posts_cnn_archive() -> list[dict[str, Any]]:
             "media_urls": media_urls,
         })
 
+        if len(posts) >= FETCH_LIMIT:
+            break
+
     log.info("Fetched %d posts from CNN archive", len(posts))
     return posts
 
 
 def fetch_posts() -> list[dict[str, Any]]:
     """Fetch posts with fallback chain."""
-    # Primary: trumpstruth.org RSS
     try:
         posts = fetch_posts_trumpstruth()
         if posts:
@@ -194,7 +214,6 @@ def fetch_posts() -> list[dict[str, Any]]:
     except Exception as exc:
         log.warning("trumpstruth.org RSS failed: %s", exc)
 
-    # Fallback: CNN archive JSON
     try:
         posts = fetch_posts_cnn_archive()
         if posts:
@@ -231,7 +250,6 @@ def save_last_seen(post_id: str) -> None:
 def filter_new_posts(posts: list[dict[str, Any]], last_seen_id: str) -> list[dict[str, Any]]:
     """Return only posts newer than last_seen_id, oldest first."""
     if not last_seen_id:
-        # First run — return only the most recent post to avoid spamming
         log.info("First run — taking only the latest post")
         return posts[:1]
 
@@ -241,7 +259,6 @@ def filter_new_posts(posts: list[dict[str, Any]], last_seen_id: str) -> list[dic
             break
         new_posts.append(post)
 
-    # Return oldest first so messages arrive in chronological order
     new_posts.reverse()
     log.info("Found %d new posts", len(new_posts))
     return new_posts
@@ -306,7 +323,7 @@ def _split_text(text: str, max_len: int) -> list[str]:
     return chunks
 
 # ---------------------------------------------------------------------------
-# Telegram — messaging with inline buttons
+# Telegram
 # ---------------------------------------------------------------------------
 
 
@@ -315,49 +332,41 @@ def format_timestamp(date_str: str) -> str:
     if not date_str:
         return "—"
     try:
-        # Try RFC 2822 format (from RSS pubDate)
         dt = parsedate_to_datetime(date_str)
         israel = dt.astimezone(ISRAEL_TZ)
-        return israel.strftime("%d/%m/%Y %H:%M (Israel)")
+        return israel.strftime("%d/%m/%Y %H:%M")
     except Exception:
         pass
     try:
-        # Try ISO 8601 format
         dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
         israel = dt.astimezone(ISRAEL_TZ)
-        return israel.strftime("%d/%m/%Y %H:%M (Israel)")
+        return israel.strftime("%d/%m/%Y %H:%M")
     except (ValueError, TypeError):
         return date_str
 
 
 def build_message(post: dict[str, Any], hebrew: str) -> str:
-    """Build the Telegram message in HTML format."""
+    """Build the Telegram message in HTML format — English text + Hebrew translation."""
     original = html.escape(post["text"])
     translated = html.escape(hebrew)
     timestamp = format_timestamp(post["created_at"])
+    link = post.get("url", "")
 
-    return (
+    msg = (
         "🇺🇸 <b>טראמפ — פוסט חדש</b>\n"
+        f"🕐 {timestamp}\n"
         "\n"
-        f"📝 <b>מקור (אנגלית):</b>\n"
         f"{original}\n"
         "\n"
-        f"🇮🇱 <b>תרגום:</b>\n"
-        f"{translated}\n"
+        "━━━━━━━━━━━━━━━\n"
         "\n"
-        f"🕐 {timestamp}\n"
+        f"🇮🇱 <b>תרגום לעברית:</b>\n"
+        f"{translated}\n"
     )
+    if link:
+        msg += f'\n🔗 <a href="{html.escape(link)}">לפוסט המקורי</a>'
 
-
-def build_inline_keyboard(post_url: str) -> list[list[dict[str, str]]]:
-    """Build inline keyboard buttons for a post message."""
-    buttons: list[list[dict[str, str]]] = []
-    if post_url:
-        buttons.append([
-            {"text": "🔗 לפוסט המקורי", "url": post_url},
-            {"text": "📢 שתף", "url": f"https://t.me/share/url?url={urllib.parse.quote(post_url)}"},
-        ])
-    return buttons
+    return msg
 
 
 def send_telegram_message(
@@ -365,7 +374,7 @@ def send_telegram_message(
     chat_id: str | None = None,
     reply_markup: dict[str, Any] | None = None,
 ) -> bool:
-    """Send a message to the Telegram chat. Returns True on success."""
+    """Send a message to the Telegram chat."""
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN not set")
         return False
@@ -380,7 +389,7 @@ def send_telegram_message(
         "chat_id": target,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,
+        "disable_web_page_preview": True,
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -399,15 +408,36 @@ def send_telegram_message(
 
 
 def send_post_message(post: dict[str, Any], hebrew: str, chat_id: str | None = None) -> bool:
-    """Send a translated post with inline buttons."""
+    """Send a translated post."""
     message = build_message(post, hebrew)
-    keyboard = build_inline_keyboard(post.get("url", ""))
-    reply_markup = {"inline_keyboard": keyboard} if keyboard else None
-    return send_telegram_message(message, chat_id=chat_id, reply_markup=reply_markup)
+    return send_telegram_message(message, chat_id=chat_id)
+
+
+def setup_bot_commands() -> None:
+    """Set the bot's command menu via Telegram API."""
+    url = f"{TELEGRAM_API}/setMyCommands"
+    commands = [
+        {"command": "start", "description": "התחל — הודעת פתיחה"},
+        {"command": "recent", "description": "5 הפוסטים האחרונים של טראמפ"},
+        {"command": "help", "description": "עזרה"},
+    ]
+    try:
+        http_post(url, {"commands": commands})
+        log.info("Bot commands menu set successfully")
+    except Exception as exc:
+        log.warning("Failed to set bot commands: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Telegram — bot commands (/start, /recent, /help)
 # ---------------------------------------------------------------------------
+
+MENU_KEYBOARD = {
+    "keyboard": [
+        [{"text": "📋 פוסטים אחרונים"}, {"text": "❓ עזרה"}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
 
 
 def load_last_update_id() -> int:
@@ -441,7 +471,7 @@ def get_telegram_updates(offset: int = 0) -> list[dict[str, Any]]:
 
 
 def handle_start_command(chat_id: str) -> None:
-    """Handle /start command — send welcome message."""
+    """Handle /start command."""
     msg = (
         "🇺🇸🇮🇱 <b>ברוכים הבאים!</b>\n"
         "\n"
@@ -449,11 +479,11 @@ def handle_start_command(chat_id: str) -> None:
         "\n"
         "📬 פוסטים חדשים נשלחים אוטומטית כל 15 דקות.\n"
         "\n"
-        "<b>פקודות זמינות:</b>\n"
-        "/recent — 5 הפוסטים האחרונים\n"
-        "/help — עזרה\n"
+        "<b>פקודות:</b>\n"
+        "📋 <b>פוסטים אחרונים</b> — 5 הפוסטים האחרונים\n"
+        "❓ <b>עזרה</b> — מידע נוסף\n"
     )
-    send_telegram_message(msg, chat_id=chat_id)
+    send_telegram_message(msg, chat_id=chat_id, reply_markup=MENU_KEYBOARD)
 
 
 def handle_help_command(chat_id: str) -> None:
@@ -461,14 +491,17 @@ def handle_help_command(chat_id: str) -> None:
     msg = (
         "📖 <b>עזרה</b>\n"
         "\n"
-        "/start — הודעת פתיחה\n"
-        "/recent — 5 הפוסטים האחרונים של טראמפ (מתורגמים)\n"
-        "/help — ההודעה הזאת\n"
+        "📋 <b>פוסטים אחרונים</b> — 5 הפוסטים האחרונים של טראמפ (מתורגמים)\n"
+        "❓ <b>עזרה</b> — ההודעה הזאת\n"
         "\n"
         "📬 פוסטים חדשים נשלחים אוטומטית.\n"
         "⏱ הבוט בודק פוסטים חדשים כל 15 דקות.\n"
+        "\n"
+        "💡 אפשר גם להשתמש בפקודות:\n"
+        "/recent — פוסטים אחרונים\n"
+        "/help — עזרה\n"
     )
-    send_telegram_message(msg, chat_id=chat_id)
+    send_telegram_message(msg, chat_id=chat_id, reply_markup=MENU_KEYBOARD)
 
 
 def handle_recent_command(chat_id: str) -> None:
@@ -480,14 +513,13 @@ def handle_recent_command(chat_id: str) -> None:
         send_telegram_message("❌ לא הצלחתי להביא פוסטים כרגע. נסה שוב מאוחר יותר.", chat_id=chat_id)
         return
 
-    # Send up to 5 latest posts, oldest first
     recent = list(reversed(posts[:5]))
     for post in recent:
         hebrew = translate_to_hebrew(post["text"])
         send_post_message(post, hebrew, chat_id=chat_id)
         time.sleep(0.5)
 
-    send_telegram_message(f"✅ <b>{len(recent)} פוסטים אחרונים נשלחו</b>", chat_id=chat_id)
+    send_telegram_message(f"✅ <b>{len(recent)} פוסטים אחרונים</b>", chat_id=chat_id)
 
 
 def process_telegram_commands() -> None:
@@ -515,13 +547,14 @@ def process_telegram_commands() -> None:
         if not text or not chat_id:
             continue
 
-        command = text.split()[0].lower().split("@")[0]  # handle /start@botname
+        # Handle both /commands and button text
+        command = text.split()[0].lower().split("@")[0]
 
         if command == "/start":
             handle_start_command(chat_id)
-        elif command == "/recent":
+        elif command == "/recent" or text == "📋 פוסטים אחרונים":
             handle_recent_command(chat_id)
-        elif command == "/help":
+        elif command == "/help" or text == "❓ עזרה":
             handle_help_command(chat_id)
 
     if max_update_id > last_update_id:
@@ -537,7 +570,6 @@ def main() -> None:
     log.info("Trump Truth Social → Telegram Bot starting")
     log.info("=" * 60)
 
-    # Validate config
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN environment variable is not set")
         sys.exit(1)
@@ -545,19 +577,22 @@ def main() -> None:
         log.error("TELEGRAM_CHAT_ID environment variable is not set")
         sys.exit(1)
 
-    # Step 1: Process any pending bot commands (/start, /recent, /help)
+    # Set up bot command menu
+    setup_bot_commands()
+
+    # Process any pending bot commands
     process_telegram_commands()
 
-    # Step 2: Load last seen post
+    # Load last seen post
     last_seen_id = load_last_seen()
 
-    # Step 3: Fetch posts
+    # Fetch posts
     posts = fetch_posts()
     if not posts:
         log.info("No posts fetched — exiting")
         return
 
-    # Step 4: Filter new posts
+    # Filter new posts
     new_posts = filter_new_posts(posts, last_seen_id)
     if not new_posts:
         log.info("No new posts — exiting")
@@ -565,7 +600,7 @@ def main() -> None:
 
     log.info("Processing %d new post(s)", len(new_posts))
 
-    # Step 5: Translate and send each new post with inline buttons
+    # Translate and send each new post
     latest_id = ""
     for post in new_posts:
         log.info("Processing post %s", post["id"])
@@ -582,7 +617,7 @@ def main() -> None:
         if len(new_posts) > 1:
             time.sleep(1)
 
-    # Step 6: Update last seen
+    # Update last seen
     if latest_id:
         save_last_seen(latest_id)
 
