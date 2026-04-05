@@ -413,19 +413,28 @@ def send_post_message(post: dict[str, Any], hebrew: str, chat_id: str | None = N
     return send_telegram_message(message, chat_id=chat_id)
 
 
-def setup_bot_commands() -> None:
-    """Set the bot's command menu via Telegram API."""
-    url = f"{TELEGRAM_API}/setMyCommands"
+def setup_bot_menu() -> None:
+    """Set the bot's command menu and menu button via Telegram API."""
+    # Set commands list
     commands = [
-        {"command": "start", "description": "התחל — הודעת פתיחה"},
+        {"command": "start", "description": "תפריט ראשי"},
         {"command": "recent", "description": "5 הפוסטים האחרונים של טראמפ"},
         {"command": "help", "description": "עזרה"},
     ]
     try:
-        http_post(url, {"commands": commands})
-        log.info("Bot commands menu set successfully")
+        http_post(f"{TELEGRAM_API}/setMyCommands", {"commands": commands})
+        log.info("Bot commands set successfully")
     except Exception as exc:
         log.warning("Failed to set bot commands: %s", exc)
+
+    # Set the menu button to show commands
+    try:
+        http_post(f"{TELEGRAM_API}/setChatMenuButton", {
+            "menu_button": {"type": "commands"},
+        })
+        log.info("Bot menu button set successfully")
+    except Exception as exc:
+        log.warning("Failed to set menu button: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Telegram — bot commands (/start, /recent, /help)
@@ -577,8 +586,8 @@ def main() -> None:
         log.error("TELEGRAM_CHAT_ID environment variable is not set")
         sys.exit(1)
 
-    # Set up bot command menu
-    setup_bot_commands()
+    # Set up bot menu
+    setup_bot_menu()
 
     # Process any pending bot commands
     process_telegram_commands()
