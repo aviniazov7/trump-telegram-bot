@@ -30,6 +30,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/last_seen.txt
-          git diff --staged --quiet || git commit -m "🔄 Update last seen post"
+          git add data/last_seen.txt data/last_update_id.txt
+          git diff --staged --quiet || git commit -m "🔄 Update bot state"
           git push

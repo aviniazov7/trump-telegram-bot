@@ -2,8 +2,9 @@
 """
 Trump Truth Social → Hebrew Telegram Bot
 
-Fetches Trump's latest posts from Truth Social (Mastodon API),
-translates them to Hebrew, and sends them to a Telegram chat.
+Fetches Trump's latest posts from Truth Social (via trumpstruth.org RSS),
+translates them to Hebrew, and sends them to a Telegram chat with inline buttons.
+Also handles Telegram bot commands (/start, /recent, /help).
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,9 +28,9 @@ from typing import Any
 # Config
 # ---------------------------------------------------------------------------
 
-TRUMP_ACCOUNT_ID = "107780257626128497"
-TRUTH_SOCIAL_API = f"https://truthsocial.com/api/v1/accounts/{TRUMP_ACCOUNT_ID}/statuses"
 TRUTH_SOCIAL_PROFILE = "https://truthsocial.com/@realDonaldTrump"
+TRUMPSTRUTH_RSS = "https://www.trumpstruth.org/feed"
+CNN_ARCHIVE_JSON = "https://ix.cnn.io/data/truth-social/truth_archive.json"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -36,12 +38,13 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LAST_SEEN_FILE = DATA_DIR / "last_seen.txt"
+LAST_UPDATE_ID_FILE = DATA_DIR / "last_update_id.txt"
 
 ISRAEL_TZ = timezone(timedelta(hours=3))
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
-FETCH_LIMIT = 5
+FETCH_LIMIT = 10
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -90,7 +93,7 @@ def http_post(url: str, data: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError(f"Failed to POST {url} after {MAX_RETRIES} attempts")
 
 # ---------------------------------------------------------------------------
-# Truth Social — fetch posts
+# Fetch posts — trumpstruth.org RSS (primary) + CNN JSON (fallback)
 # ---------------------------------------------------------------------------
 
 
@@ -101,38 +104,73 @@ def strip_html(text: str) -> str:
     return html.unescape(text).strip()
 
 
-def fetch_posts_mastodon_api() -> list[dict[str, Any]]:
-    """Fetch posts via Truth Social's Mastodon-compatible API."""
-    url = f"{TRUTH_SOCIAL_API}?limit={FETCH_LIMIT}&exclude_replies=true&exclude_reblogs=false"
-    log.info("Fetching posts from Mastodon API: %s", url)
-    headers = {"Accept": "application/json", "User-Agent": "TrumpTelegramBot/1.0"}
-    raw = http_get(url, headers=headers)
-    statuses = json.loads(raw)
+def _xml_tag(text: str, tag: str) -> str:
+    """Extract text content of an XML tag (supports namespaced tags)."""
+    m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", text, re.DOTALL)
+    if m:
+        content = m.group(1).strip()
+        cdata = re.match(r"<!\[CDATA\[(.*?)\]\]>", content, re.DOTALL)
+        return cdata.group(1) if cdata else content
+    return ""
+
+
+def fetch_posts_trumpstruth() -> list[dict[str, Any]]:
+    """Fetch posts from trumpstruth.org RSS feed (primary source)."""
+    log.info("Fetching posts from trumpstruth.org RSS feed")
+    raw = http_get(TRUMPSTRUTH_RSS)
+    xml_text = raw.decode("utf-8")
 
     posts: list[dict[str, Any]] = []
-    for s in statuses:
-        content = s.get("content", "")
-        text = strip_html(content)
+    items = re.findall(r"<item>(.*?)</item>", xml_text, re.DOTALL)
+    for item in items[:FETCH_LIMIT]:
+        title = _xml_tag(item, "title")
+        description = _xml_tag(item, "description")
+        link = _xml_tag(item, "link") or _xml_tag(item, "guid")
+        pub_date = _xml_tag(item, "pubDate")
+        original_url = _xml_tag(item, "truth:originalUrl") or link
+        original_id = _xml_tag(item, "truth:originalId")
 
-        # Handle reblogs (re-truths)
-        reblog = s.get("reblog")
-        if reblog:
-            reblog_text = strip_html(reblog.get("content", ""))
-            reblog_author = reblog.get("account", {}).get("display_name", "Unknown")
-            text = f"🔁 Re-Truth from {reblog_author}:\n{reblog_text}"
-
+        text = strip_html(description or title or "")
         if not text:
             continue
 
-        post_id = s["id"]
-        created = s.get("created_at", "")
-        post_url = s.get("url") or f"{TRUTH_SOCIAL_PROFILE}/{post_id}"
+        # Use original Truth Social ID if available, otherwise extract from link
+        post_id = original_id or (link.rstrip("/").split("/")[-1] if link else "")
+
+        posts.append({
+            "id": post_id,
+            "text": text,
+            "created_at": pub_date or "",
+            "url": original_url or link or "",
+            "media_urls": [],
+        })
+
+    log.info("Fetched %d posts from trumpstruth.org", len(posts))
+    return posts
+
+
+def fetch_posts_cnn_archive() -> list[dict[str, Any]]:
+    """Fallback: fetch posts from CNN's Truth Social archive JSON."""
+    log.info("Fetching posts from CNN archive (fallback)")
+    raw = http_get(CNN_ARCHIVE_JSON)
+    data = json.loads(raw)
+
+    # CNN archive is a list of post objects, newest first
+    posts: list[dict[str, Any]] = []
+    for item in data[:FETCH_LIMIT]:
+        text = strip_html(item.get("content", "") or item.get("text", ""))
+        if not text:
+            continue
+
+        post_id = str(item.get("id", ""))
+        created = item.get("created_at", "")
+        post_url = f"{TRUTH_SOCIAL_PROFILE}/{post_id}" if post_id else ""
 
         media_urls: list[str] = []
-        for att in s.get("media_attachments", []):
-            media_url = att.get("url") or att.get("remote_url")
-            if media_url:
-                media_urls.append(media_url)
+        for att in item.get("media_attachments", []):
+            url = att.get("url") or att.get("remote_url")
+            if url:
+                media_urls.append(url)
 
         posts.append({
             "id": post_id,
@@ -142,83 +180,27 @@ def fetch_posts_mastodon_api() -> list[dict[str, Any]]:
             "media_urls": media_urls,
         })
 
-    log.info("Fetched %d posts from Mastodon API", len(posts))
+    log.info("Fetched %d posts from CNN archive", len(posts))
     return posts
-
-
-def fetch_posts_rss() -> list[dict[str, Any]]:
-    """Fallback: fetch posts via RSS (if available)."""
-    rss_urls = [
-        f"https://truthsocial.com/@realDonaldTrump.rss",
-        f"https://rsshub.app/truthsocial/user/realDonaldTrump",
-    ]
-    for rss_url in rss_urls:
-        try:
-            log.info("Trying RSS feed: %s", rss_url)
-            raw = http_get(rss_url)
-            return parse_rss(raw.decode("utf-8"))
-        except Exception as exc:
-            log.warning("RSS feed %s failed: %s", rss_url, exc)
-    return []
-
-
-def parse_rss(xml_text: str) -> list[dict[str, Any]]:
-    """Minimal RSS XML parser using stdlib."""
-    posts: list[dict[str, Any]] = []
-    items = re.findall(r"<item>(.*?)</item>", xml_text, re.DOTALL)
-    for item in items[:FETCH_LIMIT]:
-        title = _xml_tag(item, "title")
-        description = _xml_tag(item, "description")
-        link = _xml_tag(item, "link") or _xml_tag(item, "guid")
-        pub_date = _xml_tag(item, "pubDate")
-
-        text = strip_html(description or title or "")
-        if not text:
-            continue
-
-        # Try to extract an ID from the link
-        post_id = link.rstrip("/").split("/")[-1] if link else ""
-
-        posts.append({
-            "id": post_id,
-            "text": text,
-            "created_at": pub_date or "",
-            "url": link or "",
-            "media_urls": [],
-        })
-
-    log.info("Parsed %d posts from RSS", len(posts))
-    return posts
-
-
-def _xml_tag(text: str, tag: str) -> str:
-    """Extract text content of an XML tag."""
-    m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", text, re.DOTALL)
-    if m:
-        content = m.group(1).strip()
-        # Handle CDATA
-        cdata = re.match(r"<!\[CDATA\[(.*?)\]\]>", content, re.DOTALL)
-        return cdata.group(1) if cdata else content
-    return ""
 
 
 def fetch_posts() -> list[dict[str, Any]]:
     """Fetch posts with fallback chain."""
-    # Try Mastodon API first
+    # Primary: trumpstruth.org RSS
     try:
-        posts = fetch_posts_mastodon_api()
+        posts = fetch_posts_trumpstruth()
         if posts:
             return posts
     except Exception as exc:
-        log.warning("Mastodon API failed: %s", exc)
+        log.warning("trumpstruth.org RSS failed: %s", exc)
 
-    # Fallback to RSS
+    # Fallback: CNN archive JSON
     try:
-        posts = fetch_posts_rss()
+        posts = fetch_posts_cnn_archive()
         if posts:
             return posts
     except Exception as exc:
-        log.warning("RSS fallback failed: %s", exc)
+        log.warning("CNN archive fallback failed: %s", exc)
 
     log.error("All fetch methods failed")
     return []
@@ -269,7 +251,7 @@ def filter_new_posts(posts: list[dict[str, Any]], last_seen_id: str) -> list[dic
 # ---------------------------------------------------------------------------
 
 TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
-MAX_TRANSLATE_CHUNK = 4500  # characters per request
+MAX_TRANSLATE_CHUNK = 4500
 
 
 def translate_to_hebrew(text: str) -> str:
@@ -277,7 +259,6 @@ def translate_to_hebrew(text: str) -> str:
     if not text.strip():
         return text
 
-    # Split long text into chunks
     chunks = _split_text(text, MAX_TRANSLATE_CHUNK)
     translated_parts: list[str] = []
 
@@ -294,12 +275,11 @@ def translate_to_hebrew(text: str) -> str:
         try:
             raw = http_get(url)
             result = json.loads(raw)
-            # result[0] is a list of [translated_segment, original_segment, ...]
             translated = "".join(seg[0] for seg in result[0] if seg[0])
             translated_parts.append(translated)
         except Exception as exc:
             log.warning("Translation failed for chunk: %s", exc)
-            translated_parts.append(chunk)  # fallback to original
+            translated_parts.append(chunk)
 
     return "".join(translated_parts)
 
@@ -314,7 +294,6 @@ def _split_text(text: str, max_len: int) -> list[str]:
         if len(text) <= max_len:
             chunks.append(text)
             break
-        # Try to split at a newline or period
         cut = text.rfind("\n", 0, max_len)
         if cut < max_len // 2:
             cut = text.rfind(". ", 0, max_len)
@@ -327,21 +306,28 @@ def _split_text(text: str, max_len: int) -> list[str]:
     return chunks
 
 # ---------------------------------------------------------------------------
-# Telegram
+# Telegram — messaging with inline buttons
 # ---------------------------------------------------------------------------
 
 
-def format_timestamp(iso_str: str) -> str:
-    """Convert ISO timestamp to Israel time display string."""
-    if not iso_str:
+def format_timestamp(date_str: str) -> str:
+    """Convert date string to Israel time display string."""
+    if not date_str:
         return "—"
     try:
-        # Truth Social uses ISO 8601 format
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        # Try RFC 2822 format (from RSS pubDate)
+        dt = parsedate_to_datetime(date_str)
+        israel = dt.astimezone(ISRAEL_TZ)
+        return israel.strftime("%d/%m/%Y %H:%M (Israel)")
+    except Exception:
+        pass
+    try:
+        # Try ISO 8601 format
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
         israel = dt.astimezone(ISRAEL_TZ)
         return israel.strftime("%d/%m/%Y %H:%M (Israel)")
     except (ValueError, TypeError):
-        return iso_str
+        return date_str
 
 
 def build_message(post: dict[str, Any], hebrew: str) -> str:
@@ -349,38 +335,55 @@ def build_message(post: dict[str, Any], hebrew: str) -> str:
     original = html.escape(post["text"])
     translated = html.escape(hebrew)
     timestamp = format_timestamp(post["created_at"])
-    link = post.get("url", "")
 
-    msg = (
+    return (
         "🇺🇸 <b>טראמפ — פוסט חדש</b>\n"
         "\n"
-        "📝 <b>מקור (אנגלית):</b>\n"
+        f"📝 <b>מקור (אנגלית):</b>\n"
         f"{original}\n"
         "\n"
-        "🇮🇱 <b>תרגום:</b>\n"
+        f"🇮🇱 <b>תרגום:</b>\n"
         f"{translated}\n"
         "\n"
         f"🕐 {timestamp}\n"
     )
-    if link:
-        msg += f'🔗 <a href="{html.escape(link)}">לפוסט המקורי</a>\n'
-
-    return msg
 
 
-def send_telegram_message(text: str) -> bool:
+def build_inline_keyboard(post_url: str) -> list[list[dict[str, str]]]:
+    """Build inline keyboard buttons for a post message."""
+    buttons: list[list[dict[str, str]]] = []
+    if post_url:
+        buttons.append([
+            {"text": "🔗 לפוסט המקורי", "url": post_url},
+            {"text": "📢 שתף", "url": f"https://t.me/share/url?url={urllib.parse.quote(post_url)}"},
+        ])
+    return buttons
+
+
+def send_telegram_message(
+    text: str,
+    chat_id: str | None = None,
+    reply_markup: dict[str, Any] | None = None,
+) -> bool:
     """Send a message to the Telegram chat. Returns True on success."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
+    if not TELEGRAM_BOT_TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN not set")
+        return False
+
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not target:
+        log.error("No chat_id provided")
         return False
 
     url = f"{TELEGRAM_API}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+    payload: dict[str, Any] = {
+        "chat_id": target,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
     try:
         result = http_post(url, payload)
@@ -395,25 +398,134 @@ def send_telegram_message(text: str) -> bool:
         return False
 
 
-def send_telegram_photo(photo_url: str, caption: str) -> bool:
-    """Send a photo to the Telegram chat."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
+def send_post_message(post: dict[str, Any], hebrew: str, chat_id: str | None = None) -> bool:
+    """Send a translated post with inline buttons."""
+    message = build_message(post, hebrew)
+    keyboard = build_inline_keyboard(post.get("url", ""))
+    reply_markup = {"inline_keyboard": keyboard} if keyboard else None
+    return send_telegram_message(message, chat_id=chat_id, reply_markup=reply_markup)
 
-    url = f"{TELEGRAM_API}/sendPhoto"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "photo": photo_url,
-        "caption": caption[:1024],  # Telegram caption limit
-        "parse_mode": "HTML",
-    }
+# ---------------------------------------------------------------------------
+# Telegram — bot commands (/start, /recent, /help)
+# ---------------------------------------------------------------------------
 
+
+def load_last_update_id() -> int:
+    """Load the last processed Telegram update ID."""
+    if LAST_UPDATE_ID_FILE.exists():
+        content = LAST_UPDATE_ID_FILE.read_text().strip()
+        if content.isdigit():
+            return int(content)
+    return 0
+
+
+def save_last_update_id(update_id: int) -> None:
+    """Save the last processed Telegram update ID."""
+    LAST_UPDATE_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LAST_UPDATE_ID_FILE.write_text(str(update_id) + "\n")
+
+
+def get_telegram_updates(offset: int = 0) -> list[dict[str, Any]]:
+    """Fetch new updates from Telegram Bot API."""
+    url = f"{TELEGRAM_API}/getUpdates"
+    params: dict[str, Any] = {"timeout": 0, "limit": 20}
+    if offset:
+        params["offset"] = offset
     try:
-        result = http_post(url, payload)
-        return bool(result.get("ok"))
+        result = http_post(url, params)
+        if result.get("ok"):
+            return result.get("result", [])
     except Exception as exc:
-        log.error("Failed to send Telegram photo: %s", exc)
-        return False
+        log.warning("Failed to get Telegram updates: %s", exc)
+    return []
+
+
+def handle_start_command(chat_id: str) -> None:
+    """Handle /start command — send welcome message."""
+    msg = (
+        "🇺🇸🇮🇱 <b>ברוכים הבאים!</b>\n"
+        "\n"
+        "אני בוט שמתרגם את הפוסטים של דונלד טראמפ מ-Truth Social לעברית.\n"
+        "\n"
+        "📬 פוסטים חדשים נשלחים אוטומטית כל 15 דקות.\n"
+        "\n"
+        "<b>פקודות זמינות:</b>\n"
+        "/recent — 5 הפוסטים האחרונים\n"
+        "/help — עזרה\n"
+    )
+    send_telegram_message(msg, chat_id=chat_id)
+
+
+def handle_help_command(chat_id: str) -> None:
+    """Handle /help command."""
+    msg = (
+        "📖 <b>עזרה</b>\n"
+        "\n"
+        "/start — הודעת פתיחה\n"
+        "/recent — 5 הפוסטים האחרונים של טראמפ (מתורגמים)\n"
+        "/help — ההודעה הזאת\n"
+        "\n"
+        "📬 פוסטים חדשים נשלחים אוטומטית.\n"
+        "⏱ הבוט בודק פוסטים חדשים כל 15 דקות.\n"
+    )
+    send_telegram_message(msg, chat_id=chat_id)
+
+
+def handle_recent_command(chat_id: str) -> None:
+    """Handle /recent command — send last 5 posts translated."""
+    send_telegram_message("⏳ <b>מביא את הפוסטים האחרונים...</b>", chat_id=chat_id)
+
+    posts = fetch_posts()
+    if not posts:
+        send_telegram_message("❌ לא הצלחתי להביא פוסטים כרגע. נסה שוב מאוחר יותר.", chat_id=chat_id)
+        return
+
+    # Send up to 5 latest posts, oldest first
+    recent = list(reversed(posts[:5]))
+    for post in recent:
+        hebrew = translate_to_hebrew(post["text"])
+        send_post_message(post, hebrew, chat_id=chat_id)
+        time.sleep(0.5)
+
+    send_telegram_message(f"✅ <b>{len(recent)} פוסטים אחרונים נשלחו</b>", chat_id=chat_id)
+
+
+def process_telegram_commands() -> None:
+    """Check for and process pending Telegram bot commands."""
+    log.info("Checking for Telegram bot commands...")
+    last_update_id = load_last_update_id()
+    offset = last_update_id + 1 if last_update_id else 0
+
+    updates = get_telegram_updates(offset=offset)
+    if not updates:
+        log.info("No new commands")
+        return
+
+    log.info("Processing %d Telegram update(s)", len(updates))
+    max_update_id = last_update_id
+
+    for update in updates:
+        update_id = update.get("update_id", 0)
+        max_update_id = max(max_update_id, update_id)
+
+        message = update.get("message", {})
+        text = message.get("text", "").strip()
+        chat_id = str(message.get("chat", {}).get("id", ""))
+
+        if not text or not chat_id:
+            continue
+
+        command = text.split()[0].lower().split("@")[0]  # handle /start@botname
+
+        if command == "/start":
+            handle_start_command(chat_id)
+        elif command == "/recent":
+            handle_recent_command(chat_id)
+        elif command == "/help":
+            handle_help_command(chat_id)
+
+    if max_update_id > last_update_id:
+        save_last_update_id(max_update_id)
 
 # ---------------------------------------------------------------------------
 # Main pipeline
@@ -433,16 +545,19 @@ def main() -> None:
         log.error("TELEGRAM_CHAT_ID environment variable is not set")
         sys.exit(1)
 
-    # Step 1: Load last seen
+    # Step 1: Process any pending bot commands (/start, /recent, /help)
+    process_telegram_commands()
+
+    # Step 2: Load last seen post
     last_seen_id = load_last_seen()
 
-    # Step 2: Fetch posts
+    # Step 3: Fetch posts
     posts = fetch_posts()
     if not posts:
         log.info("No posts fetched — exiting")
         return
 
-    # Step 3: Filter new posts
+    # Step 4: Filter new posts
     new_posts = filter_new_posts(posts, last_seen_id)
     if not new_posts:
         log.info("No new posts — exiting")
@@ -450,22 +565,13 @@ def main() -> None:
 
     log.info("Processing %d new post(s)", len(new_posts))
 
-    # Step 4: Translate and send each new post
+    # Step 5: Translate and send each new post with inline buttons
     latest_id = ""
     for post in new_posts:
         log.info("Processing post %s", post["id"])
 
-        # Translate
         hebrew = translate_to_hebrew(post["text"])
-
-        # Build and send message
-        message = build_message(post, hebrew)
-        success = send_telegram_message(message)
-
-        # Send media if present
-        if success and post.get("media_urls"):
-            for media_url in post["media_urls"]:
-                send_telegram_photo(media_url, "📸 מדיה מצורפת")
+        success = send_post_message(post, hebrew)
 
         if success:
             latest_id = post["id"]
@@ -473,11 +579,10 @@ def main() -> None:
             log.warning("Failed to send post %s — stopping to avoid gaps", post["id"])
             break
 
-        # Brief delay between messages
         if len(new_posts) > 1:
             time.sleep(1)
 
-    # Step 5: Update last seen
+    # Step 6: Update last seen
     if latest_id:
         save_last_seen(latest_id)
 
