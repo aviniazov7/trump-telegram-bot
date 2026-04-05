@@ -98,10 +98,22 @@ def http_post(url: str, data: dict[str, Any]) -> dict[str, Any]:
 
 
 def strip_html(text: str) -> str:
-    """Remove HTML tags and decode entities."""
+    """Remove HTML tags and decode entities, clean up URLs."""
     text = re.sub(r"<br\s*/?>", "\n", text)
+    # Add space before closing tags to prevent text merging
+    text = re.sub(r"</a>", " ", text)
+    text = re.sub(r"</p>", "\n", text)
+    # Remove all remaining HTML tags
     text = re.sub(r"<[^>]+>", "", text)
-    return html.unescape(text).strip()
+    text = html.unescape(text)
+    # Remove standalone URLs (RT: https://... patterns)
+    text = re.sub(r"RT:\s*https?://\S+\s*", "", text)
+    # Remove any remaining standalone URLs
+    text = re.sub(r"https?://\S+", "", text)
+    # Clean up extra whitespace
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"  +", " ", text)
+    return text.strip()
 
 
 def _xml_tag(text: str, tag: str) -> str:
