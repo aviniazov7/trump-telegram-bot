@@ -564,8 +564,14 @@ def process_telegram_commands() -> None:
         message = update.get("message", {})
         text = message.get("text", "").strip()
         chat_id = str(message.get("chat", {}).get("id", ""))
+        user_id = str(message.get("from", {}).get("id", ""))
 
         if not text or not chat_id:
+            continue
+
+        # Only the owner (TELEGRAM_CHAT_ID) may interact with the bot.
+        if chat_id != TELEGRAM_CHAT_ID and user_id != TELEGRAM_CHAT_ID:
+            log.warning("Ignoring unauthorized request from chat=%s user=%s", chat_id, user_id)
             continue
 
         # Handle both /commands and button text
