@@ -67,7 +67,7 @@ def http_get(url: str, headers: dict[str, str] | None = None) -> bytes:
     req = urllib.request.Request(url, headers=headers or {})
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 return resp.read()
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             log.warning("GET %s attempt %d/%d failed: %s", url, attempt, MAX_RETRIES, exc)
@@ -84,7 +84,7 @@ def http_post(url: str, data: dict[str, Any]) -> dict[str, Any]:
     )
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 return json.loads(resp.read())
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             log.warning("POST %s attempt %d/%d failed: %s", url, attempt, MAX_RETRIES, exc)
@@ -564,8 +564,14 @@ def process_telegram_commands() -> None:
         message = update.get("message", {})
         text = message.get("text", "").strip()
         chat_id = str(message.get("chat", {}).get("id", ""))
+        user_id = str(message.get("from", {}).get("id", ""))
 
         if not text or not chat_id:
+            continue
+
+        # Only the owner (TELEGRAM_CHAT_ID) may interact with the bot.
+        if chat_id != TELEGRAM_CHAT_ID and user_id != TELEGRAM_CHAT_ID:
+            log.warning("Ignoring unauthorized request from chat=%s user=%s", chat_id, user_id)
             continue
 
         # Handle both /commands and button text
