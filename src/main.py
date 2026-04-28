@@ -67,7 +67,7 @@ def http_get(url: str, headers: dict[str, str] | None = None) -> bytes:
     req = urllib.request.Request(url, headers=headers or {})
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 return resp.read()
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             log.warning("GET %s attempt %d/%d failed: %s", url, attempt, MAX_RETRIES, exc)
@@ -84,7 +84,7 @@ def http_post(url: str, data: dict[str, Any]) -> dict[str, Any]:
     )
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 return json.loads(resp.read())
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             log.warning("POST %s attempt %d/%d failed: %s", url, attempt, MAX_RETRIES, exc)
