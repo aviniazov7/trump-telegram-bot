@@ -23,6 +23,7 @@ from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Config
@@ -40,11 +41,28 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LAST_SEEN_FILE = DATA_DIR / "last_seen.txt"
 LAST_UPDATE_ID_FILE = DATA_DIR / "last_update_id.txt"
 
-ISRAEL_TZ = timezone(timedelta(hours=3))
+# Use Asia/Jerusalem so Israel DST (UTC+2 winter / UTC+3 summer) is correct.
+ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
-MAX_RETRIES = 3
-RETRY_DELAY = 5  # seconds
+MAX_RETRIES = 2
+RETRY_DELAY = 2  # seconds
 FETCH_LIMIT = 10
+HTTP_TIMEOUT = 15  # seconds per request
+
+# Telegram caps text messages at 4096 chars; leave a small margin for safety.
+TELEGRAM_MAX_MESSAGE_LEN = 4000
+
+# Hard wall-clock budget for the whole run, so a slow upstream can't hold the
+# job past the next cron tick. The workflow timeout is the outer safety net.
+SCRIPT_BUDGET_SECONDS = 10 * 60
+
+DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; trump-telegram-bot/1.0)"
+
+_script_deadline: float | None = None
+
+
+def _budget_exceeded() -> bool:
+    return _script_deadline is not None and time.monotonic() > _script_deadline
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -62,35 +80,52 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def http_get(url: str, headers: dict[str, str] | None = None) -> bytes:
-    """GET request with retries."""
-    req = urllib.request.Request(url, headers=headers or {})
-    for attempt in range(1, MAX_RETRIES + 1):
+def http_get(
+    url: str,
+    headers: dict[str, str] | None = None,
+    retries: int = MAX_RETRIES,
+) -> bytes:
+    """GET request with bounded retries and a default User-Agent."""
+    merged = {"User-Agent": DEFAULT_USER_AGENT}
+    if headers:
+        merged.update(headers)
+    req = urllib.request.Request(url, headers=merged)
+    for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                 return resp.read()
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-            log.warning("GET %s attempt %d/%d failed: %s", url, attempt, MAX_RETRIES, exc)
-            if attempt < MAX_RETRIES:
+            log.warning("GET %s attempt %d/%d failed: %s", url, attempt, retries, exc)
+            if attempt < retries:
                 time.sleep(RETRY_DELAY * attempt)
-    raise RuntimeError(f"Failed to GET {url} after {MAX_RETRIES} attempts")
+    raise RuntimeError(f"Failed to GET {url} after {retries} attempts")
 
 
-def http_post(url: str, data: dict[str, Any]) -> dict[str, Any]:
-    """POST JSON request with retries."""
+def http_post(
+    url: str,
+    data: dict[str, Any],
+    retries: int = MAX_RETRIES,
+) -> dict[str, Any]:
+    """POST JSON request with bounded retries."""
     body = json.dumps(data).encode()
     req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": DEFAULT_USER_AGENT,
+        },
+        method="POST",
     )
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                 return json.loads(resp.read())
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-            log.warning("POST %s attempt %d/%d failed: %s", url, attempt, MAX_RETRIES, exc)
-            if attempt < MAX_RETRIES:
+            log.warning("POST %s attempt %d/%d failed: %s", url, attempt, retries, exc)
+            if attempt < retries:
                 time.sleep(RETRY_DELAY * attempt)
-    raise RuntimeError(f"Failed to POST {url} after {MAX_RETRIES} attempts")
+    raise RuntimeError(f"Failed to POST {url} after {retries} attempts")
 
 # ---------------------------------------------------------------------------
 # Fetch posts — trumpstruth.org RSS (primary) + CNN JSON (fallback)
@@ -260,9 +295,23 @@ def save_last_seen(post_id: str) -> None:
 
 
 def filter_new_posts(posts: list[dict[str, Any]], last_seen_id: str) -> list[dict[str, Any]]:
-    """Return only posts newer than last_seen_id, oldest first."""
+    """Return only posts newer than last_seen_id, oldest first.
+
+    If last_seen_id isn't found in the fetched window we assume the bot was
+    offline long enough that it scrolled out — treat it like a first run and
+    only send the most recent post, instead of spamming everything we got.
+    """
     if not last_seen_id:
         log.info("First run — taking only the latest post")
+        return posts[:1]
+
+    found = any(post["id"] == last_seen_id for post in posts)
+    if not found:
+        log.warning(
+            "last_seen_id %s not in fetched window of %d posts — sending only the latest to avoid spam",
+            last_seen_id,
+            len(posts),
+        )
         return posts[:1]
 
     new_posts: list[dict[str, Any]] = []
@@ -302,7 +351,9 @@ def translate_to_hebrew(text: str) -> str:
         url = f"{TRANSLATE_URL}?{params}"
 
         try:
-            raw = http_get(url)
+            # No retries on translation: if Google blocks/throttles we'd burn
+            # the script budget waiting. Fall back to the original text instead.
+            raw = http_get(url, retries=1)
             result = json.loads(raw)
             translated = "".join(seg[0] for seg in result[0] if seg[0])
             translated_parts.append(translated)
@@ -343,18 +394,24 @@ def format_timestamp(date_str: str) -> str:
     """Convert date string to Israel time display string."""
     if not date_str:
         return "—"
-    try:
-        dt = parsedate_to_datetime(date_str)
-        israel = dt.astimezone(ISRAEL_TZ)
-        return israel.strftime("%d/%m/%Y %H:%M")
-    except Exception:
-        pass
-    try:
-        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-        israel = dt.astimezone(ISRAEL_TZ)
-        return israel.strftime("%d/%m/%Y %H:%M")
-    except (ValueError, TypeError):
-        return date_str
+    for parser in (parsedate_to_datetime, _parse_iso):
+        try:
+            dt = parser(date_str)
+        except (ValueError, TypeError):
+            continue
+        if dt is None:
+            continue
+        # Treat tz-naive timestamps as UTC. Without this, astimezone() would
+        # interpret them in the host's local timezone, which on GitHub Actions
+        # happens to be UTC but is not guaranteed.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ISRAEL_TZ).strftime("%d/%m/%Y %H:%M")
+    return date_str
+
+
+def _parse_iso(date_str: str) -> datetime:
+    return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
 
 
 def build_message(post: dict[str, Any], hebrew: str) -> str:
@@ -381,12 +438,37 @@ def build_message(post: dict[str, Any], hebrew: str) -> str:
     return msg
 
 
+def _split_for_telegram(text: str, max_len: int = TELEGRAM_MAX_MESSAGE_LEN) -> list[str]:
+    """Split a message at newline boundaries so each chunk fits Telegram's limit.
+
+    Splits only at '\\n' (and falls back to spaces) to avoid breaking HTML tags
+    or multi-byte characters. build_message keeps every <b>/<a> tag on a single
+    line, so newline splits preserve well-formed HTML.
+    """
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > max_len:
+        cut = remaining.rfind("\n", 0, max_len)
+        if cut <= 0:
+            cut = remaining.rfind(" ", 0, max_len)
+        if cut <= 0:
+            cut = max_len
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def send_telegram_message(
     text: str,
     chat_id: str | None = None,
     reply_markup: dict[str, Any] | None = None,
 ) -> bool:
-    """Send a message to the Telegram chat."""
+    """Send a message to the Telegram chat, splitting if it exceeds 4096 chars."""
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN not set")
         return False
@@ -397,26 +479,32 @@ def send_telegram_message(
         return False
 
     url = f"{TELEGRAM_API}/sendMessage"
-    payload: dict[str, Any] = {
-        "chat_id": target,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
+    chunks = _split_for_telegram(text)
 
-    try:
-        result = http_post(url, payload)
-        if result.get("ok"):
-            log.info("Telegram message sent successfully")
-            return True
-        else:
-            log.error("Telegram API error: %s", result)
+    for i, chunk in enumerate(chunks):
+        payload: dict[str, Any] = {
+            "chat_id": target,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        # Attach reply_markup only to the final chunk so the keyboard appears
+        # once per logical message.
+        if reply_markup and i == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
+
+        try:
+            result = http_post(url, payload)
+        except Exception as exc:
+            log.error("Failed to send Telegram message (chunk %d/%d): %s", i + 1, len(chunks), exc)
             return False
-    except Exception as exc:
-        log.error("Failed to send Telegram message: %s", exc)
-        return False
+
+        if not result.get("ok"):
+            log.error("Telegram API error (chunk %d/%d): %s", i + 1, len(chunks), result)
+            return False
+
+    log.info("Telegram message sent successfully (%d chunk(s))", len(chunks))
+    return True
 
 
 def send_post_message(post: dict[str, Any], hebrew: str, chat_id: str | None = None) -> bool:
@@ -477,15 +565,17 @@ def save_last_update_id(update_id: int) -> None:
 
 
 def get_telegram_updates(offset: int = 0) -> list[dict[str, Any]]:
-    """Fetch new updates from Telegram Bot API."""
-    url = f"{TELEGRAM_API}/getUpdates"
+    """Fetch new updates from Telegram Bot API (short poll)."""
     params: dict[str, Any] = {"timeout": 0, "limit": 20}
     if offset:
         params["offset"] = offset
+    url = f"{TELEGRAM_API}/getUpdates?{urllib.parse.urlencode(params)}"
     try:
-        result = http_post(url, params)
+        raw = http_get(url)
+        result = json.loads(raw)
         if result.get("ok"):
             return result.get("result", [])
+        log.warning("Telegram getUpdates returned not-ok: %s", result)
     except Exception as exc:
         log.warning("Failed to get Telegram updates: %s", exc)
     return []
@@ -536,6 +626,9 @@ def handle_recent_command(chat_id: str) -> None:
 
     recent = list(reversed(posts[:5]))
     for post in recent:
+        if _budget_exceeded():
+            log.warning("Budget exceeded inside /recent — stopping early")
+            break
         hebrew = translate_to_hebrew(post["text"])
         send_post_message(post, hebrew, chat_id=chat_id)
         time.sleep(0.5)
@@ -593,6 +686,9 @@ def process_telegram_commands() -> None:
 
 
 def main() -> None:
+    global _script_deadline
+    _script_deadline = time.monotonic() + SCRIPT_BUDGET_SECONDS
+
     log.info("=" * 60)
     log.info("Trump Truth Social → Telegram Bot starting")
     log.info("=" * 60)
@@ -609,6 +705,10 @@ def main() -> None:
 
     # Process any pending bot commands
     process_telegram_commands()
+
+    if _budget_exceeded():
+        log.warning("Budget exceeded after handling bot commands — exiting")
+        return
 
     # Load last seen post
     last_seen_id = load_last_seen()
@@ -630,6 +730,10 @@ def main() -> None:
     # Translate and send each new post
     latest_id = ""
     for post in new_posts:
+        if _budget_exceeded():
+            log.warning("Budget exceeded — stopping at post %s to avoid overlapping next cron", post["id"])
+            break
+
         log.info("Processing post %s", post["id"])
 
         hebrew = translate_to_hebrew(post["text"])
