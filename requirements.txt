@@ -1,2 +1,3 @@
-# No external dependencies — uses Python stdlib only
-# (urllib, json, html, re, logging, datetime, pathlib)
+# No external dependencies — uses Python stdlib only.
+# Modules used: urllib, json, html, re, logging, datetime, pathlib, zoneinfo.
+# Requires Python 3.9+ (zoneinfo is stdlib from 3.9 onwards).
