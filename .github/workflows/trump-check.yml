@@ -8,10 +8,16 @@ on:
 permissions:
   contents: write             # Needed to commit last_seen.txt updates
 
+# Prevent overlapping runs: a hung or slow run must not race the next cron tick
+# on data/last_seen.txt or push. Queue new runs instead of cancelling.
+concurrency:
+  group: trump-bot
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
