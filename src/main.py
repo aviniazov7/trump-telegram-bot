@@ -43,6 +43,7 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LAST_SEEN_FILE = DATA_DIR / "last_seen.txt"
 LAST_UPDATE_ID_FILE = DATA_DIR / "last_update_id.txt"
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.txt"
+POSTS_LOG_FILE = DATA_DIR / "posts_log.txt"
 
 # Use Asia/Jerusalem so Israel DST (UTC+2 winter / UTC+3 summer) is correct.
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -393,10 +394,10 @@ def _split_text(text: str, max_len: int) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def format_timestamp(date_str: str) -> str:
-    """Convert date string to Israel time display string."""
+def _parse_post_date(date_str: str) -> datetime | None:
+    """Parse a date string from either RFC-2822 or ISO-8601, returning UTC-aware."""
     if not date_str:
-        return "—"
+        return None
     for parser in (parsedate_to_datetime, _parse_iso):
         try:
             dt = parser(date_str)
@@ -409,8 +410,16 @@ def format_timestamp(date_str: str) -> str:
         # happens to be UTC but is not guaranteed.
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(ISRAEL_TZ).strftime("%d/%m/%Y %H:%M")
-    return date_str
+        return dt
+    return None
+
+
+def format_timestamp(date_str: str) -> str:
+    """Convert date string to Israel time display string."""
+    dt = _parse_post_date(date_str)
+    if dt is None:
+        return date_str or "—"
+    return dt.astimezone(ISRAEL_TZ).strftime("%d/%m/%Y %H:%M")
 
 
 def _parse_iso(date_str: str) -> datetime:
@@ -511,26 +520,104 @@ def send_post_message(post: dict[str, Any], hebrew: str, chat_id: str) -> bool:
     return send_telegram_message(message, chat_id=chat_id)
 
 
-def clear_bot_menu() -> None:
-    """Clear the bot's command menu so users have no slash commands.
+def setup_bot_menu() -> None:
+    """Expose only /stats in the bot's slash-command menu.
 
-    The bot is broadcast-only — only /start works (and only in private chats).
-    Clearing the commands list and resetting the menu button removes the
-    visible "/" menu UI from clients.
+    /start works too but is intentionally hidden — users discover it from
+    the t.me/<bot> link, not from a menu they could click in a group.
     """
+    commands = [
+        {"command": "stats", "description": "סטטיסטיקת ציוצים אחרונים"},
+    ]
     try:
-        http_post(f"{TELEGRAM_API}/setMyCommands", {"commands": []})
-        log.info("Cleared bot commands list")
+        http_post(f"{TELEGRAM_API}/setMyCommands", {"commands": commands})
+        log.info("Bot commands set: /stats")
     except Exception as exc:
-        log.warning("Failed to clear bot commands: %s", exc)
+        log.warning("Failed to set bot commands: %s", exc)
 
     try:
         http_post(f"{TELEGRAM_API}/setChatMenuButton", {
-            "menu_button": {"type": "default"},
+            "menu_button": {"type": "commands"},
         })
-        log.info("Reset bot menu button to default")
+        log.info("Bot menu button set to commands")
     except Exception as exc:
-        log.warning("Failed to reset menu button: %s", exc)
+        log.warning("Failed to set menu button: %s", exc)
+
+# ---------------------------------------------------------------------------
+# Posts log — every broadcast post is appended for /stats
+# ---------------------------------------------------------------------------
+
+
+def log_sent_post(post: dict[str, Any]) -> None:
+    """Append a post entry (ISO timestamp + id) to the posts log."""
+    POSTS_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Prefer the post's own created_at so a long catch-up after downtime
+    # doesn't bunch everything into "today".
+    dt = _parse_post_date(post.get("created_at", "")) or datetime.now(timezone.utc)
+    iso = dt.astimezone(timezone.utc).isoformat()
+    with POSTS_LOG_FILE.open("a") as f:
+        f.write(f"{iso}\t{post.get('id', '')}\n")
+
+
+def _count_posts_in_windows() -> tuple[int, int, int, int, datetime | None]:
+    """Return (day, week, month, total, earliest_dt) post counts from the log."""
+    if not POSTS_LOG_FILE.exists():
+        return 0, 0, 0, 0, None
+
+    now = datetime.now(timezone.utc)
+    day_ago = now - timedelta(days=1)
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+
+    day_count = week_count = month_count = total = 0
+    earliest: datetime | None = None
+
+    for line in POSTS_LOG_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        iso = line.split("\t", 1)[0]
+        try:
+            ts = datetime.fromisoformat(iso)
+        except ValueError:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        total += 1
+        if earliest is None or ts < earliest:
+            earliest = ts
+        if ts >= day_ago:
+            day_count += 1
+        if ts >= week_ago:
+            week_count += 1
+        if ts >= month_ago:
+            month_count += 1
+
+    return day_count, week_count, month_count, total, earliest
+
+
+def handle_stats_command(chat_id: str) -> None:
+    """Reply with post counts in the last 24h / 7d / 30d windows."""
+    day_count, week_count, month_count, total, earliest = _count_posts_in_windows()
+    if total == 0:
+        send_telegram_message(
+            "📊 עדיין לא נאספו נתונים. נסה שוב בעוד כמה שעות.",
+            chat_id=chat_id,
+        )
+        return
+
+    earliest_str = earliest.astimezone(ISRAEL_TZ).strftime("%d/%m/%Y") if earliest else "—"
+    msg = (
+        "📊 <b>סטטיסטיקות הציוצים של טראמפ</b>\n"
+        "\n"
+        f"📅 ב-24 שעות האחרונות: <b>{day_count}</b>\n"
+        f"📆 בשבוע האחרון: <b>{week_count}</b>\n"
+        f"🗓 בחודש האחרון: <b>{month_count}</b>\n"
+        "\n"
+        f"🗂 סה״כ ציוצים שתועדו: <b>{total}</b>\n"
+        f"📍 מעקב החל מ-{earliest_str}"
+    )
+    send_telegram_message(msg, chat_id=chat_id)
 
 # ---------------------------------------------------------------------------
 # Subscribers — anyone who /start's the bot or adds it to a group/channel
@@ -637,6 +724,7 @@ def send_welcome(chat_id: str, chat_type: str) -> None:
             "אני שולח את הפוסטים של דונלד טראמפ מ-Truth Social, מתורגמים לעברית.\n"
             "\n"
             "📬 כל פוסט חדש יישלח אליך אוטומטית.\n"
+            "📊 שלח /stats לסטטיסטיקה של ציוצים אחרונים.\n"
             "\n"
             "💡 אפשר גם להוסיף אותי לקבוצה או לערוץ."
         )
@@ -685,9 +773,9 @@ def process_telegram_commands() -> None:
                 remove_subscriber(chat_id)
             continue
 
-        # Incoming message. Only /start in a private chat does anything —
-        # it subscribes the user and sends the welcome. All other text
-        # (including any slash command in a group/channel) is ignored.
+        # Incoming message. Slash commands are honored only in private chats
+        # (/start to subscribe, /stats for post counts). In groups/channels
+        # the bot is broadcast-only — every message is ignored silently.
         message = update.get("message", {})
         text = (message.get("text") or "").strip()
         chat = message.get("chat", {})
@@ -706,6 +794,8 @@ def process_telegram_commands() -> None:
                 send_welcome(chat_id, chat_type)
                 if not newly_added:
                     log.info("Existing subscriber re-/start'd: %s", chat_id)
+            elif command == "/stats":
+                handle_stats_command(chat_id)
 
     if max_update_id > last_update_id:
         save_last_update_id(max_update_id)
@@ -727,8 +817,8 @@ def main() -> None:
         log.error("TELEGRAM_BOT_TOKEN environment variable is not set")
         sys.exit(1)
 
-    # Make sure no slash-command menu is exposed to users.
-    clear_bot_menu()
+    # Make sure the /stats command is visible in the menu.
+    setup_bot_menu()
 
     # Pick up new subscribers / kicks before broadcasting this round's posts.
     process_telegram_commands()
@@ -783,6 +873,7 @@ def main() -> None:
 
         if delivered > 0:
             latest_id = post["id"]
+            log_sent_post(post)
         else:
             log.warning("Failed to deliver post %s to any subscriber — stopping to retry next run", post["id"])
             break
