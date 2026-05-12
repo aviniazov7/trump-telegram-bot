@@ -475,9 +475,21 @@ def _split_for_telegram(text: str, max_len: int = TELEGRAM_MAX_MESSAGE_LEN) -> l
     return chunks
 
 
+STATS_BUTTON_TEXT = "📊 סטטיסטיקה"
+
+# Reply keyboard for private chats — a single persistent button that
+# triggers /stats without exposing a slash-command menu.
+STATS_KEYBOARD: dict[str, Any] = {
+    "keyboard": [[{"text": STATS_BUTTON_TEXT}]],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+
+
 def send_telegram_message(
     text: str,
     chat_id: str | None = None,
+    reply_markup: dict[str, Any] | None = None,
 ) -> bool:
     """Send a message to the Telegram chat, splitting if it exceeds 4096 chars."""
     if not TELEGRAM_BOT_TOKEN:
@@ -499,6 +511,10 @@ def send_telegram_message(
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        # Attach reply_markup only to the final chunk so the keyboard
+        # appears once per logical message.
+        if reply_markup and i == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
 
         try:
             result = http_post(url, payload)
@@ -521,27 +537,22 @@ def send_post_message(post: dict[str, Any], hebrew: str, chat_id: str) -> bool:
 
 
 def setup_bot_menu() -> None:
-    """Expose only /stats in the bot's slash-command menu.
-
-    /start works too but is intentionally hidden — users discover it from
-    the t.me/<bot> link, not from a menu they could click in a group.
+    """Keep the slash-command menu cleared — users interact via the reply
+    keyboard button (📊 סטטיסטיקה) attached to /start and /stats responses.
     """
-    commands = [
-        {"command": "stats", "description": "סטטיסטיקת ציוצים אחרונים"},
-    ]
     try:
-        http_post(f"{TELEGRAM_API}/setMyCommands", {"commands": commands})
-        log.info("Bot commands set: /stats")
+        http_post(f"{TELEGRAM_API}/setMyCommands", {"commands": []})
+        log.info("Cleared bot commands list")
     except Exception as exc:
-        log.warning("Failed to set bot commands: %s", exc)
+        log.warning("Failed to clear bot commands: %s", exc)
 
     try:
         http_post(f"{TELEGRAM_API}/setChatMenuButton", {
-            "menu_button": {"type": "commands"},
+            "menu_button": {"type": "default"},
         })
-        log.info("Bot menu button set to commands")
+        log.info("Reset bot menu button to default")
     except Exception as exc:
-        log.warning("Failed to set menu button: %s", exc)
+        log.warning("Failed to reset menu button: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Posts log — every broadcast post is appended for /stats
@@ -603,6 +614,7 @@ def handle_stats_command(chat_id: str) -> None:
         send_telegram_message(
             "📊 עדיין לא נאספו נתונים. נסה שוב בעוד כמה שעות.",
             chat_id=chat_id,
+            reply_markup=STATS_KEYBOARD,
         )
         return
 
@@ -617,7 +629,7 @@ def handle_stats_command(chat_id: str) -> None:
         f"🗂 סה״כ ציוצים שתועדו: <b>{total}</b>\n"
         f"📍 מעקב החל מ-{earliest_str}"
     )
-    send_telegram_message(msg, chat_id=chat_id)
+    send_telegram_message(msg, chat_id=chat_id, reply_markup=STATS_KEYBOARD)
 
 # ---------------------------------------------------------------------------
 # Subscribers — anyone who /start's the bot or adds it to a group/channel
@@ -724,18 +736,18 @@ def send_welcome(chat_id: str, chat_type: str) -> None:
             "אני שולח את הפוסטים של דונלד טראמפ מ-Truth Social, מתורגמים לעברית.\n"
             "\n"
             "📬 כל פוסט חדש יישלח אליך אוטומטית.\n"
-            "📊 שלח /stats לסטטיסטיקה של ציוצים אחרונים.\n"
+            f"📊 לחץ על הכפתור <b>{STATS_BUTTON_TEXT}</b> למטה לסטטיסטיקה.\n"
             "\n"
             "💡 אפשר גם להוסיף אותי לקבוצה או לערוץ."
         )
-    elif chat_type in ("group", "supergroup"):
+        send_telegram_message(msg, chat_id=chat_id, reply_markup=STATS_KEYBOARD)
+        return
+    if chat_type in ("group", "supergroup"):
         msg = (
             "🇺🇸🇮🇱 <b>שלום!</b>\n"
             "אני אשלח לקבוצה הזאת את הפוסטים של טראמפ מתורגמים לעברית, אוטומטית."
         )
-    else:
-        return
-    send_telegram_message(msg, chat_id=chat_id)
+        send_telegram_message(msg, chat_id=chat_id)
 
 
 def process_telegram_commands() -> None:
@@ -794,7 +806,7 @@ def process_telegram_commands() -> None:
                 send_welcome(chat_id, chat_type)
                 if not newly_added:
                     log.info("Existing subscriber re-/start'd: %s", chat_id)
-            elif command == "/stats":
+            elif command == "/stats" or text == STATS_BUTTON_TEXT:
                 handle_stats_command(chat_id)
 
     if max_update_id > last_update_id:
