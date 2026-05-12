@@ -3,8 +3,10 @@
 Trump Truth Social → Hebrew Telegram Bot
 
 Fetches Trump's latest posts from Truth Social (via trumpstruth.org RSS),
-translates them to Hebrew, and sends them to a Telegram chat.
-Includes bot menu with /start, /recent, /help commands.
+translates them to Hebrew, and broadcasts them to every subscriber
+(private chats, groups, and channels that have added the bot).
+The bot is broadcast-only: /start subscribes a private chat, being added
+to a group/channel subscribes it, and all other messages are ignored.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LAST_SEEN_FILE = DATA_DIR / "last_seen.txt"
 LAST_UPDATE_ID_FILE = DATA_DIR / "last_update_id.txt"
+SUBSCRIBERS_FILE = DATA_DIR / "subscribers.txt"
 
 # Use Asia/Jerusalem so Israel DST (UTC+2 winter / UTC+3 summer) is correct.
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -466,14 +469,13 @@ def _split_for_telegram(text: str, max_len: int = TELEGRAM_MAX_MESSAGE_LEN) -> l
 def send_telegram_message(
     text: str,
     chat_id: str | None = None,
-    reply_markup: dict[str, Any] | None = None,
 ) -> bool:
     """Send a message to the Telegram chat, splitting if it exceeds 4096 chars."""
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN not set")
         return False
 
-    target = chat_id or TELEGRAM_CHAT_ID
+    target = chat_id
     if not target:
         log.error("No chat_id provided")
         return False
@@ -488,10 +490,6 @@ def send_telegram_message(
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
-        # Attach reply_markup only to the final chunk so the keyboard appears
-        # once per logical message.
-        if reply_markup and i == len(chunks) - 1:
-            payload["reply_markup"] = reply_markup
 
         try:
             result = http_post(url, payload)
@@ -503,50 +501,90 @@ def send_telegram_message(
             log.error("Telegram API error (chunk %d/%d): %s", i + 1, len(chunks), result)
             return False
 
-    log.info("Telegram message sent successfully (%d chunk(s))", len(chunks))
+    log.info("Telegram message sent successfully to %s (%d chunk(s))", target, len(chunks))
     return True
 
 
-def send_post_message(post: dict[str, Any], hebrew: str, chat_id: str | None = None) -> bool:
-    """Send a translated post."""
+def send_post_message(post: dict[str, Any], hebrew: str, chat_id: str) -> bool:
+    """Send a translated post to a specific chat."""
     message = build_message(post, hebrew)
     return send_telegram_message(message, chat_id=chat_id)
 
 
-def setup_bot_menu() -> None:
-    """Set the bot's command menu and menu button via Telegram API."""
-    # Set commands list
-    commands = [
-        {"command": "start", "description": "תפריט ראשי"},
-        {"command": "recent", "description": "5 הפוסטים האחרונים של טראמפ"},
-        {"command": "help", "description": "עזרה"},
-    ]
-    try:
-        http_post(f"{TELEGRAM_API}/setMyCommands", {"commands": commands})
-        log.info("Bot commands set successfully")
-    except Exception as exc:
-        log.warning("Failed to set bot commands: %s", exc)
+def clear_bot_menu() -> None:
+    """Clear the bot's command menu so users have no slash commands.
 
-    # Set the menu button to show commands
+    The bot is broadcast-only — only /start works (and only in private chats).
+    Clearing the commands list and resetting the menu button removes the
+    visible "/" menu UI from clients.
+    """
+    try:
+        http_post(f"{TELEGRAM_API}/setMyCommands", {"commands": []})
+        log.info("Cleared bot commands list")
+    except Exception as exc:
+        log.warning("Failed to clear bot commands: %s", exc)
+
     try:
         http_post(f"{TELEGRAM_API}/setChatMenuButton", {
-            "menu_button": {"type": "commands"},
+            "menu_button": {"type": "default"},
         })
-        log.info("Bot menu button set successfully")
+        log.info("Reset bot menu button to default")
     except Exception as exc:
-        log.warning("Failed to set menu button: %s", exc)
+        log.warning("Failed to reset menu button: %s", exc)
 
 # ---------------------------------------------------------------------------
-# Telegram — bot commands (/start, /recent, /help)
+# Subscribers — anyone who /start's the bot or adds it to a group/channel
 # ---------------------------------------------------------------------------
 
-MENU_KEYBOARD = {
-    "keyboard": [
-        [{"text": "📋 פוסטים אחרונים"}, {"text": "❓ עזרה"}],
-    ],
-    "resize_keyboard": True,
-    "is_persistent": True,
-}
+
+def load_subscribers() -> set[str]:
+    """Load the set of subscriber chat IDs (private chats, groups, channels)."""
+    subscribers: set[str] = set()
+    if SUBSCRIBERS_FILE.exists():
+        for line in SUBSCRIBERS_FILE.read_text().splitlines():
+            chat_id = line.strip()
+            if chat_id:
+                subscribers.add(chat_id)
+    # Seed with the configured owner so existing deployments keep receiving
+    # posts even before they /start the bot from scratch.
+    if TELEGRAM_CHAT_ID:
+        subscribers.add(TELEGRAM_CHAT_ID)
+    return subscribers
+
+
+def save_subscribers(subscribers: set[str]) -> None:
+    SUBSCRIBERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    content = "\n".join(sorted(subscribers))
+    if content:
+        content += "\n"
+    SUBSCRIBERS_FILE.write_text(content)
+
+
+def add_subscriber(chat_id: str) -> bool:
+    """Add a chat to the subscribers list. Returns True if newly added."""
+    if not chat_id:
+        return False
+    subscribers = load_subscribers()
+    if chat_id in subscribers:
+        return False
+    subscribers.add(chat_id)
+    save_subscribers(subscribers)
+    log.info("New subscriber: %s (total: %d)", chat_id, len(subscribers))
+    return True
+
+
+def remove_subscriber(chat_id: str) -> None:
+    if not chat_id:
+        return
+    subscribers = load_subscribers()
+    if chat_id in subscribers:
+        subscribers.discard(chat_id)
+        save_subscribers(subscribers)
+        log.info("Removed subscriber: %s (total: %d)", chat_id, len(subscribers))
+
+# ---------------------------------------------------------------------------
+# Telegram — incoming updates (only /start subscribes; everything else ignored)
+# ---------------------------------------------------------------------------
 
 
 def load_last_update_id() -> int:
@@ -565,8 +603,17 @@ def save_last_update_id(update_id: int) -> None:
 
 
 def get_telegram_updates(offset: int = 0) -> list[dict[str, Any]]:
-    """Fetch new updates from Telegram Bot API (short poll)."""
-    params: dict[str, Any] = {"timeout": 0, "limit": 20}
+    """Fetch new updates from Telegram Bot API (short poll).
+
+    Explicitly requests `my_chat_member` updates so we learn when the bot is
+    added to or removed from groups/channels — those updates aren't included
+    in the default `getUpdates` set.
+    """
+    params: dict[str, Any] = {
+        "timeout": 0,
+        "limit": 50,
+        "allowed_updates": json.dumps(["message", "my_chat_member"]),
+    }
     if offset:
         params["offset"] = offset
     url = f"{TELEGRAM_API}/getUpdates?{urllib.parse.urlencode(params)}"
@@ -581,70 +628,40 @@ def get_telegram_updates(offset: int = 0) -> list[dict[str, Any]]:
     return []
 
 
-def handle_start_command(chat_id: str) -> None:
-    """Handle /start command."""
-    msg = (
-        "🇺🇸🇮🇱 <b>ברוכים הבאים!</b>\n"
-        "\n"
-        "אני בוט שמתרגם את הפוסטים של דונלד טראמפ מ-Truth Social לעברית.\n"
-        "\n"
-        "📬 פוסטים חדשים נשלחים אוטומטית כל 15 דקות.\n"
-        "\n"
-        "<b>פקודות:</b>\n"
-        "📋 <b>פוסטים אחרונים</b> — 5 הפוסטים האחרונים\n"
-        "❓ <b>עזרה</b> — מידע נוסף\n"
-    )
-    send_telegram_message(msg, chat_id=chat_id, reply_markup=MENU_KEYBOARD)
-
-
-def handle_help_command(chat_id: str) -> None:
-    """Handle /help command."""
-    msg = (
-        "📖 <b>עזרה</b>\n"
-        "\n"
-        "📋 <b>פוסטים אחרונים</b> — 5 הפוסטים האחרונים של טראמפ (מתורגמים)\n"
-        "❓ <b>עזרה</b> — ההודעה הזאת\n"
-        "\n"
-        "📬 פוסטים חדשים נשלחים אוטומטית.\n"
-        "⏱ הבוט בודק פוסטים חדשים כל 15 דקות.\n"
-        "\n"
-        "💡 אפשר גם להשתמש בפקודות:\n"
-        "/recent — פוסטים אחרונים\n"
-        "/help — עזרה\n"
-    )
-    send_telegram_message(msg, chat_id=chat_id, reply_markup=MENU_KEYBOARD)
-
-
-def handle_recent_command(chat_id: str) -> None:
-    """Handle /recent command — send last 5 posts translated."""
-    send_telegram_message("⏳ <b>מביא את הפוסטים האחרונים...</b>", chat_id=chat_id)
-
-    posts = fetch_posts()
-    if not posts:
-        send_telegram_message("❌ לא הצלחתי להביא פוסטים כרגע. נסה שוב מאוחר יותר.", chat_id=chat_id)
+def send_welcome(chat_id: str, chat_type: str) -> None:
+    """Send a one-time welcome when a chat first subscribes."""
+    if chat_type == "private":
+        msg = (
+            "🇺🇸🇮🇱 <b>ברוכים הבאים!</b>\n"
+            "\n"
+            "אני שולח את הפוסטים של דונלד טראמפ מ-Truth Social, מתורגמים לעברית.\n"
+            "\n"
+            "📬 כל פוסט חדש יישלח אליך אוטומטית.\n"
+            "\n"
+            "💡 אפשר גם להוסיף אותי לקבוצה או לערוץ."
+        )
+    elif chat_type in ("group", "supergroup"):
+        msg = (
+            "🇺🇸🇮🇱 <b>שלום!</b>\n"
+            "אני אשלח לקבוצה הזאת את הפוסטים של טראמפ מתורגמים לעברית, אוטומטית."
+        )
+    else:
         return
-
-    recent = list(reversed(posts[:5]))
-    for post in recent:
-        if _budget_exceeded():
-            log.warning("Budget exceeded inside /recent — stopping early")
-            break
-        hebrew = translate_to_hebrew(post["text"])
-        send_post_message(post, hebrew, chat_id=chat_id)
-        time.sleep(0.5)
-
-    send_telegram_message(f"✅ <b>{len(recent)} פוסטים אחרונים</b>", chat_id=chat_id)
+    send_telegram_message(msg, chat_id=chat_id)
 
 
 def process_telegram_commands() -> None:
-    """Check for and process pending Telegram bot commands."""
-    log.info("Checking for Telegram bot commands...")
+    """Handle incoming updates — subscribe on /start or when added to a chat.
+
+    Everything else is ignored silently: the bot is broadcast-only.
+    """
+    log.info("Checking for Telegram updates...")
     last_update_id = load_last_update_id()
     offset = last_update_id + 1 if last_update_id else 0
 
     updates = get_telegram_updates(offset=offset)
     if not updates:
-        log.info("No new commands")
+        log.info("No new updates")
         return
 
     log.info("Processing %d Telegram update(s)", len(updates))
@@ -654,28 +671,41 @@ def process_telegram_commands() -> None:
         update_id = update.get("update_id", 0)
         max_update_id = max(max_update_id, update_id)
 
+        # Bot was added to / removed from a chat (private, group, or channel).
+        my_chat_member = update.get("my_chat_member")
+        if my_chat_member:
+            chat = my_chat_member.get("chat", {})
+            chat_id = str(chat.get("id", ""))
+            chat_type = chat.get("type", "")
+            new_status = my_chat_member.get("new_chat_member", {}).get("status", "")
+            if new_status in ("member", "administrator", "creator"):
+                if add_subscriber(chat_id):
+                    send_welcome(chat_id, chat_type)
+            elif new_status in ("kicked", "left", "restricted"):
+                remove_subscriber(chat_id)
+            continue
+
+        # Incoming message. Only /start in a private chat does anything —
+        # it subscribes the user and sends the welcome. All other text
+        # (including any slash command in a group/channel) is ignored.
         message = update.get("message", {})
-        text = message.get("text", "").strip()
-        chat_id = str(message.get("chat", {}).get("id", ""))
-        user_id = str(message.get("from", {}).get("id", ""))
+        text = (message.get("text") or "").strip()
+        chat = message.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+        chat_type = chat.get("type", "")
 
-        if not text or not chat_id:
+        if not chat_id:
             continue
 
-        # Only the owner (TELEGRAM_CHAT_ID) may interact with the bot.
-        if chat_id != TELEGRAM_CHAT_ID and user_id != TELEGRAM_CHAT_ID:
-            log.warning("Ignoring unauthorized request from chat=%s user=%s", chat_id, user_id)
-            continue
-
-        # Handle both /commands and button text
-        command = text.split()[0].lower().split("@")[0]
-
-        if command == "/start":
-            handle_start_command(chat_id)
-        elif command == "/recent" or text == "📋 פוסטים אחרונים":
-            handle_recent_command(chat_id)
-        elif command == "/help" or text == "❓ עזרה":
-            handle_help_command(chat_id)
+        if chat_type == "private" and text:
+            command = text.split()[0].lower().split("@")[0]
+            if command == "/start":
+                newly_added = add_subscriber(chat_id)
+                # Always send welcome on /start, even for returning users —
+                # it confirms the bot is alive and they're subscribed.
+                send_welcome(chat_id, chat_type)
+                if not newly_added:
+                    log.info("Existing subscriber re-/start'd: %s", chat_id)
 
     if max_update_id > last_update_id:
         save_last_update_id(max_update_id)
@@ -696,18 +726,20 @@ def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN environment variable is not set")
         sys.exit(1)
-    if not TELEGRAM_CHAT_ID:
-        log.error("TELEGRAM_CHAT_ID environment variable is not set")
-        sys.exit(1)
 
-    # Set up bot menu
-    setup_bot_menu()
+    # Make sure no slash-command menu is exposed to users.
+    clear_bot_menu()
 
-    # Process any pending bot commands
+    # Pick up new subscribers / kicks before broadcasting this round's posts.
     process_telegram_commands()
 
     if _budget_exceeded():
         log.warning("Budget exceeded after handling bot commands — exiting")
+        return
+
+    subscribers = load_subscribers()
+    if not subscribers:
+        log.info("No subscribers yet — nothing to broadcast")
         return
 
     # Load last seen post
@@ -725,9 +757,9 @@ def main() -> None:
         log.info("No new posts — exiting")
         return
 
-    log.info("Processing %d new post(s)", len(new_posts))
+    log.info("Broadcasting %d new post(s) to %d subscriber(s)", len(new_posts), len(subscribers))
 
-    # Translate and send each new post
+    # Translate and broadcast each new post to every subscriber.
     latest_id = ""
     for post in new_posts:
         if _budget_exceeded():
@@ -735,14 +767,24 @@ def main() -> None:
             break
 
         log.info("Processing post %s", post["id"])
-
         hebrew = translate_to_hebrew(post["text"])
-        success = send_post_message(post, hebrew)
+        message = build_message(post, hebrew)
 
-        if success:
+        delivered = 0
+        for sub_chat_id in sorted(subscribers):
+            if _budget_exceeded():
+                log.warning("Budget exceeded mid-broadcast — stopping")
+                break
+            if send_telegram_message(message, chat_id=sub_chat_id):
+                delivered += 1
+            # Telegram broadcast rate limit is ~30 msgs/sec; small gap keeps
+            # us well under that even with many subscribers.
+            time.sleep(0.05)
+
+        if delivered > 0:
             latest_id = post["id"]
         else:
-            log.warning("Failed to send post %s — stopping to avoid gaps", post["id"])
+            log.warning("Failed to deliver post %s to any subscriber — stopping to retry next run", post["id"])
             break
 
         if len(new_posts) > 1:
