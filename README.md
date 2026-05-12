@@ -2,7 +2,7 @@
 
 Fetches Donald Trump's latest posts from Truth Social, translates them to
 Hebrew, and broadcasts them to every subscriber. Runs on GitHub Actions
-every 15 minutes, uses the Python standard library only.
+every 10 minutes, uses the Python standard library only.
 
 The bot is **broadcast-only**:
 - Anyone can `/start` the bot in a private chat to subscribe.
@@ -21,7 +21,7 @@ The bot is **broadcast-only**:
      initial subscriber so you start receiving posts before anyone else
      subscribes.
 3. **Enable GitHub Actions** for the repository. The workflow will run
-   automatically every 15 minutes; you can also trigger it manually from
+   automatically every 10 minutes; you can also trigger it manually from
    *Actions → Trump Truth Social Check → Run workflow*.
 4. **Subscribe** — open a chat with the bot and send `/start`, or add the
    bot to a group / channel (as admin, for channels).
