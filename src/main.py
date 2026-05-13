@@ -684,7 +684,7 @@ def send_welcome(chat_id: str, chat_type: str, thread_id: str | None = None) -> 
             "📬 כל פוסט חדש יישלח אליך אוטומטית.\n"
             "\n"
             "💡 אפשר גם להוסיף אותי לקבוצה או לערוץ. כדי שאשלח לנושא ספציפי\n"
-            "בקבוצה — שלח /start בתוך הנושא הרצוי."
+            "בקבוצה — שלח /trumphere בתוך הנושא הרצוי."
         )
         # Strip any legacy reply keyboard a returning user may still have stuck.
         send_telegram_message(msg, chat_id=chat_id, reply_markup=REMOVE_KEYBOARD)
@@ -700,7 +700,7 @@ def send_welcome(chat_id: str, chat_type: str, thread_id: str | None = None) -> 
                 "🇺🇸🇮🇱 <b>שלום!</b>\n"
                 "אני אשלח לקבוצה הזאת את הפוסטים של טראמפ מתורגמים לעברית, אוטומטית.\n"
                 "\n"
-                "💡 אם תרצה שאשלח לנושא ספציפי — שלח /start בתוך הנושא הרצוי."
+                "💡 אם תרצה שאשלח לנושא ספציפי — שלח /trumphere בתוך הנושא הרצוי."
             )
         send_telegram_message(msg, chat_id=chat_id, thread_id=thread_id)
 
@@ -762,7 +762,9 @@ def process_telegram_commands() -> None:
             continue
 
         command = text.split()[0].lower().split("@")[0]
-        if command != "/start":
+        # /trumphere is a unique alias that avoids conflicts with other bots
+        # in a group that also respond to /start.
+        if command not in ("/start", "/trumphere"):
             continue
 
         if chat_type == "private":
