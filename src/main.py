@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -43,7 +43,6 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LAST_SEEN_FILE = DATA_DIR / "last_seen.txt"
 LAST_UPDATE_ID_FILE = DATA_DIR / "last_update_id.txt"
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.txt"
-POSTS_LOG_FILE = DATA_DIR / "posts_log.txt"
 
 # Use Asia/Jerusalem so Israel DST (UTC+2 winter / UTC+3 summer) is correct.
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -475,15 +474,9 @@ def _split_for_telegram(text: str, max_len: int = TELEGRAM_MAX_MESSAGE_LEN) -> l
     return chunks
 
 
-STATS_BUTTON_TEXT = "📊 סטטיסטיקה"
-
-# Reply keyboard for private chats — a single persistent button that
-# triggers /stats without exposing a slash-command menu.
-STATS_KEYBOARD: dict[str, Any] = {
-    "keyboard": [[{"text": STATS_BUTTON_TEXT}]],
-    "resize_keyboard": True,
-    "is_persistent": True,
-}
+# Removing a possibly-stuck legacy reply keyboard requires sending an empty
+# reply_markup with remove_keyboard=true. We attach this once on /start.
+REMOVE_KEYBOARD: dict[str, Any] = {"remove_keyboard": True}
 
 
 def send_telegram_message(
@@ -536,10 +529,8 @@ def send_post_message(post: dict[str, Any], hebrew: str, chat_id: str) -> bool:
     return send_telegram_message(message, chat_id=chat_id)
 
 
-def setup_bot_menu() -> None:
-    """Keep the slash-command menu cleared — users interact via the reply
-    keyboard button (📊 סטטיסטיקה) attached to /start and /stats responses.
-    """
+def clear_bot_menu() -> None:
+    """Clear the bot's slash-command menu so no commands are exposed."""
     try:
         http_post(f"{TELEGRAM_API}/setMyCommands", {"commands": []})
         log.info("Cleared bot commands list")
@@ -553,83 +544,6 @@ def setup_bot_menu() -> None:
         log.info("Reset bot menu button to default")
     except Exception as exc:
         log.warning("Failed to reset menu button: %s", exc)
-
-# ---------------------------------------------------------------------------
-# Posts log — every broadcast post is appended for /stats
-# ---------------------------------------------------------------------------
-
-
-def log_sent_post(post: dict[str, Any]) -> None:
-    """Append a post entry (ISO timestamp + id) to the posts log."""
-    POSTS_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # Prefer the post's own created_at so a long catch-up after downtime
-    # doesn't bunch everything into "today".
-    dt = _parse_post_date(post.get("created_at", "")) or datetime.now(timezone.utc)
-    iso = dt.astimezone(timezone.utc).isoformat()
-    with POSTS_LOG_FILE.open("a") as f:
-        f.write(f"{iso}\t{post.get('id', '')}\n")
-
-
-def _count_posts_in_windows() -> tuple[int, int, int, int, datetime | None]:
-    """Return (day, week, month, total, earliest_dt) post counts from the log."""
-    if not POSTS_LOG_FILE.exists():
-        return 0, 0, 0, 0, None
-
-    now = datetime.now(timezone.utc)
-    day_ago = now - timedelta(days=1)
-    week_ago = now - timedelta(days=7)
-    month_ago = now - timedelta(days=30)
-
-    day_count = week_count = month_count = total = 0
-    earliest: datetime | None = None
-
-    for line in POSTS_LOG_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        iso = line.split("\t", 1)[0]
-        try:
-            ts = datetime.fromisoformat(iso)
-        except ValueError:
-            continue
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        total += 1
-        if earliest is None or ts < earliest:
-            earliest = ts
-        if ts >= day_ago:
-            day_count += 1
-        if ts >= week_ago:
-            week_count += 1
-        if ts >= month_ago:
-            month_count += 1
-
-    return day_count, week_count, month_count, total, earliest
-
-
-def handle_stats_command(chat_id: str) -> None:
-    """Reply with post counts in the last 24h / 7d / 30d windows."""
-    day_count, week_count, month_count, total, earliest = _count_posts_in_windows()
-    if total == 0:
-        send_telegram_message(
-            "📊 עדיין לא נאספו נתונים. נסה שוב בעוד כמה שעות.",
-            chat_id=chat_id,
-            reply_markup=STATS_KEYBOARD,
-        )
-        return
-
-    earliest_str = earliest.astimezone(ISRAEL_TZ).strftime("%d/%m/%Y") if earliest else "—"
-    msg = (
-        "📊 <b>סטטיסטיקות הציוצים של טראמפ</b>\n"
-        "\n"
-        f"📅 ב-24 שעות האחרונות: <b>{day_count}</b>\n"
-        f"📆 בשבוע האחרון: <b>{week_count}</b>\n"
-        f"🗓 בחודש האחרון: <b>{month_count}</b>\n"
-        "\n"
-        f"🗂 סה״כ ציוצים שתועדו: <b>{total}</b>\n"
-        f"📍 מעקב החל מ-{earliest_str}"
-    )
-    send_telegram_message(msg, chat_id=chat_id, reply_markup=STATS_KEYBOARD)
 
 # ---------------------------------------------------------------------------
 # Subscribers — anyone who /start's the bot or adds it to a group/channel
@@ -736,11 +650,11 @@ def send_welcome(chat_id: str, chat_type: str) -> None:
             "אני שולח את הפוסטים של דונלד טראמפ מ-Truth Social, מתורגמים לעברית.\n"
             "\n"
             "📬 כל פוסט חדש יישלח אליך אוטומטית.\n"
-            f"📊 לחץ על הכפתור <b>{STATS_BUTTON_TEXT}</b> למטה לסטטיסטיקה.\n"
             "\n"
             "💡 אפשר גם להוסיף אותי לקבוצה או לערוץ."
         )
-        send_telegram_message(msg, chat_id=chat_id, reply_markup=STATS_KEYBOARD)
+        # Strip any legacy reply keyboard a returning user may still have stuck.
+        send_telegram_message(msg, chat_id=chat_id, reply_markup=REMOVE_KEYBOARD)
         return
     if chat_type in ("group", "supergroup"):
         msg = (
@@ -785,9 +699,9 @@ def process_telegram_commands() -> None:
                 remove_subscriber(chat_id)
             continue
 
-        # Incoming message. Slash commands are honored only in private chats
-        # (/start to subscribe, /stats for post counts). In groups/channels
-        # the bot is broadcast-only — every message is ignored silently.
+        # Incoming message. Only /start in a private chat does anything —
+        # it subscribes the user and sends the welcome. Every other message
+        # (including any slash command in a group/channel) is ignored.
         message = update.get("message", {})
         text = (message.get("text") or "").strip()
         chat = message.get("chat", {})
@@ -806,8 +720,6 @@ def process_telegram_commands() -> None:
                 send_welcome(chat_id, chat_type)
                 if not newly_added:
                     log.info("Existing subscriber re-/start'd: %s", chat_id)
-            elif command == "/stats" or text == STATS_BUTTON_TEXT:
-                handle_stats_command(chat_id)
 
     if max_update_id > last_update_id:
         save_last_update_id(max_update_id)
@@ -829,8 +741,8 @@ def main() -> None:
         log.error("TELEGRAM_BOT_TOKEN environment variable is not set")
         sys.exit(1)
 
-    # Make sure the /stats command is visible in the menu.
-    setup_bot_menu()
+    # Keep the slash-command menu cleared — the bot is broadcast-only.
+    clear_bot_menu()
 
     # Pick up new subscribers / kicks before broadcasting this round's posts.
     process_telegram_commands()
@@ -885,7 +797,6 @@ def main() -> None:
 
         if delivered > 0:
             latest_id = post["id"]
-            log_sent_post(post)
         else:
             log.warning("Failed to deliver post %s to any subscriber — stopping to retry next run", post["id"])
             break
