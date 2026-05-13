@@ -483,8 +483,14 @@ def send_telegram_message(
     text: str,
     chat_id: str | None = None,
     reply_markup: dict[str, Any] | None = None,
+    thread_id: str | None = None,
 ) -> bool:
-    """Send a message to the Telegram chat, splitting if it exceeds 4096 chars."""
+    """Send a message, splitting if it exceeds 4096 chars.
+
+    ``thread_id`` pins the message to a specific forum topic in a group
+    chat (Telegram's ``message_thread_id``). For private chats and groups
+    without topics, leave it as None.
+    """
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN not set")
         return False
@@ -504,6 +510,8 @@ def send_telegram_message(
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        if thread_id:
+            payload["message_thread_id"] = thread_id
         # Attach reply_markup only to the final chunk so the keyboard
         # appears once per logical message.
         if reply_markup and i == len(chunks) - 1:
@@ -550,39 +558,59 @@ def clear_bot_menu() -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_subscribers() -> set[str]:
-    """Load the set of subscriber chat IDs (private chats, groups, channels)."""
-    subscribers: set[str] = set()
+def load_subscribers() -> dict[str, str | None]:
+    """Load subscribers as {chat_id: thread_id_or_None}.
+
+    Each line in the file is either ``chat_id`` (post to General / private DM)
+    or ``chat_id\\tthread_id`` (post to a specific forum topic in a group).
+    """
+    subscribers: dict[str, str | None] = {}
     if SUBSCRIBERS_FILE.exists():
         for line in SUBSCRIBERS_FILE.read_text().splitlines():
-            chat_id = line.strip()
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            chat_id = parts[0].strip()
+            thread_id = parts[1].strip() if len(parts) == 2 and parts[1].strip() else None
             if chat_id:
-                subscribers.add(chat_id)
+                subscribers[chat_id] = thread_id
     # Seed with the configured owner so existing deployments keep receiving
     # posts even before they /start the bot from scratch.
-    if TELEGRAM_CHAT_ID:
-        subscribers.add(TELEGRAM_CHAT_ID)
+    if TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID not in subscribers:
+        subscribers[TELEGRAM_CHAT_ID] = None
     return subscribers
 
 
-def save_subscribers(subscribers: set[str]) -> None:
+def save_subscribers(subscribers: dict[str, str | None]) -> None:
     SUBSCRIBERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    content = "\n".join(sorted(subscribers))
+    lines = []
+    for chat_id in sorted(subscribers):
+        thread_id = subscribers[chat_id]
+        lines.append(f"{chat_id}\t{thread_id}" if thread_id else chat_id)
+    content = "\n".join(lines)
     if content:
         content += "\n"
     SUBSCRIBERS_FILE.write_text(content)
 
 
-def add_subscriber(chat_id: str) -> bool:
-    """Add a chat to the subscribers list. Returns True if newly added."""
+def add_subscriber(chat_id: str, thread_id: str | None = None) -> bool:
+    """Subscribe a chat (optionally pinned to a forum topic).
+
+    Returns True if this changed the stored subscription (either a new chat,
+    or an existing chat whose target topic moved).
+    """
     if not chat_id:
         return False
     subscribers = load_subscribers()
-    if chat_id in subscribers:
+    if subscribers.get(chat_id) == thread_id and chat_id in subscribers:
         return False
-    subscribers.add(chat_id)
+    subscribers[chat_id] = thread_id
     save_subscribers(subscribers)
-    log.info("New subscriber: %s (total: %d)", chat_id, len(subscribers))
+    log.info(
+        "Subscriber set: chat=%s thread=%s (total: %d)",
+        chat_id, thread_id, len(subscribers),
+    )
     return True
 
 
@@ -591,7 +619,7 @@ def remove_subscriber(chat_id: str) -> None:
         return
     subscribers = load_subscribers()
     if chat_id in subscribers:
-        subscribers.discard(chat_id)
+        del subscribers[chat_id]
         save_subscribers(subscribers)
         log.info("Removed subscriber: %s (total: %d)", chat_id, len(subscribers))
 
@@ -641,8 +669,12 @@ def get_telegram_updates(offset: int = 0) -> list[dict[str, Any]]:
     return []
 
 
-def send_welcome(chat_id: str, chat_type: str) -> None:
-    """Send a one-time welcome when a chat first subscribes."""
+def send_welcome(chat_id: str, chat_type: str, thread_id: str | None = None) -> None:
+    """Send a one-time welcome when a chat first subscribes.
+
+    ``thread_id`` pins the welcome (and future broadcasts) to a forum topic
+    in a group chat. Omit it for private chats and groups without topics.
+    """
     if chat_type == "private":
         msg = (
             "🇺🇸🇮🇱 <b>ברוכים הבאים!</b>\n"
@@ -651,17 +683,26 @@ def send_welcome(chat_id: str, chat_type: str) -> None:
             "\n"
             "📬 כל פוסט חדש יישלח אליך אוטומטית.\n"
             "\n"
-            "💡 אפשר גם להוסיף אותי לקבוצה או לערוץ."
+            "💡 אפשר גם להוסיף אותי לקבוצה או לערוץ. כדי שאשלח לנושא ספציפי\n"
+            "בקבוצה — שלח /start בתוך הנושא הרצוי."
         )
         # Strip any legacy reply keyboard a returning user may still have stuck.
         send_telegram_message(msg, chat_id=chat_id, reply_markup=REMOVE_KEYBOARD)
         return
     if chat_type in ("group", "supergroup"):
-        msg = (
-            "🇺🇸🇮🇱 <b>שלום!</b>\n"
-            "אני אשלח לקבוצה הזאת את הפוסטים של טראמפ מתורגמים לעברית, אוטומטית."
-        )
-        send_telegram_message(msg, chat_id=chat_id)
+        if thread_id:
+            msg = (
+                "🇺🇸🇮🇱 <b>שלום!</b>\n"
+                "אני אשלח את הפוסטים של טראמפ <b>בנושא הזה</b>, מתורגמים לעברית."
+            )
+        else:
+            msg = (
+                "🇺🇸🇮🇱 <b>שלום!</b>\n"
+                "אני אשלח לקבוצה הזאת את הפוסטים של טראמפ מתורגמים לעברית, אוטומטית.\n"
+                "\n"
+                "💡 אם תרצה שאשלח לנושא ספציפי — שלח /start בתוך הנושא הרצוי."
+            )
+        send_telegram_message(msg, chat_id=chat_id, thread_id=thread_id)
 
 
 def process_telegram_commands() -> None:
@@ -699,27 +740,43 @@ def process_telegram_commands() -> None:
                 remove_subscriber(chat_id)
             continue
 
-        # Incoming message. Only /start in a private chat does anything —
-        # it subscribes the user and sends the welcome. Every other message
-        # (including any slash command in a group/channel) is ignored.
+        # Incoming message. /start in a private chat or group subscribes that
+        # chat. In a forum group, /start sent inside a topic pins broadcasts
+        # to that specific topic. Every other message is ignored silently.
         message = update.get("message", {})
         text = (message.get("text") or "").strip()
         chat = message.get("chat", {})
         chat_id = str(chat.get("id", ""))
         chat_type = chat.get("type", "")
+        # ``is_topic_message`` is set by Telegram when a message belongs to a
+        # forum topic (not the General channel). We only pin when this is true
+        # — otherwise message_thread_id may still be present but refer to a
+        # reply thread, which we don't want to treat as a forum topic.
+        thread_id: str | None = None
+        if message.get("is_topic_message"):
+            raw_thread = message.get("message_thread_id")
+            if raw_thread is not None:
+                thread_id = str(raw_thread)
 
-        if not chat_id:
+        if not chat_id or not text:
             continue
 
-        if chat_type == "private" and text:
-            command = text.split()[0].lower().split("@")[0]
-            if command == "/start":
-                newly_added = add_subscriber(chat_id)
-                # Always send welcome on /start, even for returning users —
-                # it confirms the bot is alive and they're subscribed.
-                send_welcome(chat_id, chat_type)
-                if not newly_added:
-                    log.info("Existing subscriber re-/start'd: %s", chat_id)
+        command = text.split()[0].lower().split("@")[0]
+        if command != "/start":
+            continue
+
+        if chat_type == "private":
+            newly_added = add_subscriber(chat_id)
+            send_welcome(chat_id, chat_type)
+            if not newly_added:
+                log.info("Existing subscriber re-/start'd: %s", chat_id)
+        elif chat_type in ("group", "supergroup"):
+            changed = add_subscriber(chat_id, thread_id)
+            # Always confirm in the topic where /start was sent, even on a
+            # no-op — so the admin sees that the bot heard them.
+            send_welcome(chat_id, chat_type, thread_id=thread_id)
+            if not changed:
+                log.info("Group %s already subscribed to thread %s", chat_id, thread_id)
 
     if max_update_id > last_update_id:
         save_last_update_id(max_update_id)
@@ -789,7 +846,8 @@ def main() -> None:
             if _budget_exceeded():
                 log.warning("Budget exceeded mid-broadcast — stopping")
                 break
-            if send_telegram_message(message, chat_id=sub_chat_id):
+            sub_thread_id = subscribers[sub_chat_id]
+            if send_telegram_message(message, chat_id=sub_chat_id, thread_id=sub_thread_id):
                 delivered += 1
             # Telegram broadcast rate limit is ~30 msgs/sec; small gap keeps
             # us well under that even with many subscribers.
