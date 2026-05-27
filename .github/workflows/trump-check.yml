@@ -38,5 +38,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/last_seen.txt data/last_update_id.txt data/subscribers.txt
-          git diff --staged --quiet || git commit -m "🔄 Update bot state"
-          git push
+          # Nothing changed this run — don't bother committing or pushing.
+          git diff --staged --quiet && exit 0
+          git commit -m "🔄 Update bot state"
+          # GitHub occasionally rejects the push with a transient server-side
+          # error ("remote: fatal error in commit_refs"). Retry with backoff,
+          # rebasing first in case main advanced, so a blip doesn't fail the run.
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase origin main && git push && exit 0
+            echo "push attempt $attempt failed, retrying in $((attempt * 5))s..."
+            sleep $((attempt * 5))
+          done
+          echo "git push failed after 5 attempts" >&2
+          exit 1
