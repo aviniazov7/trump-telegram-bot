@@ -1193,8 +1193,7 @@ def run_summary_selftest(subscribers: dict[str, str | None]) -> None:
         note = (
             "🧪 <b>בדיקת סיכום</b>\n"
             "אין עדיין פוסטים מתועדים לסיכום, אבל חיבור ה-AI עובד:\n\n"
-            f"{html.escape(probe)}\n\n"
-            f"<i>ספק: {html.escape(SUMMARY_AI_PROVIDER)}</i>"
+            f"{html.escape(probe)}"
         )
     else:
         note = (
