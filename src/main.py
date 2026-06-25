@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -43,6 +43,10 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LAST_SEEN_FILE = DATA_DIR / "last_seen.txt"
 LAST_UPDATE_ID_FILE = DATA_DIR / "last_update_id.txt"
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.txt"
+# Daily summary state: a JSON-lines log of every broadcast post, and the last
+# Israel-calendar date for which a summary was already sent.
+POSTS_LOG_FILE = DATA_DIR / "posts_log.txt"
+LAST_SUMMARY_DATE_FILE = DATA_DIR / "last_summary_date.txt"
 
 # Use Asia/Jerusalem so Israel DST (UTC+2 winter / UTC+3 summer) is correct.
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -60,6 +64,29 @@ TELEGRAM_MAX_MESSAGE_LEN = 4000
 SCRIPT_BUDGET_SECONDS = 10 * 60
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; trump-telegram-bot/1.0)"
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int env var, falling back to default on missing/invalid input."""
+    try:
+        return int(os.environ.get(name, "").strip())
+    except (ValueError, TypeError):
+        return default
+
+
+# ---- Daily summary -------------------------------------------------------
+# Once a day the bot sends a digest of all of Trump's posts from the previous
+# Israel-calendar day. Set DAILY_SUMMARY_ENABLED=false to turn it off.
+DAILY_SUMMARY_ENABLED = (
+    os.environ.get("DAILY_SUMMARY_ENABLED", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+# Hour (Israel time, 0-23) at/after which yesterday's summary is sent.
+DAILY_SUMMARY_HOUR = _env_int("DAILY_SUMMARY_HOUR", 9)
+# How many days of post history to keep in the log before pruning.
+SUMMARY_LOG_RETENTION_DAYS = _env_int("SUMMARY_LOG_RETENTION_DAYS", 7)
+# Max characters of each post's translation shown in the digest.
+SUMMARY_SNIPPET_LEN = _env_int("SUMMARY_SNIPPET_LEN", 350)
 
 _script_deadline: float | None = None
 
@@ -784,6 +811,196 @@ def process_telegram_commands() -> None:
         save_last_update_id(max_update_id)
 
 # ---------------------------------------------------------------------------
+# Daily summary — digest of all of the previous day's posts
+# ---------------------------------------------------------------------------
+
+
+def _israel_date_of(post: dict[str, Any]) -> str:
+    """Israel-calendar date (YYYY-MM-DD) a post belongs to.
+
+    Falls back to today's Israel date if the timestamp can't be parsed, so a
+    post is never silently dropped from the log.
+    """
+    dt = _parse_post_date(post.get("created_at", ""))
+    if dt is None:
+        return datetime.now(ISRAEL_TZ).strftime("%Y-%m-%d")
+    return dt.astimezone(ISRAEL_TZ).strftime("%Y-%m-%d")
+
+
+def log_post(post: dict[str, Any], hebrew: str) -> None:
+    """Append a broadcast post to the JSON-lines log for the daily summary."""
+    record = {
+        "id": post.get("id", ""),
+        "created_at": post.get("created_at", ""),
+        "israel_date": _israel_date_of(post),
+        "text": post.get("text", ""),
+        "hebrew": hebrew,
+        "url": post.get("url", ""),
+    }
+    try:
+        POSTS_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with POSTS_LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        log.warning("Failed to log post %s for daily summary: %s", record["id"], exc)
+
+
+def _iter_logged_posts() -> list[dict[str, Any]]:
+    """Read all valid JSON records from the log, skipping legacy/corrupt lines."""
+    if not POSTS_LOG_FILE.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for line in POSTS_LOG_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
+def load_posts_for_date(israel_date: str) -> list[dict[str, Any]]:
+    """All logged posts belonging to a given Israel date, oldest first."""
+    posts = [r for r in _iter_logged_posts() if r.get("israel_date") == israel_date]
+    posts.sort(key=lambda r: r.get("created_at", ""))
+    return posts
+
+
+def prune_posts_log(keep_days: int = SUMMARY_LOG_RETENTION_DAYS) -> None:
+    """Drop log entries older than keep_days (also clears legacy lines)."""
+    if not POSTS_LOG_FILE.exists():
+        return
+    cutoff = (datetime.now(ISRAEL_TZ).date() - timedelta(days=keep_days)).isoformat()
+    # ISO date strings sort lexicographically, so a string compare is enough.
+    kept = [r for r in _iter_logged_posts() if r.get("israel_date", "") >= cutoff]
+    content = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept)
+    try:
+        POSTS_LOG_FILE.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        log.warning("Failed to prune posts log: %s", exc)
+
+
+def load_last_summary_date() -> str:
+    """Last Israel date (YYYY-MM-DD) a summary was sent for, or ''."""
+    if LAST_SUMMARY_DATE_FILE.exists():
+        return LAST_SUMMARY_DATE_FILE.read_text().strip()
+    return ""
+
+
+def save_last_summary_date(israel_date: str) -> None:
+    LAST_SUMMARY_DATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LAST_SUMMARY_DATE_FILE.write_text(israel_date + "\n")
+
+
+def _snippet(text: str, limit: int = SUMMARY_SNIPPET_LEN) -> str:
+    """Collapse whitespace and truncate a post's text for the digest."""
+    flat = re.sub(r"\s+", " ", text).strip()
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1].rstrip() + "…"
+
+
+def build_daily_summary(israel_date: str, posts: list[dict[str, Any]]) -> str:
+    """Build the Hebrew daily-digest message for a day's posts."""
+    try:
+        pretty_date = date.fromisoformat(israel_date).strftime("%d/%m/%Y")
+    except ValueError:
+        pretty_date = israel_date
+
+    header = (
+        "📋 <b>סיכום יומי — טראמפ ב-Truth Social</b>\n"
+        f"🗓️ {pretty_date}\n"
+        f"📨 סה\"כ {len(posts)} פוסטים\n"
+        "\n"
+        "━━━━━━━━━━━━━━━\n"
+    )
+
+    lines = [header]
+    for i, post in enumerate(posts, start=1):
+        dt = _parse_post_date(post.get("created_at", ""))
+        time_str = dt.astimezone(ISRAEL_TZ).strftime("%H:%M") if dt else "—"
+        body = _snippet(post.get("hebrew") or post.get("text") or "")
+        entry = f"\n<b>{i}.</b> 🕐 {time_str}\n{html.escape(body)}"
+        link = post.get("url", "")
+        if link:
+            entry += f'\n🔗 <a href="{html.escape(link)}">לפוסט המקורי</a>'
+        lines.append(entry + "\n")
+
+    return "".join(lines)
+
+
+def send_daily_summary(
+    israel_date: str,
+    posts: list[dict[str, Any]],
+    subscribers: dict[str, str | None],
+) -> None:
+    """Broadcast the daily digest for israel_date to every subscriber."""
+    message = build_daily_summary(israel_date, posts)
+    log.info("Sending daily summary for %s (%d posts) to %d subscriber(s)",
+             israel_date, len(posts), len(subscribers))
+    for chat_id in sorted(subscribers):
+        if _budget_exceeded():
+            log.warning("Budget exceeded mid-summary — stopping")
+            break
+        send_telegram_message(message, chat_id=chat_id, thread_id=subscribers[chat_id])
+        time.sleep(0.05)
+
+
+def maybe_send_daily_summary(subscribers: dict[str, str | None]) -> None:
+    """Send any outstanding daily summaries (one per completed day).
+
+    Runs every cron tick but only fires once per day: it summarizes whole
+    Israel-calendar days up to yesterday, gated on DAILY_SUMMARY_HOUR, and
+    records the last sent date so it never repeats. If the bot was down for
+    a few days it catches up, sending one digest per missed day.
+    """
+    if not DAILY_SUMMARY_ENABLED:
+        return
+    if not subscribers:
+        return
+
+    now = datetime.now(ISRAEL_TZ)
+    yesterday = now.date() - timedelta(days=1)
+    last_sent = load_last_summary_date()
+
+    # First run: anchor to yesterday so we don't summarize pre-deployment
+    # history, and start collecting from today onward.
+    if not last_sent:
+        save_last_summary_date(yesterday.isoformat())
+        log.info("Initialized daily-summary anchor to %s", yesterday.isoformat())
+        return
+
+    # Hold until the configured hour so the digest arrives at a predictable
+    # time rather than just after midnight.
+    if now.hour < DAILY_SUMMARY_HOUR:
+        return
+
+    try:
+        target = date.fromisoformat(last_sent) + timedelta(days=1)
+    except ValueError:
+        log.warning("Bad last_summary_date %r — re-anchoring", last_sent)
+        save_last_summary_date(yesterday.isoformat())
+        return
+
+    while target <= yesterday:
+        if _budget_exceeded():
+            log.warning("Budget exceeded — deferring daily summary to next run")
+            return
+        target_str = target.isoformat()
+        posts = load_posts_for_date(target_str)
+        if posts:
+            send_daily_summary(target_str, posts, subscribers)
+        else:
+            log.info("No posts logged for %s — skipping summary", target_str)
+        save_last_summary_date(target_str)
+        target += timedelta(days=1)
+
+    prune_posts_log()
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -818,17 +1035,15 @@ def main() -> None:
     # Load last seen post
     last_seen_id = load_last_seen()
 
-    # Fetch posts
+    # Fetch + filter new posts. Even when there's nothing new to broadcast we
+    # still fall through to the daily-summary check below, which runs on its
+    # own once-a-day schedule independent of whether this tick had new posts.
     posts = fetch_posts()
+    new_posts = filter_new_posts(posts, last_seen_id) if posts else []
     if not posts:
-        log.info("No posts fetched — exiting")
-        return
-
-    # Filter new posts
-    new_posts = filter_new_posts(posts, last_seen_id)
-    if not new_posts:
-        log.info("No new posts — exiting")
-        return
+        log.info("No posts fetched this run")
+    elif not new_posts:
+        log.info("No new posts this run")
 
     log.info("Broadcasting %d new post(s) to %d subscriber(s)", len(new_posts), len(subscribers))
 
@@ -857,6 +1072,8 @@ def main() -> None:
 
         if delivered > 0:
             latest_id = post["id"]
+            # Record the post so it can appear in the daily summary digest.
+            log_post(post, hebrew)
         else:
             log.warning("Failed to deliver post %s to any subscriber — stopping to retry next run", post["id"])
             break
@@ -867,6 +1084,10 @@ def main() -> None:
     # Update last seen
     if latest_id:
         save_last_seen(latest_id)
+
+    # Send the daily digest if one is due (independent of this run's posts).
+    if not _budget_exceeded():
+        maybe_send_daily_summary(subscribers)
 
     log.info("Done — processed up to post %s", latest_id or "(none)")
 
