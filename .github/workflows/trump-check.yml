@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '*/10 * * * *'  # Every 10 minutes
   workflow_dispatch:          # Manual trigger from GitHub UI
+    inputs:
+      selftest_summary:
+        description: 'Send a test daily summary now (verifies the AI path)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write             # Needed to commit last_seen.txt updates
@@ -31,13 +36,18 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # The AI daily summary works with no key by default (Pollinations).
+          # This optional secret is only used if SUMMARY_AI_PROVIDER=gemini.
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Set by the manual "Run workflow" button to send a test summary now.
+          SELFTEST_SUMMARY: ${{ github.event.inputs.selftest_summary }}
         run: python src/main.py
 
       - name: Persist last seen post
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/last_seen.txt data/last_update_id.txt data/subscribers.txt
+          git add data/last_seen.txt data/last_update_id.txt data/subscribers.txt data/posts_log.txt data/last_summary_date.txt
           # Nothing changed this run — don't bother committing or pushing.
           git diff --staged --quiet && exit 0
           git commit -m "🔄 Update bot state"
