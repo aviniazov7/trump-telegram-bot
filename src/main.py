@@ -75,18 +75,47 @@ def _env_int(name: str, default: int) -> int:
 
 
 # ---- Daily summary -------------------------------------------------------
-# Once a day the bot sends a digest of all of Trump's posts from the previous
-# Israel-calendar day. Set DAILY_SUMMARY_ENABLED=false to turn it off.
+# Once a day, at the end of the day, the bot sends a digest of all of Trump's
+# posts from that Israel-calendar day. Set DAILY_SUMMARY_ENABLED=false to off.
 DAILY_SUMMARY_ENABLED = (
     os.environ.get("DAILY_SUMMARY_ENABLED", "true").strip().lower()
     not in ("0", "false", "no", "off")
 )
-# Hour (Israel time, 0-23) at/after which yesterday's summary is sent.
-DAILY_SUMMARY_HOUR = _env_int("DAILY_SUMMARY_HOUR", 9)
+# Hour (Israel time, 0-23) at/after which the day's summary is sent. Default
+# 22:00 — a day's digest goes out the same evening, covering 00:00 until now.
+DAILY_SUMMARY_HOUR = _env_int("DAILY_SUMMARY_HOUR", 22)
 # How many days of post history to keep in the log before pruning.
 SUMMARY_LOG_RETENTION_DAYS = _env_int("SUMMARY_LOG_RETENTION_DAYS", 7)
-# Max characters of each post's translation shown in the digest.
+# Max characters of each post's translation shown in the fallback list digest.
 SUMMARY_SNIPPET_LEN = _env_int("SUMMARY_SNIPPET_LEN", 350)
+
+# ---- AI summary ----------------------------------------------------------
+# When an AI provider key is set, the daily digest is an AI-written Hebrew
+# recap instead of a raw list. Falls back to the list digest on any failure.
+#
+# Default provider is Google Gemini, which has a free tier generous enough for
+# a once-a-day summary (get a free key at https://aistudio.google.com/apikey).
+# Set SUMMARY_AI_PROVIDER=claude to use the Anthropic API instead (paid).
+SUMMARY_AI_ENABLED = (
+    os.environ.get("SUMMARY_AI_ENABLED", "true").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+SUMMARY_AI_PROVIDER = os.environ.get("SUMMARY_AI_PROVIDER", "gemini").strip().lower()
+SUMMARY_MAX_TOKENS = _env_int("SUMMARY_MAX_TOKENS", 1500)
+
+# Google Gemini (free tier) — the default provider.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
+GEMINI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
+
+# Anthropic Claude (paid) — optional alternative provider.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "claude-opus-4-8").strip()
 
 _script_deadline: float | None = None
 
@@ -931,13 +960,152 @@ def build_daily_summary(israel_date: str, posts: list[dict[str, Any]]) -> str:
     return "".join(lines)
 
 
+def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any] | None:
+    """POST JSON to url and return the parsed response, or None on failure."""
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT, **headers},
+        method="POST",
+    )
+    try:
+        # Generous timeout: summarization can take a while, and we're well
+        # inside the script budget by the time the summary runs.
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
+        log.warning("AI request to %s failed: %s", url, exc)
+        return None
+
+
+def _call_gemini(system: str, user: str) -> str | None:
+    """Call Google's Gemini API (free tier, raw HTTP); return text or None."""
+    if not GEMINI_API_KEY:
+        return None
+    payload = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"parts": [{"text": user}]}],
+        "generationConfig": {"maxOutputTokens": SUMMARY_MAX_TOKENS},
+    }
+    result = _post_json(GEMINI_API_URL, payload, {"x-goog-api-key": GEMINI_API_KEY})
+    if not result:
+        return None
+    try:
+        parts = result["candidates"][0]["content"]["parts"]
+    except (KeyError, IndexError, TypeError):
+        log.warning("Unexpected Gemini response shape: %s", result)
+        return None
+    text = "".join(p.get("text", "") for p in parts).strip()
+    return text or None
+
+
+def _call_claude(system: str, user: str) -> str | None:
+    """Call the Claude Messages API (raw HTTP) and return the text, or None."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    payload = {
+        "model": SUMMARY_MODEL,
+        "max_tokens": SUMMARY_MAX_TOKENS,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    result = _post_json(ANTHROPIC_API_URL, payload, {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": ANTHROPIC_VERSION,
+    })
+    if not result:
+        return None
+    if result.get("stop_reason") == "refusal":
+        log.warning("Claude API refused the summary request")
+        return None
+    parts = [
+        block.get("text", "")
+        for block in result.get("content", [])
+        if block.get("type") == "text"
+    ]
+    text = "".join(parts).strip()
+    return text or None
+
+
+def _ai_complete(system: str, user: str) -> str | None:
+    """Run the configured AI provider, returning its text or None."""
+    if SUMMARY_AI_PROVIDER == "claude":
+        return _call_claude(system, user)
+    return _call_gemini(system, user)
+
+
+def _ai_key_available() -> bool:
+    """Whether the configured provider has a usable API key set."""
+    return bool(ANTHROPIC_API_KEY) if SUMMARY_AI_PROVIDER == "claude" else bool(GEMINI_API_KEY)
+
+
+def build_ai_summary(israel_date: str, posts: list[dict[str, Any]]) -> str | None:
+    """Ask Claude for a concise Hebrew recap of the day's posts.
+
+    Returns a ready-to-send HTML message, or None if AI summarization is
+    disabled, no API key is set, or the request fails — so the caller can
+    fall back to the plain list digest.
+    """
+    if not (SUMMARY_AI_ENABLED and _ai_key_available()):
+        return None
+
+    try:
+        pretty_date = date.fromisoformat(israel_date).strftime("%d/%m/%Y")
+    except ValueError:
+        pretty_date = israel_date
+
+    # Feed the model the original English posts with their Israel-time stamps.
+    lines = []
+    for post in posts:
+        dt = _parse_post_date(post.get("created_at", ""))
+        time_str = dt.astimezone(ISRAEL_TZ).strftime("%H:%M") if dt else "—"
+        text = re.sub(r"\s+", " ", post.get("text", "")).strip()
+        if text:
+            lines.append(f"[{time_str}] {text}")
+    if not lines:
+        return None
+    posts_block = "\n".join(lines)
+
+    system = (
+        "אתה עורך חדשות ישראלי. תפקידך לסכם בעברית את הפעילות היומית של "
+        "דונלד טראמפ ברשת Truth Social עבור קוראים ישראלים. כתוב סיכום תמציתי, "
+        "ענייני ובהיר. ארגן את הסיכום לפי נושאים מרכזיים עם תבליטים (•). שמור על "
+        "טון עיתונאי ונייטרלי. כתוב בעברית בלבד, בטקסט רגיל ללא Markdown וללא "
+        "תגיות HTML. אל תוסיף הקדמה או סיכום-על — רק הסיכום עצמו."
+    )
+    user = (
+        f"להלן {len(posts)} הפוסטים שדונלד טראמפ פרסם ב-{pretty_date} "
+        f"(שעות בשעון ישראל). סכם את עיקרי הדברים בעברית:\n\n{posts_block}"
+    )
+
+    body = _ai_complete(system, user)
+    if not body:
+        return None
+
+    header = (
+        "📋 <b>סיכום יומי — טראמפ ב-Truth Social</b>\n"
+        f"🗓️ {pretty_date}\n"
+        f"📨 {len(posts)} פוסטים\n"
+        "\n"
+        "━━━━━━━━━━━━━━━\n"
+        "\n"
+    )
+    # The model returns plain text; escape it so any stray <, >, & is safe
+    # under Telegram's HTML parse mode.
+    return header + html.escape(body) + "\n\n🤖 <i>סיכום שנכתב על ידי בינה מלאכותית</i>"
+
+
 def send_daily_summary(
     israel_date: str,
     posts: list[dict[str, Any]],
     subscribers: dict[str, str | None],
 ) -> None:
-    """Broadcast the daily digest for israel_date to every subscriber."""
-    message = build_daily_summary(israel_date, posts)
+    """Broadcast the daily digest for israel_date to every subscriber.
+
+    Prefers an AI-written Hebrew recap; falls back to the plain list digest
+    if AI summarization is unavailable or fails.
+    """
+    message = build_ai_summary(israel_date, posts) or build_daily_summary(israel_date, posts)
     log.info("Sending daily summary for %s (%d posts) to %d subscriber(s)",
              israel_date, len(posts), len(subscribers))
     for chat_id in sorted(subscribers):
@@ -949,12 +1117,13 @@ def send_daily_summary(
 
 
 def maybe_send_daily_summary(subscribers: dict[str, str | None]) -> None:
-    """Send any outstanding daily summaries (one per completed day).
+    """Send any outstanding daily summaries (one per day).
 
-    Runs every cron tick but only fires once per day: it summarizes whole
-    Israel-calendar days up to yesterday, gated on DAILY_SUMMARY_HOUR, and
-    records the last sent date so it never repeats. If the bot was down for
-    a few days it catches up, sending one digest per missed day.
+    Runs every cron tick but fires only once per day. A day's summary becomes
+    due at DAILY_SUMMARY_HOUR (default 22:00 Israel) that same evening, so the
+    digest for today covers 00:00 until ~22:00. The last sent date is recorded
+    so it never repeats; if the bot was down it catches up, sending one digest
+    per missed day.
     """
     if not DAILY_SUMMARY_ENABLED:
         return
@@ -966,16 +1135,15 @@ def maybe_send_daily_summary(subscribers: dict[str, str | None]) -> None:
     last_sent = load_last_summary_date()
 
     # First run: anchor to yesterday so we don't summarize pre-deployment
-    # history, and start collecting from today onward.
+    # history. Today's posts collect from now and go out tonight at the hour.
     if not last_sent:
         save_last_summary_date(yesterday.isoformat())
         log.info("Initialized daily-summary anchor to %s", yesterday.isoformat())
         return
 
-    # Hold until the configured hour so the digest arrives at a predictable
-    # time rather than just after midnight.
-    if now.hour < DAILY_SUMMARY_HOUR:
-        return
+    # The most recent day whose summary is now due: today once we've passed
+    # the summary hour, otherwise yesterday (today isn't due until tonight).
+    due_through = now.date() if now.hour >= DAILY_SUMMARY_HOUR else yesterday
 
     try:
         target = date.fromisoformat(last_sent) + timedelta(days=1)
@@ -984,7 +1152,7 @@ def maybe_send_daily_summary(subscribers: dict[str, str | None]) -> None:
         save_last_summary_date(yesterday.isoformat())
         return
 
-    while target <= yesterday:
+    while target <= due_through:
         if _budget_exceeded():
             log.warning("Budget exceeded — deferring daily summary to next run")
             return
