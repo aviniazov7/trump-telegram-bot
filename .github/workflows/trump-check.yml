@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '*/10 * * * *'  # Every 10 minutes
   workflow_dispatch:          # Manual trigger from GitHub UI
+    inputs:
+      selftest_summary:
+        description: 'Send a test daily summary now (verifies the AI path)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write             # Needed to commit last_seen.txt updates
@@ -34,6 +39,8 @@ jobs:
           # The AI daily summary works with no key by default (Pollinations).
           # This optional secret is only used if SUMMARY_AI_PROVIDER=gemini.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Set by the manual "Run workflow" button to send a test summary now.
+          SELFTEST_SUMMARY: ${{ github.event.inputs.selftest_summary }}
         run: python src/main.py
 
       - name: Persist last seen post
