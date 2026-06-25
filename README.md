@@ -10,6 +10,45 @@ The bot is **broadcast-only**:
 - No slash-command menu is shown. All other messages are ignored silently —
   users can't trigger any action.
 
+## Daily summary
+
+Once a day the bot also sends a **Hebrew summary of all of Trump's posts from
+that day**. Every broadcast post is recorded to `data/posts_log.txt`; the
+digest for the day is sent that evening (default 22:00 Israel time) and
+`data/last_summary_date.txt` ensures it's sent exactly once. If the bot is
+down for a few days it catches up, sending one digest per missed day, and the
+log is pruned to the last 7 days automatically.
+
+### AI-written summary (free, no setup)
+
+The digest is a **concise, topic-organized Hebrew recap written by AI** rather
+than a raw list. The default provider is **Pollinations** — a free AI service
+that needs **no API key and no setup at all**. It just works out of the box.
+
+If the AI service is unavailable for a given day, the summary still goes out —
+it falls back to a numbered list with each post's time, its translation, and a
+link to the original.
+
+Want a higher-quality or more reliable provider? Two optional alternatives:
+
+- **Google Gemini** (free tier): `SUMMARY_AI_PROVIDER=gemini` + a free
+  `GEMINI_API_KEY` from <https://aistudio.google.com/apikey> (no credit card).
+- **Anthropic Claude** (paid): `SUMMARY_AI_PROVIDER=claude` + `ANTHROPIC_API_KEY`.
+
+### Configuration
+
+All optional, via Actions secrets / env vars:
+
+- `DAILY_SUMMARY_ENABLED` — set to `false` to turn the digest off (default on).
+- `DAILY_SUMMARY_HOUR` — hour (0–23, Israel time) to send the digest (default `22`).
+- `SUMMARY_AI_ENABLED` — set to `false` to always use the plain list (default on).
+- `SUMMARY_AI_PROVIDER` — `pollinations` (default, keyless), `gemini`, or `claude`.
+- `POLLINATIONS_MODEL` — Pollinations model (default `openai`).
+- `GEMINI_API_KEY` / `GEMINI_MODEL` — Gemini key and model (default `gemini-2.0-flash`).
+- `ANTHROPIC_API_KEY` / `SUMMARY_MODEL` — Claude key and model (default `claude-opus-4-8`).
+- `SUMMARY_LOG_RETENTION_DAYS` — days of post history to keep (default `7`).
+- `SUMMARY_SNIPPET_LEN` — max characters per post in the list fallback (default `350`).
+
 ## Setup
 
 1. **Create a Telegram bot** with [@BotFather](https://t.me/BotFather) and
@@ -34,6 +73,8 @@ src/main.py                         Pipeline: fetch → translate → broadcast
 data/last_seen.txt                  Last processed post id (auto-updated)
 data/last_update_id.txt             Last processed Telegram update id
 data/subscribers.txt                Chat IDs receiving the broadcast
+data/posts_log.txt                  Per-post log feeding the daily summary
+data/last_summary_date.txt          Last date a daily summary was sent
 BOT-CONTROLS.sh                     gh-cli helper (status / run / logs)
 ```
 
