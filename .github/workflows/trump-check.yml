@@ -31,8 +31,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Optional: free Gemini key enables the AI-written daily summary.
-          # Without it, the daily summary falls back to a plain list digest.
+          # The AI daily summary works with no key by default (Pollinations).
+          # This optional secret is only used if SUMMARY_AI_PROVIDER=gemini.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python src/main.py
 

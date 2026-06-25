@@ -90,20 +90,26 @@ SUMMARY_LOG_RETENTION_DAYS = _env_int("SUMMARY_LOG_RETENTION_DAYS", 7)
 SUMMARY_SNIPPET_LEN = _env_int("SUMMARY_SNIPPET_LEN", 350)
 
 # ---- AI summary ----------------------------------------------------------
-# When an AI provider key is set, the daily digest is an AI-written Hebrew
-# recap instead of a raw list. Falls back to the list digest on any failure.
+# The daily digest is an AI-written Hebrew recap instead of a raw list. Falls
+# back to the list digest on any failure.
 #
-# Default provider is Google Gemini, which has a free tier generous enough for
-# a once-a-day summary (get a free key at https://aistudio.google.com/apikey).
-# Set SUMMARY_AI_PROVIDER=claude to use the Anthropic API instead (paid).
+# Default provider is Pollinations, a free AI service that needs NO API key —
+# zero setup. Set SUMMARY_AI_PROVIDER to:
+#   - "pollinations" (default) — free, keyless.
+#   - "gemini"  — Google Gemini free tier (set GEMINI_API_KEY).
+#   - "claude"  — Anthropic API, paid (set ANTHROPIC_API_KEY).
 SUMMARY_AI_ENABLED = (
     os.environ.get("SUMMARY_AI_ENABLED", "true").strip().lower()
     not in ("0", "false", "no", "off")
 )
-SUMMARY_AI_PROVIDER = os.environ.get("SUMMARY_AI_PROVIDER", "gemini").strip().lower()
+SUMMARY_AI_PROVIDER = os.environ.get("SUMMARY_AI_PROVIDER", "pollinations").strip().lower()
 SUMMARY_MAX_TOKENS = _env_int("SUMMARY_MAX_TOKENS", 1500)
 
-# Google Gemini (free tier) — the default provider.
+# Pollinations (free, no API key) — the default provider. OpenAI-compatible.
+POLLINATIONS_API_URL = "https://text.pollinations.ai/openai"
+POLLINATIONS_MODEL = os.environ.get("POLLINATIONS_MODEL", "openai").strip()
+
+# Google Gemini (free tier, needs a free key).
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
 GEMINI_API_URL = (
@@ -978,6 +984,27 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> di
         return None
 
 
+def _call_pollinations(system: str, user: str) -> str | None:
+    """Call Pollinations' free, keyless AI (OpenAI-compatible); text or None."""
+    payload = {
+        "model": POLLINATIONS_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    result = _post_json(POLLINATIONS_API_URL, payload, {})
+    if not result:
+        return None
+    try:
+        text = result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        log.warning("Unexpected Pollinations response shape: %s", result)
+        return None
+    text = (text or "").strip()
+    return text or None
+
+
 def _call_gemini(system: str, user: str) -> str | None:
     """Call Google's Gemini API (free tier, raw HTTP); return text or None."""
     if not GEMINI_API_KEY:
@@ -1031,12 +1058,21 @@ def _ai_complete(system: str, user: str) -> str | None:
     """Run the configured AI provider, returning its text or None."""
     if SUMMARY_AI_PROVIDER == "claude":
         return _call_claude(system, user)
-    return _call_gemini(system, user)
+    if SUMMARY_AI_PROVIDER == "gemini":
+        return _call_gemini(system, user)
+    return _call_pollinations(system, user)
 
 
 def _ai_key_available() -> bool:
-    """Whether the configured provider has a usable API key set."""
-    return bool(ANTHROPIC_API_KEY) if SUMMARY_AI_PROVIDER == "claude" else bool(GEMINI_API_KEY)
+    """Whether the configured provider is usable (has a key, if it needs one).
+
+    Pollinations is keyless, so it's always available.
+    """
+    if SUMMARY_AI_PROVIDER == "claude":
+        return bool(ANTHROPIC_API_KEY)
+    if SUMMARY_AI_PROVIDER == "gemini":
+        return bool(GEMINI_API_KEY)
+    return True
 
 
 def build_ai_summary(israel_date: str, posts: list[dict[str, Any]]) -> str | None:
