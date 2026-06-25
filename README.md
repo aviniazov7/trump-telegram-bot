@@ -19,21 +19,21 @@ digest for the day is sent that evening (default 22:00 Israel time) and
 down for a few days it catches up, sending one digest per missed day, and the
 log is pruned to the last 7 days automatically.
 
-### AI-written summary (free)
+### AI-written summary (free, no setup)
 
-If an AI provider key is set, the digest is a **concise, topic-organized
-Hebrew recap written by AI** rather than a raw list. The default provider is
-**Google Gemini**, which has a free tier more than generous enough for one
-summary a day:
+The digest is a **concise, topic-organized Hebrew recap written by AI** rather
+than a raw list. The default provider is **Pollinations** — a free AI service
+that needs **no API key and no setup at all**. It just works out of the box.
 
-1. Get a free API key at <https://aistudio.google.com/apikey> (no credit card).
-2. Add it as the `GEMINI_API_KEY` Actions secret.
+If the AI service is unavailable for a given day, the summary still goes out —
+it falls back to a numbered list with each post's time, its translation, and a
+link to the original.
 
-Without a key, the daily summary still works — it falls back to a numbered
-list with each post's time, its translation, and a link to the original.
+Want a higher-quality or more reliable provider? Two optional alternatives:
 
-To use Anthropic's Claude instead (paid), set `SUMMARY_AI_PROVIDER=claude` and
-the `ANTHROPIC_API_KEY` secret.
+- **Google Gemini** (free tier): `SUMMARY_AI_PROVIDER=gemini` + a free
+  `GEMINI_API_KEY` from <https://aistudio.google.com/apikey> (no credit card).
+- **Anthropic Claude** (paid): `SUMMARY_AI_PROVIDER=claude` + `ANTHROPIC_API_KEY`.
 
 ### Configuration
 
@@ -42,7 +42,8 @@ All optional, via Actions secrets / env vars:
 - `DAILY_SUMMARY_ENABLED` — set to `false` to turn the digest off (default on).
 - `DAILY_SUMMARY_HOUR` — hour (0–23, Israel time) to send the digest (default `22`).
 - `SUMMARY_AI_ENABLED` — set to `false` to always use the plain list (default on).
-- `SUMMARY_AI_PROVIDER` — `gemini` (default) or `claude`.
+- `SUMMARY_AI_PROVIDER` — `pollinations` (default, keyless), `gemini`, or `claude`.
+- `POLLINATIONS_MODEL` — Pollinations model (default `openai`).
 - `GEMINI_API_KEY` / `GEMINI_MODEL` — Gemini key and model (default `gemini-2.0-flash`).
 - `ANTHROPIC_API_KEY` / `SUMMARY_MODEL` — Claude key and model (default `claude-opus-4-8`).
 - `SUMMARY_LOG_RETENTION_DAYS` — days of post history to keep (default `7`).
