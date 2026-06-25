@@ -123,6 +123,13 @@ ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "claude-opus-4-8").strip()
 
+# On-demand test: when set (via the workflow's selftest_summary input), the
+# bot builds and sends a summary immediately, bypassing the daily schedule,
+# so the AI path can be verified without waiting for DAILY_SUMMARY_HOUR.
+SELFTEST_SUMMARY = (
+    os.environ.get("SELFTEST_SUMMARY", "").strip().lower() in ("1", "true", "yes", "on")
+)
+
 _script_deadline: float | None = None
 
 
@@ -1076,7 +1083,7 @@ def _ai_key_available() -> bool:
 
 
 def build_ai_summary(israel_date: str, posts: list[dict[str, Any]]) -> str | None:
-    """Ask Claude for a concise Hebrew recap of the day's posts.
+    """Ask the configured AI provider for a concise Hebrew recap of the day.
 
     Returns a ready-to-send HTML message, or None if AI summarization is
     disabled, no API key is set, or the request fails — so the caller can
@@ -1149,6 +1156,55 @@ def send_daily_summary(
             log.warning("Budget exceeded mid-summary — stopping")
             break
         send_telegram_message(message, chat_id=chat_id, thread_id=subscribers[chat_id])
+        time.sleep(0.05)
+
+
+def run_summary_selftest(subscribers: dict[str, str | None]) -> None:
+    """Build and send a summary right now, bypassing the daily schedule.
+
+    Triggered by the workflow's selftest_summary input so the AI summary path
+    (including the live provider call) can be verified on demand. Summarizes
+    the most recent day that has logged posts; if none are logged yet, sends a
+    short status note plus a live AI connectivity probe so the run still proves
+    the provider is reachable.
+    """
+    today = datetime.now(ISRAEL_TZ).date().isoformat()
+    used_date = today
+    posts = load_posts_for_date(today)
+    if not posts:
+        dates = sorted({r.get("israel_date", "") for r in _iter_logged_posts()} - {""})
+        if dates:
+            used_date = dates[-1]
+            posts = load_posts_for_date(used_date)
+
+    if posts:
+        log.info("Self-test: summarizing %d post(s) for %s", len(posts), used_date)
+        send_daily_summary(used_date, posts, subscribers)
+        return
+
+    log.info("Self-test: no logged posts yet — running AI connectivity probe")
+    probe = None
+    if SUMMARY_AI_ENABLED and _ai_key_available():
+        probe = _ai_complete(
+            "ענה בעברית במשפט קצר אחד בלבד.",
+            "כתוב משפט קצר שמאשר שאתה פעיל.",
+        )
+    if probe:
+        note = (
+            "🧪 <b>בדיקת סיכום</b>\n"
+            "אין עדיין פוסטים מתועדים לסיכום, אבל חיבור ה-AI עובד:\n\n"
+            f"{html.escape(probe)}\n\n"
+            f"<i>ספק: {html.escape(SUMMARY_AI_PROVIDER)}</i>"
+        )
+    else:
+        note = (
+            "🧪 <b>בדיקת סיכום</b>\n"
+            "אין עדיין פוסטים מתועדים לסיכום, וה-AI לא זמין כרגע — "
+            "הסיכום היומי ייפול לרשימה רגילה."
+        )
+    log.info("Self-test: sending status note to %d subscriber(s)", len(subscribers))
+    for chat_id in sorted(subscribers):
+        send_telegram_message(note, chat_id=chat_id, thread_id=subscribers[chat_id])
         time.sleep(0.05)
 
 
@@ -1234,6 +1290,13 @@ def main() -> None:
     subscribers = load_subscribers()
     if not subscribers:
         log.info("No subscribers yet — nothing to broadcast")
+        return
+
+    # On-demand summary test (manual workflow_dispatch input). Runs the summary
+    # now and exits, without touching the normal broadcast / last-seen state.
+    if SELFTEST_SUMMARY:
+        log.info("SELFTEST_SUMMARY set — running summary self-test and exiting")
+        run_summary_selftest(subscribers)
         return
 
     # Load last seen post
