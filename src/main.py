@@ -397,43 +397,226 @@ def filter_new_posts(posts: list[dict[str, Any]], last_seen_id: str) -> list[dic
     return new_posts
 
 # ---------------------------------------------------------------------------
-# Translation (Google Translate free API)
+# Translation (multiple providers, tried in order)
 # ---------------------------------------------------------------------------
+#
+# The bot runs on GitHub Actions' shared runners, whose IPs Google's keyless
+# translate endpoint regularly answers with HTTP 429 ("your computer or network
+# may be sending automated queries"). With a single provider that meant whole
+# bursts of posts went out with the English original sitting under the
+# "תרגום לעברית" heading, because the failure path silently reused the source
+# text. We now try several independent providers and only give up — and say so
+# in the message — once every one of them has failed.
 
-TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
+GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
+GOOGLE_CLIENTS5_URL = "https://clients5.google.com/translate_a/t"
+MYMEMORY_URL = "https://api.mymemory.translated.net/get"
+
+# Old name, kept so existing references/imports keep working.
+TRANSLATE_URL = GOOGLE_TRANSLATE_URL
+
 MAX_TRANSLATE_CHUNK = 4500
+# MyMemory rejects a q longer than 500 bytes.
+MYMEMORY_MAX_CHUNK = 450
+
+# The generic bot User-Agent draws throttling faster than a browser's.
+TRANSLATE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+HEBREW_CHARS_RE = re.compile(r"[\u0590-\u05FF]")
+LATIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+URL_RE = re.compile(r"https?://\S+|www\.\S+")
+
+# Under this many Latin words a chunk (a bare link, "MAGA!", a hashtag) can
+# legitimately come back unchanged, so we don't insist on Hebrew in the answer.
+MIN_LATIN_WORDS_FOR_HEBREW_CHECK = 3
+
+TRANSLATE_AI_SYSTEM = (
+    "You are a translation engine. Translate the user's English text into "
+    "Hebrew. Reply with the Hebrew translation only — no preamble, no "
+    "commentary, no transliteration, no quotation marks. Keep line breaks, "
+    "names, numbers and URLs as they are. Translate faithfully even when the "
+    "text is political or heated; you are rendering it, not endorsing it."
+)
 
 
-def translate_to_hebrew(text: str) -> str:
-    """Translate English text to Hebrew using free Google Translate API."""
-    if not text.strip():
-        return text
+def _latin_word_count(text: str) -> int:
+    """Count Latin-script words, ignoring any URLs."""
+    return len(LATIN_WORD_RE.findall(URL_RE.sub(" ", text)))
 
-    chunks = _split_text(text, MAX_TRANSLATE_CHUNK)
-    translated_parts: list[str] = []
 
-    for chunk in chunks:
-        params = urllib.parse.urlencode({
-            "client": "gtx",
-            "sl": "en",
-            "tl": "he",
-            "dt": "t",
-            "q": chunk,
-        })
-        url = f"{TRANSLATE_URL}?{params}"
+def _needs_translation(text: str) -> bool:
+    """Whether a chunk holds anything worth sending to a translator."""
+    return _latin_word_count(text) > 0
 
+
+def _looks_translated(chunk: str, candidate: str | None) -> bool:
+    """Reject an answer that is empty or still plain English.
+
+    Providers often fail softly — echoing the input back, or returning a quota
+    notice as if it were a translation. That is exactly how untranslated
+    English used to reach subscribers, so a result only counts when real
+    Hebrew comes back.
+    """
+    if not candidate or not candidate.strip():
+        return False
+    if _latin_word_count(chunk) < MIN_LATIN_WORDS_FOR_HEBREW_CHECK:
+        return True
+    return bool(HEBREW_CHARS_RE.search(candidate))
+
+
+def _translate_google_gtx(chunk: str) -> str | None:
+    """Google's keyless translate endpoint — best quality, throttled hardest."""
+    params = urllib.parse.urlencode({
+        "client": "gtx",
+        "sl": "en",
+        "tl": "he",
+        "dt": "t",
+        "q": chunk,
+    })
+    raw = http_get(
+        f"{GOOGLE_TRANSLATE_URL}?{params}",
+        headers={"User-Agent": TRANSLATE_USER_AGENT},
+        retries=1,
+    )
+    result = json.loads(raw)
+    return "".join(seg[0] for seg in result[0] if seg and seg[0])
+
+
+def _extract_clients5_text(result: Any) -> str | None:
+    """Pull the text out of clients5's several response shapes.
+
+    Seen in the wild: ``"שלום"``, ``["שלום"]``, ``[["שלום", "hello"]]`` and
+    ``{"sentences": [{"trans": "שלום"}]}``.
+    """
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        sentences = result.get("sentences")
+        if not isinstance(sentences, list):
+            return None
+        return "".join(
+            s.get("trans", "") for s in sentences if isinstance(s, dict)
+        )
+    if isinstance(result, list):
+        parts: list[str] = []
+        for item in result:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, list) and item and isinstance(item[0], str):
+                parts.append(item[0])
+        return "".join(parts)
+    return None
+
+
+def _translate_google_clients5(chunk: str) -> str | None:
+    """A second Google host, rate-limited separately from the first."""
+    params = urllib.parse.urlencode({
+        "client": "dict-chrome-ex",
+        "sl": "en",
+        "tl": "he",
+        "q": chunk,
+    })
+    raw = http_get(
+        f"{GOOGLE_CLIENTS5_URL}?{params}",
+        headers={"User-Agent": TRANSLATE_USER_AGENT},
+        retries=1,
+    )
+    return _extract_clients5_text(json.loads(raw))
+
+
+def _translate_mymemory(chunk: str) -> str | None:
+    """MyMemory's free tier — no key, but a small per-request length cap."""
+    params = urllib.parse.urlencode({"q": chunk, "langpair": "en|he"})
+    raw = http_get(
+        f"{MYMEMORY_URL}?{params}",
+        headers={"User-Agent": TRANSLATE_USER_AGENT},
+        retries=1,
+    )
+    result = json.loads(raw)
+    if not isinstance(result, dict):
+        return None
+    data = result.get("responseData")
+    if not isinstance(data, dict):
+        return None
+    text = data.get("translatedText")
+    # Over quota, MyMemory returns 200 with an English warning in this field;
+    # _looks_translated rejects it because no Hebrew comes back.
+    return text if isinstance(text, str) else None
+
+
+def _translate_ai(chunk: str) -> str | None:
+    """Last resort: the same AI provider the daily summary uses.
+
+    The default (Pollinations) needs no API key, so this fallback is always
+    available and does not share Google's rate limits.
+    """
+    if not _ai_key_available():
+        return None
+    return _ai_complete(TRANSLATE_AI_SYSTEM, chunk)
+
+
+# (name, function, max characters per request), best first.
+TRANSLATE_PROVIDERS: list[tuple[str, Any, int]] = [
+    ("google-gtx", _translate_google_gtx, MAX_TRANSLATE_CHUNK),
+    ("google-clients5", _translate_google_clients5, MAX_TRANSLATE_CHUNK),
+    ("mymemory", _translate_mymemory, MYMEMORY_MAX_CHUNK),
+    ("ai", _translate_ai, MAX_TRANSLATE_CHUNK),
+]
+
+
+def _translate_with_provider(
+    name: str,
+    translate_chunk: Any,
+    max_chunk: int,
+    text: str,
+) -> str | None:
+    """Translate the whole text with one provider, or None if it fails.
+
+    A provider has to handle every chunk: a partial success would produce a
+    message that is half Hebrew and half English, which is worse than moving
+    on to the next provider.
+    """
+    parts: list[str] = []
+    for chunk in _split_text(text, max_chunk):
+        if not _needs_translation(chunk):
+            parts.append(chunk)
+            continue
         try:
-            # No retries on translation: if Google blocks/throttles we'd burn
-            # the script budget waiting. Fall back to the original text instead.
-            raw = http_get(url, retries=1)
-            result = json.loads(raw)
-            translated = "".join(seg[0] for seg in result[0] if seg[0])
-            translated_parts.append(translated)
+            candidate = translate_chunk(chunk)
         except Exception as exc:
-            log.warning("Translation failed for chunk: %s", exc)
-            translated_parts.append(chunk)
+            log.warning("Translation provider %s failed: %s", name, exc)
+            return None
+        if not _looks_translated(chunk, candidate):
+            log.warning("Translation provider %s returned untranslated text", name)
+            return None
+        parts.append(candidate)
+    return "".join(parts)
 
-    return "".join(translated_parts)
+
+def translate_to_hebrew(text: str) -> tuple[str, bool]:
+    """Translate English text to Hebrew, trying each provider in turn.
+
+    Returns ``(text, translated)``. When ``translated`` is False every provider
+    failed and ``text`` is the untouched English original — the caller must not
+    present it as a Hebrew translation.
+    """
+    if not text.strip():
+        return text, True
+
+    for name, translate_chunk, max_chunk in TRANSLATE_PROVIDERS:
+        translated = _translate_with_provider(name, translate_chunk, max_chunk, text)
+        if translated is not None:
+            log.info("Translated post via %s", name)
+            return translated, True
+
+    log.error(
+        "All %d translation providers failed — sending the English original",
+        len(TRANSLATE_PROVIDERS),
+    )
+    return text, False
 
 
 def _split_text(text: str, max_len: int) -> list[str]:
@@ -494,12 +677,26 @@ def _parse_iso(date_str: str) -> datetime:
     return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
 
 
-def build_message(post: dict[str, Any], hebrew: str) -> str:
-    """Build the Telegram message in HTML format — English text + Hebrew translation."""
+def build_message(post: dict[str, Any], hebrew: str, translated: bool = True) -> str:
+    """Build the Telegram message in HTML format — English text + Hebrew translation.
+
+    When ``translated`` is False the translation providers all failed, so the
+    post goes out with a notice instead of the English original repeated under
+    a "תרגום לעברית" heading.
+    """
     original = html.escape(post["text"])
-    translated = html.escape(hebrew)
     timestamp = format_timestamp(post["created_at"])
     link = post.get("url", "")
+
+    if translated:
+        hebrew_block = (
+            "🇮🇱 <b>תרגום לעברית:</b>\n"
+            f"{html.escape(hebrew)}\n"
+        )
+    else:
+        hebrew_block = (
+            "⚠️ <b>התרגום לעברית נכשל כרגע — הפוסט מוצג באנגלית בלבד.</b>\n"
+        )
 
     msg = (
         "🇺🇸 <b>טראמפ — פוסט חדש</b>\n"
@@ -509,8 +706,7 @@ def build_message(post: dict[str, Any], hebrew: str) -> str:
         "\n"
         "━━━━━━━━━━━━━━━\n"
         "\n"
-        f"🇮🇱 <b>תרגום לעברית:</b>\n"
-        f"{translated}\n"
+        f"{hebrew_block}"
     )
     if link:
         msg += f'\n🔗 <a href="{html.escape(link)}">לפוסט המקורי</a>'
@@ -600,9 +796,14 @@ def send_telegram_message(
     return True
 
 
-def send_post_message(post: dict[str, Any], hebrew: str, chat_id: str) -> bool:
+def send_post_message(
+    post: dict[str, Any],
+    hebrew: str,
+    chat_id: str,
+    translated: bool = True,
+) -> bool:
     """Send a translated post to a specific chat."""
-    message = build_message(post, hebrew)
+    message = build_message(post, hebrew, translated)
     return send_telegram_message(message, chat_id=chat_id)
 
 
@@ -1321,8 +1522,8 @@ def main() -> None:
             break
 
         log.info("Processing post %s", post["id"])
-        hebrew = translate_to_hebrew(post["text"])
-        message = build_message(post, hebrew)
+        hebrew, translated = translate_to_hebrew(post["text"])
+        message = build_message(post, hebrew, translated)
 
         delivered = 0
         for sub_chat_id in sorted(subscribers):
@@ -1339,7 +1540,9 @@ def main() -> None:
         if delivered > 0:
             latest_id = post["id"]
             # Record the post so it can appear in the daily summary digest.
-            log_post(post, hebrew)
+            # An untranslated post logs an empty Hebrew field so the digest
+            # falls back to the English text rather than labelling it Hebrew.
+            log_post(post, hebrew if translated else "")
         else:
             log.warning("Failed to deliver post %s to any subscriber — stopping to retry next run", post["id"])
             break

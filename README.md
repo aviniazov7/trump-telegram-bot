@@ -10,6 +10,23 @@ The bot is **broadcast-only**:
 - No slash-command menu is shown. All other messages are ignored silently —
   users can't trigger any action.
 
+## Translation
+
+Each post is translated to Hebrew by trying several providers in order, moving
+on as soon as one returns real Hebrew:
+
+1. Google's keyless translate endpoint (`translate.googleapis.com`)
+2. A second Google host (`clients5.google.com`), rate-limited separately
+3. MyMemory's free API (no key)
+4. The same AI provider the daily summary uses (Pollinations by default, keyless)
+
+The fallback chain matters because GitHub Actions runs on shared IPs that
+Google's free endpoint often answers with HTTP 429, which previously left posts
+untranslated. A provider that echoes the English back or returns a quota notice
+is treated as a failure rather than a translation. If every provider fails, the
+post is still broadcast, but it is clearly marked as untranslated instead of
+showing English under a "translated to Hebrew" heading.
+
 ## Daily summary
 
 Once a day the bot also sends a **Hebrew summary of all of Trump's posts from
