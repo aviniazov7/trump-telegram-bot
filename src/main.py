@@ -633,7 +633,11 @@ def _translate_with_provider(
             log.warning("Translation provider %s failed: %s", name, exc)
             return None
         if not _looks_translated(chunk, candidate):
-            log.warning("Translation provider %s returned untranslated text", name)
+            # Distinguish "no answer at all" from "an answer that wasn't
+            # Hebrew" — the two point at very different causes when reading
+            # these logs later.
+            reason = "no answer" if not candidate else "untranslated text"
+            log.warning("Translation provider %s returned %s", name, reason)
             return None
         parts.append(candidate)
     return "".join(parts)
