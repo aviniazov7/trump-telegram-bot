@@ -411,6 +411,14 @@ def filter_new_posts(posts: list[dict[str, Any]], last_seen_id: str) -> list[dic
 GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 GOOGLE_CLIENTS5_URL = "https://clients5.google.com/translate_a/t"
 MYMEMORY_URL = "https://api.mymemory.translated.net/get"
+# Lingva is a keyless Google Translate front end. Several public instances run
+# the same API, on different hosts and IPs, so one being throttled or down does
+# not take the rest with it.
+LINGVA_INSTANCES = (
+    "https://lingva.ml",
+    "https://lingva.garudalinux.org",
+    "https://translate.plausibility.cloud",
+)
 
 # Old name, kept so existing references/imports keep working.
 TRANSLATE_URL = GOOGLE_TRANSLATE_URL
@@ -418,6 +426,8 @@ TRANSLATE_URL = GOOGLE_TRANSLATE_URL
 MAX_TRANSLATE_CHUNK = 4500
 # MyMemory rejects a q longer than 500 bytes.
 MYMEMORY_MAX_CHUNK = 450
+# Lingva takes the text in the URL path, so stay well inside URL length limits.
+LINGVA_MAX_CHUNK = 1200
 
 # The generic bot User-Agent draws throttling faster than a browser's.
 TRANSLATE_USER_AGENT = (
@@ -558,10 +568,43 @@ def _translate_ai(chunk: str) -> str | None:
     return _ai_complete(TRANSLATE_AI_SYSTEM, chunk)
 
 
+def _translate_lingva(chunk: str) -> str | None:
+    """Try each Lingva instance in turn; the first real answer wins."""
+    path = urllib.parse.quote(chunk, safe="")
+    last_exc: Exception | None = None
+    for base in LINGVA_INSTANCES:
+        try:
+            raw = http_get(
+                f"{base}/api/v1/en/he/{path}",
+                headers={"User-Agent": TRANSLATE_USER_AGENT},
+                retries=1,
+            )
+        except Exception as exc:
+            last_exc = exc
+            continue
+        try:
+            result = json.loads(raw)
+        except ValueError as exc:
+            last_exc = exc
+            continue
+        if isinstance(result, dict):
+            text = result.get("translation")
+            if isinstance(text, str) and text.strip():
+                return text
+    if last_exc is not None:
+        log.debug("All Lingva instances failed, last error: %s", last_exc)
+    return None
+
+
 # (name, function, max characters per request), best first.
+#
+# The AI entry is last on purpose: the keyless default (Pollinations) started
+# answering 402 Payment Required, so it only contributes when GEMINI_API_KEY or
+# ANTHROPIC_API_KEY is set. Everything above it needs no key at all.
 TRANSLATE_PROVIDERS: list[tuple[str, Any, int]] = [
     ("google-gtx", _translate_google_gtx, MAX_TRANSLATE_CHUNK),
     ("google-clients5", _translate_google_clients5, MAX_TRANSLATE_CHUNK),
+    ("lingva", _translate_lingva, LINGVA_MAX_CHUNK),
     ("mymemory", _translate_mymemory, MYMEMORY_MAX_CHUNK),
     ("ai", _translate_ai, MAX_TRANSLATE_CHUNK),
 ]

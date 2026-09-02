@@ -17,13 +17,15 @@ on as soon as one returns real Hebrew:
 
 1. Google's keyless translate endpoint (`translate.googleapis.com`)
 2. A second Google host (`clients5.google.com`), rate-limited separately
-3. MyMemory's free API (no key)
-4. The same AI provider the daily summary uses (Pollinations by default, keyless)
+3. Lingva — keyless Google Translate front ends, several public instances
+4. MyMemory's free API (no key)
+5. The AI provider the daily summary uses (only if an API key is set — see below)
 
 The fallback chain matters because GitHub Actions runs on shared IPs that
-Google's free endpoint often answers with HTTP 429, which previously left posts
-untranslated. A provider that echoes the English back or returns a quota notice
-is treated as a failure rather than a translation. If every provider fails, the
+Google's free endpoint intermittently answers with HTTP 429, which previously
+left posts untranslated whenever the throttle happened to hit. A provider that
+echoes the English back or returns a quota notice is treated as a failure
+rather than a translation. If every provider fails, the
 post is still broadcast, but it is clearly marked as untranslated instead of
 showing English under a "translated to Hebrew" heading.
 
@@ -39,8 +41,13 @@ log is pruned to the last 7 days automatically.
 ### AI-written summary (free, no setup)
 
 The digest is a **concise, topic-organized Hebrew recap written by AI** rather
-than a raw list. The default provider is **Pollinations** — a free AI service
-that needs **no API key and no setup at all**. It just works out of the box.
+than a raw list. The default provider is **Pollinations**, which needs no API
+key.
+
+> **Note:** Pollinations now answers `HTTP 402 Payment Required` from GitHub
+> Actions, so with no key configured the AI step fails and the digest falls
+> back to the plain numbered list. Setting a free `GEMINI_API_KEY` (below)
+> restores the AI digest *and* adds a strong last-resort translation provider.
 
 If the AI service is unavailable for a given day, the summary still goes out —
 it falls back to a numbered list with each post's time, its translation, and a
