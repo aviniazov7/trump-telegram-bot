@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -43,10 +43,6 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LAST_SEEN_FILE = DATA_DIR / "last_seen.txt"
 LAST_UPDATE_ID_FILE = DATA_DIR / "last_update_id.txt"
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.txt"
-# Daily summary state: a JSON-lines log of every broadcast post, and the last
-# Israel-calendar date for which a summary was already sent.
-POSTS_LOG_FILE = DATA_DIR / "posts_log.txt"
-LAST_SUMMARY_DATE_FILE = DATA_DIR / "last_summary_date.txt"
 
 # Use Asia/Jerusalem so Israel DST (UTC+2 winter / UTC+3 summer) is correct.
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -74,38 +70,20 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# ---- Daily summary -------------------------------------------------------
-# Once a day, at the end of the day, the bot sends a digest of all of Trump's
-# posts from that Israel-calendar day. Set DAILY_SUMMARY_ENABLED=false to off.
-DAILY_SUMMARY_ENABLED = (
-    os.environ.get("DAILY_SUMMARY_ENABLED", "true").strip().lower()
-    not in ("0", "false", "no", "off")
-)
-# Hour (Israel time, 0-23) at/after which the day's summary is sent. Default
-# 22:00 — a day's digest goes out the same evening, covering 00:00 until now.
-DAILY_SUMMARY_HOUR = _env_int("DAILY_SUMMARY_HOUR", 22)
-# How many days of post history to keep in the log before pruning.
-SUMMARY_LOG_RETENTION_DAYS = _env_int("SUMMARY_LOG_RETENTION_DAYS", 7)
-# Max characters of each post's translation shown in the fallback list digest.
-SUMMARY_SNIPPET_LEN = _env_int("SUMMARY_SNIPPET_LEN", 350)
-
-# ---- AI summary ----------------------------------------------------------
-# The daily digest is an AI-written Hebrew recap instead of a raw list. Falls
-# back to the list digest on any failure.
-#
-# Default provider is Pollinations, a free AI service that needs NO API key —
-# zero setup. Set SUMMARY_AI_PROVIDER to:
-#   - "pollinations" (default) — free, keyless.
+# ---- AI provider ---------------------------------------------------------
+# Used only as the last-resort link in the translation fallback chain (see
+# TRANSLATE_PROVIDERS). Set AI_PROVIDER to:
+#   - "pollinations" (default) — keyless, but currently answers 402, so this
+#     link is inert until one of the keyed providers below is configured.
 #   - "gemini"  — Google Gemini free tier (set GEMINI_API_KEY).
 #   - "claude"  — Anthropic API, paid (set ANTHROPIC_API_KEY).
-SUMMARY_AI_ENABLED = (
-    os.environ.get("SUMMARY_AI_ENABLED", "true").strip().lower()
-    not in ("0", "false", "no", "off")
-)
-SUMMARY_AI_PROVIDER = os.environ.get("SUMMARY_AI_PROVIDER", "pollinations").strip().lower()
-SUMMARY_MAX_TOKENS = _env_int("SUMMARY_MAX_TOKENS", 1500)
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "pollinations").strip().lower()
+AI_MAX_TOKENS = _env_int("AI_MAX_TOKENS", 1500)
+# Generous per-request timeout: a model call is slower than a translate call,
+# and this only runs after every keyless provider has already failed.
+AI_TIMEOUT = _env_int("AI_TIMEOUT", 60)
 
-# Pollinations (free, no API key) — the default provider. OpenAI-compatible.
+# Pollinations (no API key) — the default provider. OpenAI-compatible.
 POLLINATIONS_API_URL = "https://text.pollinations.ai/openai"
 POLLINATIONS_MODEL = os.environ.get("POLLINATIONS_MODEL", "openai").strip()
 
@@ -121,14 +99,7 @@ GEMINI_API_URL = (
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
-SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "claude-opus-4-8").strip()
-
-# On-demand test: when set (via the workflow's selftest_summary input), the
-# bot builds and sends a summary immediately, bypassing the daily schedule,
-# so the AI path can be verified without waiting for DAILY_SUMMARY_HOUR.
-SELFTEST_SUMMARY = (
-    os.environ.get("SELFTEST_SUMMARY", "").strip().lower() in ("1", "true", "yes", "on")
-)
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8").strip()
 
 _script_deadline: float | None = None
 
@@ -558,10 +529,10 @@ def _translate_mymemory(chunk: str) -> str | None:
 
 
 def _translate_ai(chunk: str) -> str | None:
-    """Last resort: the same AI provider the daily summary uses.
+    """Last resort: the configured AI provider.
 
-    The default (Pollinations) needs no API key, so this fallback is always
-    available and does not share Google's rate limits.
+    Does not share Google's rate limits, but the keyless default currently
+    answers 402, so this only contributes once a key is configured.
     """
     if not _ai_key_available():
         return None
@@ -1101,124 +1072,13 @@ def process_telegram_commands() -> None:
         save_last_update_id(max_update_id)
 
 # ---------------------------------------------------------------------------
-# Daily summary — digest of all of the previous day's posts
+# AI provider — last-resort translation fallback
 # ---------------------------------------------------------------------------
-
-
-def _israel_date_of(post: dict[str, Any]) -> str:
-    """Israel-calendar date (YYYY-MM-DD) a post belongs to.
-
-    Falls back to today's Israel date if the timestamp can't be parsed, so a
-    post is never silently dropped from the log.
-    """
-    dt = _parse_post_date(post.get("created_at", ""))
-    if dt is None:
-        return datetime.now(ISRAEL_TZ).strftime("%Y-%m-%d")
-    return dt.astimezone(ISRAEL_TZ).strftime("%Y-%m-%d")
-
-
-def log_post(post: dict[str, Any], hebrew: str) -> None:
-    """Append a broadcast post to the JSON-lines log for the daily summary."""
-    record = {
-        "id": post.get("id", ""),
-        "created_at": post.get("created_at", ""),
-        "israel_date": _israel_date_of(post),
-        "text": post.get("text", ""),
-        "hebrew": hebrew,
-        "url": post.get("url", ""),
-    }
-    try:
-        POSTS_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with POSTS_LOG_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        log.warning("Failed to log post %s for daily summary: %s", record["id"], exc)
-
-
-def _iter_logged_posts() -> list[dict[str, Any]]:
-    """Read all valid JSON records from the log, skipping legacy/corrupt lines."""
-    if not POSTS_LOG_FILE.exists():
-        return []
-    records: list[dict[str, Any]] = []
-    for line in POSTS_LOG_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return records
-
-
-def load_posts_for_date(israel_date: str) -> list[dict[str, Any]]:
-    """All logged posts belonging to a given Israel date, oldest first."""
-    posts = [r for r in _iter_logged_posts() if r.get("israel_date") == israel_date]
-    posts.sort(key=lambda r: r.get("created_at", ""))
-    return posts
-
-
-def prune_posts_log(keep_days: int = SUMMARY_LOG_RETENTION_DAYS) -> None:
-    """Drop log entries older than keep_days (also clears legacy lines)."""
-    if not POSTS_LOG_FILE.exists():
-        return
-    cutoff = (datetime.now(ISRAEL_TZ).date() - timedelta(days=keep_days)).isoformat()
-    # ISO date strings sort lexicographically, so a string compare is enough.
-    kept = [r for r in _iter_logged_posts() if r.get("israel_date", "") >= cutoff]
-    content = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept)
-    try:
-        POSTS_LOG_FILE.write_text(content, encoding="utf-8")
-    except OSError as exc:
-        log.warning("Failed to prune posts log: %s", exc)
-
-
-def load_last_summary_date() -> str:
-    """Last Israel date (YYYY-MM-DD) a summary was sent for, or ''."""
-    if LAST_SUMMARY_DATE_FILE.exists():
-        return LAST_SUMMARY_DATE_FILE.read_text().strip()
-    return ""
-
-
-def save_last_summary_date(israel_date: str) -> None:
-    LAST_SUMMARY_DATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LAST_SUMMARY_DATE_FILE.write_text(israel_date + "\n")
-
-
-def _snippet(text: str, limit: int = SUMMARY_SNIPPET_LEN) -> str:
-    """Collapse whitespace and truncate a post's text for the digest."""
-    flat = re.sub(r"\s+", " ", text).strip()
-    if len(flat) <= limit:
-        return flat
-    return flat[: limit - 1].rstrip() + "…"
-
-
-def build_daily_summary(israel_date: str, posts: list[dict[str, Any]]) -> str:
-    """Build the Hebrew daily-digest message for a day's posts."""
-    try:
-        pretty_date = date.fromisoformat(israel_date).strftime("%d/%m/%Y")
-    except ValueError:
-        pretty_date = israel_date
-
-    header = (
-        "📋 <b>סיכום יומי — טראמפ ב-Truth Social</b>\n"
-        f"🗓️ {pretty_date}\n"
-        f"📨 סה\"כ {len(posts)} פוסטים\n"
-        "\n"
-        "━━━━━━━━━━━━━━━\n"
-    )
-
-    lines = [header]
-    for i, post in enumerate(posts, start=1):
-        dt = _parse_post_date(post.get("created_at", ""))
-        time_str = dt.astimezone(ISRAEL_TZ).strftime("%H:%M") if dt else "—"
-        body = _snippet(post.get("hebrew") or post.get("text") or "")
-        entry = f"\n<b>{i}.</b> 🕐 {time_str}\n{html.escape(body)}"
-        link = post.get("url", "")
-        if link:
-            entry += f'\n🔗 <a href="{html.escape(link)}">לפוסט המקורי</a>'
-        lines.append(entry + "\n")
-
-    return "".join(lines)
+#
+# Only _translate_ai uses these. The keyless default (Pollinations) currently
+# answers 402 Payment Required, so this link contributes nothing unless
+# GEMINI_API_KEY or ANTHROPIC_API_KEY is set; the keyless providers ahead of it
+# in TRANSLATE_PROVIDERS carry translation on their own.
 
 
 def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any] | None:
@@ -1230,9 +1090,7 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> di
         method="POST",
     )
     try:
-        # Generous timeout: summarization can take a while, and we're well
-        # inside the script budget by the time the summary runs.
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
             return json.loads(resp.read())
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
         log.warning("AI request to %s failed: %s", url, exc)
@@ -1240,7 +1098,7 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> di
 
 
 def _call_pollinations(system: str, user: str) -> str | None:
-    """Call Pollinations' free, keyless AI (OpenAI-compatible); text or None."""
+    """Call Pollinations' keyless AI (OpenAI-compatible); text or None."""
     payload = {
         "model": POLLINATIONS_MODEL,
         "messages": [
@@ -1267,7 +1125,7 @@ def _call_gemini(system: str, user: str) -> str | None:
     payload = {
         "system_instruction": {"parts": [{"text": system}]},
         "contents": [{"parts": [{"text": user}]}],
-        "generationConfig": {"maxOutputTokens": SUMMARY_MAX_TOKENS},
+        "generationConfig": {"maxOutputTokens": AI_MAX_TOKENS},
     }
     result = _post_json(GEMINI_API_URL, payload, {"x-goog-api-key": GEMINI_API_KEY})
     if not result:
@@ -1286,8 +1144,8 @@ def _call_claude(system: str, user: str) -> str | None:
     if not ANTHROPIC_API_KEY:
         return None
     payload = {
-        "model": SUMMARY_MODEL,
-        "max_tokens": SUMMARY_MAX_TOKENS,
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": AI_MAX_TOKENS,
         "system": system,
         "messages": [{"role": "user", "content": user}],
     }
@@ -1298,7 +1156,7 @@ def _call_claude(system: str, user: str) -> str | None:
     if not result:
         return None
     if result.get("stop_reason") == "refusal":
-        log.warning("Claude API refused the summary request")
+        log.warning("Claude API refused the request")
         return None
     parts = [
         block.get("text", "")
@@ -1311,9 +1169,9 @@ def _call_claude(system: str, user: str) -> str | None:
 
 def _ai_complete(system: str, user: str) -> str | None:
     """Run the configured AI provider, returning its text or None."""
-    if SUMMARY_AI_PROVIDER == "claude":
+    if AI_PROVIDER == "claude":
         return _call_claude(system, user)
-    if SUMMARY_AI_PROVIDER == "gemini":
+    if AI_PROVIDER == "gemini":
         return _call_gemini(system, user)
     return _call_pollinations(system, user)
 
@@ -1321,190 +1179,14 @@ def _ai_complete(system: str, user: str) -> str | None:
 def _ai_key_available() -> bool:
     """Whether the configured provider is usable (has a key, if it needs one).
 
-    Pollinations is keyless, so it's always available.
+    Pollinations is keyless, so it always reports available — it can still fail
+    at call time, which _looks_translated catches.
     """
-    if SUMMARY_AI_PROVIDER == "claude":
+    if AI_PROVIDER == "claude":
         return bool(ANTHROPIC_API_KEY)
-    if SUMMARY_AI_PROVIDER == "gemini":
+    if AI_PROVIDER == "gemini":
         return bool(GEMINI_API_KEY)
     return True
-
-
-def build_ai_summary(israel_date: str, posts: list[dict[str, Any]]) -> str | None:
-    """Ask the configured AI provider for a concise Hebrew recap of the day.
-
-    Returns a ready-to-send HTML message, or None if AI summarization is
-    disabled, no API key is set, or the request fails — so the caller can
-    fall back to the plain list digest.
-    """
-    if not (SUMMARY_AI_ENABLED and _ai_key_available()):
-        return None
-
-    try:
-        pretty_date = date.fromisoformat(israel_date).strftime("%d/%m/%Y")
-    except ValueError:
-        pretty_date = israel_date
-
-    # Feed the model the original English posts with their Israel-time stamps.
-    lines = []
-    for post in posts:
-        dt = _parse_post_date(post.get("created_at", ""))
-        time_str = dt.astimezone(ISRAEL_TZ).strftime("%H:%M") if dt else "—"
-        text = re.sub(r"\s+", " ", post.get("text", "")).strip()
-        if text:
-            lines.append(f"[{time_str}] {text}")
-    if not lines:
-        return None
-    posts_block = "\n".join(lines)
-
-    system = (
-        "אתה עורך חדשות ישראלי. תפקידך לסכם בעברית את הפעילות היומית של "
-        "דונלד טראמפ ברשת Truth Social עבור קוראים ישראלים. כתוב סיכום תמציתי, "
-        "ענייני ובהיר. ארגן את הסיכום לפי נושאים מרכזיים עם תבליטים (•). שמור על "
-        "טון עיתונאי ונייטרלי. כתוב בעברית בלבד, בטקסט רגיל ללא Markdown וללא "
-        "תגיות HTML. אל תוסיף הקדמה או סיכום-על — רק הסיכום עצמו."
-    )
-    user = (
-        f"להלן {len(posts)} הפוסטים שדונלד טראמפ פרסם ב-{pretty_date} "
-        f"(שעות בשעון ישראל). סכם את עיקרי הדברים בעברית:\n\n{posts_block}"
-    )
-
-    body = _ai_complete(system, user)
-    if not body:
-        return None
-
-    header = (
-        "📋 <b>סיכום יומי — טראמפ ב-Truth Social</b>\n"
-        f"🗓️ {pretty_date}\n"
-        f"📨 {len(posts)} פוסטים\n"
-        "\n"
-        "━━━━━━━━━━━━━━━\n"
-        "\n"
-    )
-    # The model returns plain text; escape it so any stray <, >, & is safe
-    # under Telegram's HTML parse mode.
-    return header + html.escape(body) + "\n\n🤖 <i>סיכום שנכתב על ידי בינה מלאכותית</i>"
-
-
-def send_daily_summary(
-    israel_date: str,
-    posts: list[dict[str, Any]],
-    subscribers: dict[str, str | None],
-) -> None:
-    """Broadcast the daily digest for israel_date to every subscriber.
-
-    Prefers an AI-written Hebrew recap; falls back to the plain list digest
-    if AI summarization is unavailable or fails.
-    """
-    message = build_ai_summary(israel_date, posts) or build_daily_summary(israel_date, posts)
-    log.info("Sending daily summary for %s (%d posts) to %d subscriber(s)",
-             israel_date, len(posts), len(subscribers))
-    for chat_id in sorted(subscribers):
-        if _budget_exceeded():
-            log.warning("Budget exceeded mid-summary — stopping")
-            break
-        send_telegram_message(message, chat_id=chat_id, thread_id=subscribers[chat_id])
-        time.sleep(0.05)
-
-
-def run_summary_selftest(subscribers: dict[str, str | None]) -> None:
-    """Build and send a summary right now, bypassing the daily schedule.
-
-    Triggered by the workflow's selftest_summary input so the AI summary path
-    (including the live provider call) can be verified on demand. Summarizes
-    the most recent day that has logged posts; if none are logged yet, sends a
-    short status note plus a live AI connectivity probe so the run still proves
-    the provider is reachable.
-    """
-    today = datetime.now(ISRAEL_TZ).date().isoformat()
-    used_date = today
-    posts = load_posts_for_date(today)
-    if not posts:
-        dates = sorted({r.get("israel_date", "") for r in _iter_logged_posts()} - {""})
-        if dates:
-            used_date = dates[-1]
-            posts = load_posts_for_date(used_date)
-
-    if posts:
-        log.info("Self-test: summarizing %d post(s) for %s", len(posts), used_date)
-        send_daily_summary(used_date, posts, subscribers)
-        return
-
-    log.info("Self-test: no logged posts yet — running AI connectivity probe")
-    probe = None
-    if SUMMARY_AI_ENABLED and _ai_key_available():
-        probe = _ai_complete(
-            "ענה בעברית במשפט קצר אחד בלבד.",
-            "כתוב משפט קצר שמאשר שאתה פעיל.",
-        )
-    if probe:
-        note = (
-            "🧪 <b>בדיקת סיכום</b>\n"
-            "אין עדיין פוסטים מתועדים לסיכום, אבל חיבור ה-AI עובד:\n\n"
-            f"{html.escape(probe)}"
-        )
-    else:
-        note = (
-            "🧪 <b>בדיקת סיכום</b>\n"
-            "אין עדיין פוסטים מתועדים לסיכום, וה-AI לא זמין כרגע — "
-            "הסיכום היומי ייפול לרשימה רגילה."
-        )
-    log.info("Self-test: sending status note to %d subscriber(s)", len(subscribers))
-    for chat_id in sorted(subscribers):
-        send_telegram_message(note, chat_id=chat_id, thread_id=subscribers[chat_id])
-        time.sleep(0.05)
-
-
-def maybe_send_daily_summary(subscribers: dict[str, str | None]) -> None:
-    """Send any outstanding daily summaries (one per day).
-
-    Runs every cron tick but fires only once per day. A day's summary becomes
-    due at DAILY_SUMMARY_HOUR (default 22:00 Israel) that same evening, so the
-    digest for today covers 00:00 until ~22:00. The last sent date is recorded
-    so it never repeats; if the bot was down it catches up, sending one digest
-    per missed day.
-    """
-    if not DAILY_SUMMARY_ENABLED:
-        return
-    if not subscribers:
-        return
-
-    now = datetime.now(ISRAEL_TZ)
-    yesterday = now.date() - timedelta(days=1)
-    last_sent = load_last_summary_date()
-
-    # First run: anchor to yesterday so we don't summarize pre-deployment
-    # history. Today's posts collect from now and go out tonight at the hour.
-    if not last_sent:
-        save_last_summary_date(yesterday.isoformat())
-        log.info("Initialized daily-summary anchor to %s", yesterday.isoformat())
-        return
-
-    # The most recent day whose summary is now due: today once we've passed
-    # the summary hour, otherwise yesterday (today isn't due until tonight).
-    due_through = now.date() if now.hour >= DAILY_SUMMARY_HOUR else yesterday
-
-    try:
-        target = date.fromisoformat(last_sent) + timedelta(days=1)
-    except ValueError:
-        log.warning("Bad last_summary_date %r — re-anchoring", last_sent)
-        save_last_summary_date(yesterday.isoformat())
-        return
-
-    while target <= due_through:
-        if _budget_exceeded():
-            log.warning("Budget exceeded — deferring daily summary to next run")
-            return
-        target_str = target.isoformat()
-        posts = load_posts_for_date(target_str)
-        if posts:
-            send_daily_summary(target_str, posts, subscribers)
-        else:
-            log.info("No posts logged for %s — skipping summary", target_str)
-        save_last_summary_date(target_str)
-        target += timedelta(days=1)
-
-    prune_posts_log()
 
 
 # ---------------------------------------------------------------------------
@@ -1539,19 +1221,9 @@ def main() -> None:
         log.info("No subscribers yet — nothing to broadcast")
         return
 
-    # On-demand summary test (manual workflow_dispatch input). Runs the summary
-    # now and exits, without touching the normal broadcast / last-seen state.
-    if SELFTEST_SUMMARY:
-        log.info("SELFTEST_SUMMARY set — running summary self-test and exiting")
-        run_summary_selftest(subscribers)
-        return
-
     # Load last seen post
     last_seen_id = load_last_seen()
 
-    # Fetch + filter new posts. Even when there's nothing new to broadcast we
-    # still fall through to the daily-summary check below, which runs on its
-    # own once-a-day schedule independent of whether this tick had new posts.
     posts = fetch_posts()
     new_posts = filter_new_posts(posts, last_seen_id) if posts else []
     if not posts:
@@ -1586,10 +1258,6 @@ def main() -> None:
 
         if delivered > 0:
             latest_id = post["id"]
-            # Record the post so it can appear in the daily summary digest.
-            # An untranslated post logs an empty Hebrew field so the digest
-            # falls back to the English text rather than labelling it Hebrew.
-            log_post(post, hebrew if translated else "")
         else:
             log.warning("Failed to deliver post %s to any subscriber — stopping to retry next run", post["id"])
             break
@@ -1600,10 +1268,6 @@ def main() -> None:
     # Update last seen
     if latest_id:
         save_last_seen(latest_id)
-
-    # Send the daily digest if one is due (independent of this run's posts).
-    if not _budget_exceeded():
-        maybe_send_daily_summary(subscribers)
 
     log.info("Done — processed up to post %s", latest_id or "(none)")
 
