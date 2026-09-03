@@ -19,7 +19,7 @@ on as soon as one returns real Hebrew:
 2. A second Google host (`clients5.google.com`), rate-limited separately
 3. Lingva — keyless Google Translate front ends, several public instances
 4. MyMemory's free API (no key)
-5. The AI provider the daily summary uses (only if an API key is set — see below)
+5. An AI model — only when an API key is configured (see below)
 
 The fallback chain matters because GitHub Actions runs on shared IPs that
 Google's free endpoint intermittently answers with HTTP 429, which previously
@@ -29,49 +29,24 @@ rather than a translation. If every provider fails, the
 post is still broadcast, but it is clearly marked as untranslated instead of
 showing English under a "translated to Hebrew" heading.
 
-## Daily summary
+## AI provider (optional)
 
-Once a day the bot also sends a **Hebrew summary of all of Trump's posts from
-that day**. Every broadcast post is recorded to `data/posts_log.txt`; the
-digest for the day is sent that evening (default 22:00 Israel time) and
-`data/last_summary_date.txt` ensures it's sent exactly once. If the bot is
-down for a few days it catches up, sending one digest per missed day, and the
-log is pruned to the last 7 days automatically.
+The bot needs no API key: the first four translation providers above are all
+keyless. The fifth is an AI model, used only when every keyless provider has
+failed.
 
-### AI-written summary (free, no setup)
+The default AI provider is **Pollinations**, which needs no key but currently
+answers `HTTP 402 Payment Required` from GitHub Actions — so out of the box
+that last link is inert. To make it a real fallback, set one of:
 
-The digest is a **concise, topic-organized Hebrew recap written by AI** rather
-than a raw list. The default provider is **Pollinations**, which needs no API
-key.
+- **Google Gemini** (free tier): `AI_PROVIDER=gemini` + a free `GEMINI_API_KEY`
+  from <https://aistudio.google.com/apikey> (no credit card).
+- **Anthropic Claude** (paid): `AI_PROVIDER=claude` + `ANTHROPIC_API_KEY`.
 
-> **Note:** Pollinations now answers `HTTP 402 Payment Required` from GitHub
-> Actions, so with no key configured the AI step fails and the digest falls
-> back to the plain numbered list. Setting a free `GEMINI_API_KEY` (below)
-> restores the AI digest *and* adds a strong last-resort translation provider.
-
-If the AI service is unavailable for a given day, the summary still goes out —
-it falls back to a numbered list with each post's time, its translation, and a
-link to the original.
-
-Want a higher-quality or more reliable provider? Two optional alternatives:
-
-- **Google Gemini** (free tier): `SUMMARY_AI_PROVIDER=gemini` + a free
-  `GEMINI_API_KEY` from <https://aistudio.google.com/apikey> (no credit card).
-- **Anthropic Claude** (paid): `SUMMARY_AI_PROVIDER=claude` + `ANTHROPIC_API_KEY`.
-
-### Configuration
-
-All optional, via Actions secrets / env vars:
-
-- `DAILY_SUMMARY_ENABLED` — set to `false` to turn the digest off (default on).
-- `DAILY_SUMMARY_HOUR` — hour (0–23, Israel time) to send the digest (default `22`).
-- `SUMMARY_AI_ENABLED` — set to `false` to always use the plain list (default on).
-- `SUMMARY_AI_PROVIDER` — `pollinations` (default, keyless), `gemini`, or `claude`.
-- `POLLINATIONS_MODEL` — Pollinations model (default `openai`).
-- `GEMINI_API_KEY` / `GEMINI_MODEL` — Gemini key and model (default `gemini-2.0-flash`).
-- `ANTHROPIC_API_KEY` / `SUMMARY_MODEL` — Claude key and model (default `claude-opus-4-8`).
-- `SUMMARY_LOG_RETENTION_DAYS` — days of post history to keep (default `7`).
-- `SUMMARY_SNIPPET_LEN` — max characters per post in the list fallback (default `350`).
+Other optional env vars: `POLLINATIONS_MODEL` (default `openai`),
+`GEMINI_MODEL` (default `gemini-2.0-flash`), `ANTHROPIC_MODEL` (default
+`claude-opus-4-8`), `AI_MAX_TOKENS` (default `1500`), `AI_TIMEOUT` seconds
+(default `60`).
 
 ## Setup
 
@@ -97,8 +72,6 @@ src/main.py                         Pipeline: fetch → translate → broadcast
 data/last_seen.txt                  Last processed post id (auto-updated)
 data/last_update_id.txt             Last processed Telegram update id
 data/subscribers.txt                Chat IDs receiving the broadcast
-data/posts_log.txt                  Per-post log feeding the daily summary
-data/last_summary_date.txt          Last date a daily summary was sent
 BOT-CONTROLS.sh                     gh-cli helper (status / run / logs)
 ```
 
