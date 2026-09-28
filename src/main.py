@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from state import BotState, StateError, load_or_migrate, store_from_env
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -39,10 +41,11 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# Runtime state lives outside git (see src/state.py). DATA_DIR only holds the
+# local-development state file and the legacy *.txt files the one-time
+# migration reads; it is gitignored.
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-LAST_SEEN_FILE = DATA_DIR / "last_seen.txt"
-LAST_UPDATE_ID_FILE = DATA_DIR / "last_update_id.txt"
-SUBSCRIBERS_FILE = DATA_DIR / "subscribers.txt"
+LOCAL_STATE_FILE = DATA_DIR / "state.json"
 
 # Use Asia/Jerusalem so Israel DST (UTC+2 winter / UTC+3 summer) is correct.
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -317,24 +320,6 @@ def fetch_posts() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Duplicate prevention
 # ---------------------------------------------------------------------------
-
-
-def load_last_seen() -> str:
-    """Load the last seen post ID from file."""
-    if LAST_SEEN_FILE.exists():
-        content = LAST_SEEN_FILE.read_text().strip()
-        if content:
-            log.info("Last seen post ID: %s", content)
-            return content
-    log.info("No last seen post ID found — first run")
-    return ""
-
-
-def save_last_seen(post_id: str) -> None:
-    """Save the last seen post ID to file."""
-    LAST_SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LAST_SEEN_FILE.write_text(post_id + "\n")
-    log.info("Saved last seen post ID: %s", post_id)
 
 
 def filter_new_posts(posts: list[dict[str, Any]], last_seen_id: str) -> list[dict[str, Any]]:
@@ -846,43 +831,17 @@ def clear_bot_menu() -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_subscribers() -> dict[str, str | None]:
-    """Load subscribers as {chat_id: thread_id_or_None}.
+def seed_owner(state: BotState) -> None:
+    """Make sure the configured owner chat is subscribed.
 
-    Each line in the file is either ``chat_id`` (post to General / private DM)
-    or ``chat_id\\tthread_id`` (post to a specific forum topic in a group).
+    Keeps existing deployments receiving posts even before the owner has
+    /start'ed the bot.
     """
-    subscribers: dict[str, str | None] = {}
-    if SUBSCRIBERS_FILE.exists():
-        for line in SUBSCRIBERS_FILE.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t", 1)
-            chat_id = parts[0].strip()
-            thread_id = parts[1].strip() if len(parts) == 2 and parts[1].strip() else None
-            if chat_id:
-                subscribers[chat_id] = thread_id
-    # Seed with the configured owner so existing deployments keep receiving
-    # posts even before they /start the bot from scratch.
-    if TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID not in subscribers:
-        subscribers[TELEGRAM_CHAT_ID] = None
-    return subscribers
+    if TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID not in state.subscribers:
+        state.subscribers[TELEGRAM_CHAT_ID] = None
 
 
-def save_subscribers(subscribers: dict[str, str | None]) -> None:
-    SUBSCRIBERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    lines = []
-    for chat_id in sorted(subscribers):
-        thread_id = subscribers[chat_id]
-        lines.append(f"{chat_id}\t{thread_id}" if thread_id else chat_id)
-    content = "\n".join(lines)
-    if content:
-        content += "\n"
-    SUBSCRIBERS_FILE.write_text(content)
-
-
-def add_subscriber(chat_id: str, thread_id: str | None = None) -> bool:
+def add_subscriber(state: BotState, chat_id: str, thread_id: str | None = None) -> bool:
     """Subscribe a chat (optionally pinned to a forum topic).
 
     Returns True if this changed the stored subscription (either a new chat,
@@ -890,45 +849,24 @@ def add_subscriber(chat_id: str, thread_id: str | None = None) -> bool:
     """
     if not chat_id:
         return False
-    subscribers = load_subscribers()
-    if subscribers.get(chat_id) == thread_id and chat_id in subscribers:
+    if chat_id in state.subscribers and state.subscribers[chat_id] == thread_id:
         return False
-    subscribers[chat_id] = thread_id
-    save_subscribers(subscribers)
+    state.subscribers[chat_id] = thread_id
     log.info(
         "Subscriber set: chat=%s thread=%s (total: %d)",
-        chat_id, thread_id, len(subscribers),
+        chat_id, thread_id, len(state.subscribers),
     )
     return True
 
 
-def remove_subscriber(chat_id: str) -> None:
-    if not chat_id:
-        return
-    subscribers = load_subscribers()
-    if chat_id in subscribers:
-        del subscribers[chat_id]
-        save_subscribers(subscribers)
-        log.info("Removed subscriber: %s (total: %d)", chat_id, len(subscribers))
+def remove_subscriber(state: BotState, chat_id: str) -> None:
+    if chat_id and chat_id in state.subscribers:
+        del state.subscribers[chat_id]
+        log.info("Removed subscriber: %s (total: %d)", chat_id, len(state.subscribers))
 
 # ---------------------------------------------------------------------------
 # Telegram — incoming updates (only /start subscribes; everything else ignored)
 # ---------------------------------------------------------------------------
-
-
-def load_last_update_id() -> int:
-    """Load the last processed Telegram update ID."""
-    if LAST_UPDATE_ID_FILE.exists():
-        content = LAST_UPDATE_ID_FILE.read_text().strip()
-        if content.isdigit():
-            return int(content)
-    return 0
-
-
-def save_last_update_id(update_id: int) -> None:
-    """Save the last processed Telegram update ID."""
-    LAST_UPDATE_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LAST_UPDATE_ID_FILE.write_text(str(update_id) + "\n")
 
 
 def get_telegram_updates(offset: int = 0) -> list[dict[str, Any]]:
@@ -993,13 +931,14 @@ def send_welcome(chat_id: str, chat_type: str, thread_id: str | None = None) -> 
         send_telegram_message(msg, chat_id=chat_id, thread_id=thread_id)
 
 
-def process_telegram_commands() -> None:
+def process_telegram_commands(state: BotState) -> None:
     """Handle incoming updates — subscribe on /start or when added to a chat.
 
-    Everything else is ignored silently: the bot is broadcast-only.
+    Mutates ``state`` in memory; the caller persists it. Everything else is
+    ignored silently: the bot is broadcast-only.
     """
     log.info("Checking for Telegram updates...")
-    last_update_id = load_last_update_id()
+    last_update_id = state.last_update_id
     offset = last_update_id + 1 if last_update_id else 0
 
     updates = get_telegram_updates(offset=offset)
@@ -1022,10 +961,10 @@ def process_telegram_commands() -> None:
             chat_type = chat.get("type", "")
             new_status = my_chat_member.get("new_chat_member", {}).get("status", "")
             if new_status in ("member", "administrator", "creator"):
-                if add_subscriber(chat_id):
+                if add_subscriber(state, chat_id):
                     send_welcome(chat_id, chat_type)
             elif new_status in ("kicked", "left", "restricted"):
-                remove_subscriber(chat_id)
+                remove_subscriber(state, chat_id)
             continue
 
         # Incoming message. /start in a private chat or group subscribes that
@@ -1056,12 +995,12 @@ def process_telegram_commands() -> None:
             continue
 
         if chat_type == "private":
-            newly_added = add_subscriber(chat_id)
+            newly_added = add_subscriber(state, chat_id)
             send_welcome(chat_id, chat_type)
             if not newly_added:
                 log.info("Existing subscriber re-/start'd: %s", chat_id)
         elif chat_type in ("group", "supergroup"):
-            changed = add_subscriber(chat_id, thread_id)
+            changed = add_subscriber(state, chat_id, thread_id)
             # Always confirm in the topic where /start was sent, even on a
             # no-op — so the admin sees that the bot heard them.
             send_welcome(chat_id, chat_type, thread_id=thread_id)
@@ -1069,7 +1008,7 @@ def process_telegram_commands() -> None:
                 log.info("Group %s already subscribed to thread %s", chat_id, thread_id)
 
     if max_update_id > last_update_id:
-        save_last_update_id(max_update_id)
+        state.last_update_id = max_update_id
 
 # ---------------------------------------------------------------------------
 # AI provider — last-resort translation fallback
@@ -1206,23 +1145,54 @@ def main() -> None:
         log.error("TELEGRAM_BOT_TOKEN environment variable is not set")
         sys.exit(1)
 
+    # Load state before touching Telegram. If the store is unreachable we stop
+    # here: guessing "empty" would re-send old posts and, on save, wipe the
+    # real subscriber list.
+    try:
+        store = store_from_env(LOCAL_STATE_FILE)
+        state = load_or_migrate(store, DATA_DIR)
+    except StateError as exc:
+        log.error("Cannot load bot state: %s", exc)
+        sys.exit(1)
+    persisted = state.copy()
+    seed_owner(state)
+    log.info(
+        "State: %d subscriber(s), last_seen=%s, last_update_id=%d",
+        len(state.subscribers), state.last_seen or "(none)", state.last_update_id,
+    )
+
+    def persist() -> None:
+        """Write state only if it changed, so idle runs make no API writes."""
+        nonlocal persisted
+        if state == persisted:
+            return
+        try:
+            store.save(state)
+        except StateError as exc:
+            log.error("Cannot save bot state: %s", exc)
+            sys.exit(1)
+        persisted = state.copy()
+        log.info("State saved")
+
     # Keep the slash-command menu cleared — the bot is broadcast-only.
     clear_bot_menu()
 
     # Pick up new subscribers / kicks before broadcasting this round's posts.
-    process_telegram_commands()
+    # Persist right away so a crash mid-broadcast doesn't lose a /start.
+    process_telegram_commands(state)
+    persist()
 
     if _budget_exceeded():
         log.warning("Budget exceeded after handling bot commands — exiting")
         return
 
-    subscribers = load_subscribers()
+    subscribers = state.subscribers
     if not subscribers:
         log.info("No subscribers yet — nothing to broadcast")
         return
 
-    # Load last seen post
-    last_seen_id = load_last_seen()
+    last_seen_id = state.last_seen
+    log.info("Last seen post ID: %s", last_seen_id or "(none) — first run")
 
     posts = fetch_posts()
     new_posts = filter_new_posts(posts, last_seen_id) if posts else []
@@ -1265,9 +1235,9 @@ def main() -> None:
         if len(new_posts) > 1:
             time.sleep(1)
 
-    # Update last seen
     if latest_id:
-        save_last_seen(latest_id)
+        state.last_seen = latest_id
+        persist()
 
     log.info("Done — processed up to post %s", latest_id or "(none)")
 
