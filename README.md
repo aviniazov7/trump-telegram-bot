@@ -58,20 +58,138 @@ Other optional env vars: `POLLINATIONS_MODEL` (default `openai`),
    - `TELEGRAM_CHAT_ID` — optional. If set, this chat is seeded as the
      initial subscriber so you start receiving posts before anyone else
      subscribes.
+   - `STATE_TOKEN` — required. A fine-grained token the bot uses to read and
+     write its state. See [State storage](#state-storage) for how to create it.
 3. **Enable GitHub Actions** for the repository. The workflow will run
    automatically every 10 minutes; you can also trigger it manually from
    *Actions → Trump Truth Social Check → Run workflow*.
 4. **Subscribe** — open a chat with the bot and send `/start`, or add the
    bot to a group / channel (as admin, for channels).
 
+## State storage
+
+The bot keeps a small amount of state between runs:
+
+- **subscribers**: the chat IDs (and optional forum topic) that receive posts
+- **last_seen**: the last post that was broadcast, so nothing is sent twice
+- **last_update_id**: the Telegram `getUpdates` offset, so each `/start` is
+  handled once
+
+### Why the state is not in git
+
+The bot used to keep this state in `data/*.txt` and commit it back after every
+run. That caused two problems:
+
+1. **Privacy.** This repository is public, so the subscribers' Telegram chat
+   IDs were published to everyone. A chat ID identifies a person and lets
+   anyone with a bot token message them. That's third-party personal data we
+   have no right to publish.
+2. **Noise and fragility.** The workflow wrote 750+ "Update bot state" commits,
+   needed `contents: write`, and had to rebase and retry its pushes whenever
+   `main` moved.
+
+State is runtime data, not source code, so it now lives outside the
+repository. The workflow has read-only access to the code.
+
+### Architecture
+
+```
+GitHub Actions (cron, every 10 min, concurrency group "trump-bot")
+  └─ src/main.py
+       1. store.load()             ← GitHub REST API: GET actions/variables/BOT_STATE
+       2. handle Telegram updates  (mutates state in memory)
+       3. store.save() if changed  → PATCH actions/variables/BOT_STATE
+       4. broadcast new posts
+       5. store.save() if changed  → PATCH (new last_seen)
+```
+
+- `src/state.py` defines a `StateStore` interface with two backends that store
+  the same JSON document:
+  - `GitHubVariableStateStore` (production) keeps the state in the
+    **`BOT_STATE` repository Actions variable**, using a fine-grained token
+    scoped to this one repository with only the *Variables* permission.
+  - `FileStateStore` (local development) uses `data/state.json`, which is
+    gitignored.
+- **Fail closed.** If the state can't be read, the run exits with an error
+  before it contacts Telegram. The bot never assumes "no state" when the store
+  is unreachable, because doing so would re-send old posts and then overwrite
+  the real subscriber list. A failed write also turns the run red.
+- **Minimal writes.** State is written only when it changed, so an idle run
+  makes a single API read.
+- **No races.** The workflow's concurrency group means only one run at a time
+  reads and writes the variable.
+- **Log redaction.** Actions logs of a public repo are public, so chat IDs are
+  logged only as a keyed hash (`chat#3a1f76687d`).
+
+### Why a repository variable (and not something else)
+
+| Option | Private | Extra account | Limits / caveats |
+|---|---|---|---|
+| **Repo Actions variable** (chosen) | Collaborators only | No | 48 KB per value (~1,500 subscribers); needs a PAT, because `GITHUB_TOKEN` can't write variables |
+| Secret Gist | No: anyone with the URL can read it | No | Token needs account-wide gist access; every revision is kept forever |
+| Upstash Redis (free) | Yes | Yes | 500K commands/month; a third party holds the PII; atomic ops |
+| Cloudflare KV (free) | Yes | Yes | 1K writes/day; eventually consistent (up to 60s), which risks stale reads |
+| `actions/cache` / artifacts | Yes | No | Caches can be evicted and are immutable per key; not a durable store |
+
+A repository variable keeps everything inside GitHub, costs nothing, and needs
+the narrowest credential of all the options (one repository, one permission).
+If the bot outgrows 48 KB, add another `StateStore` backend (for example
+Redis) and switch `STATE_BACKEND`. No other code has to change.
+
+### Setup: `STATE_TOKEN`
+
+1. Go to *GitHub → Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens → Generate new token*.
+   - **Repository access:** *Only select repositories* → `trump-telegram-bot`
+   - **Permissions → Repository → Variables:** *Read and write* (*Metadata:
+     Read* is added automatically)
+   - **Expiration:** choose the longest you're comfortable with, and set a
+     reminder. When the token expires the runs turn red, and no state is lost.
+2. Add it as the repository secret **`STATE_TOKEN`** (*Settings → Secrets and
+   variables → Actions → New repository secret*).
+
+Don't create `BOT_STATE` by hand. The first run creates it.
+
+### One-time migration from `data/*.txt`
+
+The first run after this change finds no `BOT_STATE` variable. It then reads
+the legacy `data/last_seen.txt`, `data/last_update_id.txt` and
+`data/subscribers.txt` from the checkout and creates the variable from them.
+The migration can only create the variable and never overwrites it, so every
+later run just loads `BOT_STATE` and ignores the files. The files are then
+removed from the tree and from history; see
+[docs/HISTORY_CLEANUP.md](docs/HISTORY_CLEANUP.md).
+
+### Configuration
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `STATE_BACKEND` | `file` | `github` on Actions (set in the workflow), `file` locally |
+| `STATE_TOKEN` | — | Fine-grained PAT (github backend) |
+| `STATE_VARIABLE` | `BOT_STATE` | Variable name (github backend) |
+| `STATE_FILE` | `data/state.json` | Path (file backend) |
+
+`GITHUB_REPOSITORY` and `GITHUB_API_URL` are set by Actions automatically.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests use only the standard library and run on every pull request
+(`.github/workflows/tests.yml`).
+
 ## Layout
 
 ```
-.github/workflows/trump-check.yml   GitHub Actions cron workflow
+.github/workflows/trump-check.yml   GitHub Actions cron workflow (read-only)
+.github/workflows/tests.yml         Unit tests on PRs / main
 src/main.py                         Pipeline: fetch → translate → broadcast
-data/last_seen.txt                  Last processed post id (auto-updated)
-data/last_update_id.txt             Last processed Telegram update id
-data/subscribers.txt                Chat IDs receiving the broadcast
+src/state.py                        State model + storage backends + migration
+tests/                              Unit tests (stdlib unittest)
+docs/HISTORY_CLEANUP.md             Prepared git history rewrite for old state files
+data/                               Local-only state (gitignored)
 BOT-CONTROLS.sh                     gh-cli helper (status / run / logs)
 ```
 
@@ -85,4 +203,5 @@ BOT-CONTROLS.sh                     gh-cli helper (status / run / logs)
 
 - Python 3.9+ (uses `zoneinfo` from stdlib)
 - A Telegram bot token and target chat id
+- A `STATE_TOKEN` fine-grained token (see [State storage](#state-storage))
 - GitHub Actions enabled on the repository
