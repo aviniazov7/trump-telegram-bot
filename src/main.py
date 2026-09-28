@@ -11,6 +11,8 @@ to a group/channel subscribes it, and all other messages are ignored.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
 import json
 import logging
@@ -109,6 +111,20 @@ _script_deadline: float | None = None
 
 def _budget_exceeded() -> bool:
     return _script_deadline is not None and time.monotonic() > _script_deadline
+
+
+def redact_chat(chat_id: str | int | None) -> str:
+    """Log-safe stand-in for a chat ID.
+
+    Actions logs of a public repo are public, and chat IDs identify people.
+    A plain hash of a ~10-digit ID is trivially brute-forced, so key it with
+    the bot token: stable across runs (you can still correlate log lines),
+    but not reversible without the secret.
+    """
+    if not chat_id:
+        return "chat#-"
+    digest = hmac.new(TELEGRAM_BOT_TOKEN.encode(), str(chat_id).encode(), hashlib.sha256)
+    return "chat#" + digest.hexdigest()[:10]
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -795,7 +811,7 @@ def send_telegram_message(
             log.error("Telegram API error (chunk %d/%d): %s", i + 1, len(chunks), result)
             return False
 
-    log.info("Telegram message sent successfully to %s (%d chunk(s))", target, len(chunks))
+    log.info("Telegram message sent successfully to %s (%d chunk(s))", redact_chat(target), len(chunks))
     return True
 
 
@@ -853,8 +869,8 @@ def add_subscriber(state: BotState, chat_id: str, thread_id: str | None = None) 
         return False
     state.subscribers[chat_id] = thread_id
     log.info(
-        "Subscriber set: chat=%s thread=%s (total: %d)",
-        chat_id, thread_id, len(state.subscribers),
+        "Subscriber set: %s thread=%s (total: %d)",
+        redact_chat(chat_id), thread_id, len(state.subscribers),
     )
     return True
 
@@ -862,7 +878,7 @@ def add_subscriber(state: BotState, chat_id: str, thread_id: str | None = None) 
 def remove_subscriber(state: BotState, chat_id: str) -> None:
     if chat_id and chat_id in state.subscribers:
         del state.subscribers[chat_id]
-        log.info("Removed subscriber: %s (total: %d)", chat_id, len(state.subscribers))
+        log.info("Removed subscriber: %s (total: %d)", redact_chat(chat_id), len(state.subscribers))
 
 # ---------------------------------------------------------------------------
 # Telegram — incoming updates (only /start subscribes; everything else ignored)
@@ -998,14 +1014,14 @@ def process_telegram_commands(state: BotState) -> None:
             newly_added = add_subscriber(state, chat_id)
             send_welcome(chat_id, chat_type)
             if not newly_added:
-                log.info("Existing subscriber re-/start'd: %s", chat_id)
+                log.info("Existing subscriber re-/start'd: %s", redact_chat(chat_id))
         elif chat_type in ("group", "supergroup"):
             changed = add_subscriber(state, chat_id, thread_id)
             # Always confirm in the topic where /start was sent, even on a
             # no-op — so the admin sees that the bot heard them.
             send_welcome(chat_id, chat_type, thread_id=thread_id)
             if not changed:
-                log.info("Group %s already subscribed to thread %s", chat_id, thread_id)
+                log.info("Group %s already subscribed to thread %s", redact_chat(chat_id), thread_id)
 
     if max_update_id > last_update_id:
         state.last_update_id = max_update_id
