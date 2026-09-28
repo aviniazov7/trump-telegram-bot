@@ -11,3 +11,7 @@ env/
 *.swp
 *.swo
 .DS_Store
+
+# Runtime state — never commit. In production it lives in the BOT_STATE
+# repository variable; locally in data/state.json. See README "State storage".
+data/
