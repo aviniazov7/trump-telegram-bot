@@ -5,11 +5,13 @@ on:
     - cron: '*/10 * * * *'  # Every 10 minutes
   workflow_dispatch:          # Manual trigger from GitHub UI
 
+# Read-only: the workflow no longer commits anything. Bot state lives in the
+# BOT_STATE repository variable, written with STATE_TOKEN (see README).
 permissions:
-  contents: write             # Needed to commit last_seen.txt updates
+  contents: read
 
-# Prevent overlapping runs: a hung or slow run must not race the next cron tick
-# on data/last_seen.txt or push. Queue new runs instead of cancelling.
+# Prevent overlapping runs: two runs must never read-modify-write BOT_STATE at
+# the same time. Queue new runs instead of cancelling.
 concurrency:
   group: trump-bot
   cancel-in-progress: false
@@ -34,23 +36,9 @@ jobs:
           # Optional: only used as the last-resort translation provider, and
           # only when AI_PROVIDER=gemini.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Runtime state (subscribers, last seen post, Telegram offset) is kept
+          # in the BOT_STATE repository variable, never in git. STATE_TOKEN is a
+          # fine-grained PAT for this repo only, with "Variables: Read and write".
+          STATE_BACKEND: github
+          STATE_TOKEN: ${{ secrets.STATE_TOKEN }}
         run: python src/main.py
-
-      - name: Persist last seen post
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/last_seen.txt data/last_update_id.txt data/subscribers.txt
-          # Nothing changed this run — don't bother committing or pushing.
-          git diff --staged --quiet && exit 0
-          git commit -m "🔄 Update bot state"
-          # GitHub occasionally rejects the push with a transient server-side
-          # error ("remote: fatal error in commit_refs"). Retry with backoff,
-          # rebasing first in case main advanced, so a blip doesn't fail the run.
-          for attempt in 1 2 3 4 5; do
-            git pull --rebase origin main && git push && exit 0
-            echo "push attempt $attempt failed, retrying in $((attempt * 5))s..."
-            sleep $((attempt * 5))
-          done
-          echo "git push failed after 5 attempts" >&2
-          exit 1
