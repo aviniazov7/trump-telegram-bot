@@ -49,7 +49,9 @@ class ProcessCommandsTests(unittest.TestCase):
         self.assertEqual(state, BotState(subscribers={"1": None}, last_update_id=10))
 
 
-class MainStateFlowTests(unittest.TestCase):
+class MainTestCase(unittest.TestCase):
+    """Runs main.main() against a FileStateStore with Telegram and feeds mocked."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.data = Path(self.tmp.name)
@@ -67,7 +69,8 @@ class MainStateFlowTests(unittest.TestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        self.sent = mock.patch.object(main, "send_telegram_message", return_value=True).start()
+        self.send_patch = mock.patch.object(main, "send_telegram_message", return_value=True)
+        self.sent = self.send_patch.start()
         self.addCleanup(mock.patch.stopall)
 
     def tearDown(self):
@@ -78,6 +81,8 @@ class MainStateFlowTests(unittest.TestCase):
                 mock.patch.object(main, "fetch_posts", return_value=list(posts)):
             main.main()
 
+
+class MainStateFlowTests(MainTestCase):
     def test_load_failure_exits_before_touching_telegram(self):
         with mock.patch.object(main, "store_from_env", side_effect=StateError("down")), \
                 mock.patch.object(main, "clear_bot_menu") as menu:
@@ -124,6 +129,32 @@ class MainStateFlowTests(unittest.TestCase):
         with mock.patch.object(main, "TELEGRAM_CHAT_ID", "999"):
             self.run_main()
         self.assertEqual(self.store.load().subscribers, {"999": None})
+
+
+class LogRedactionTests(MainTestCase):
+    """Actions logs are public: raw chat IDs must never be logged."""
+
+    def test_redact_chat_is_stable_and_hides_id(self):
+        self.assertEqual(main.redact_chat("123456789"), main.redact_chat("123456789"))
+        self.assertNotIn("123456789", main.redact_chat("123456789"))
+        self.assertNotEqual(main.redact_chat("1"), main.redact_chat("2"))
+        self.assertEqual(main.redact_chat(""), "chat#-")
+
+    def test_full_run_logs_no_chat_ids(self):
+        self.send_patch.stop()  # use the real sender, with a fake HTTP layer
+        self.store.save(BotState(subscribers={"-1009876543210": "7", "5551234567": None}, last_seen="p1"))
+        posts = [
+            {"id": "p2", "text": "new", "created_at": "", "url": ""},
+            {"id": "p1", "text": "old", "created_at": "", "url": ""},
+        ]
+        updates = [private_start(1, 4441234567), kicked(2, -1009876543210)]
+        with mock.patch.object(main, "http_post", return_value={"ok": True}), \
+                self.assertLogs(main.log, level="DEBUG") as logs:
+            self.run_main(updates=updates, posts=posts)
+        output = "\n".join(logs.output)
+        self.assertIn("Telegram message sent successfully", output)
+        for chat_id in ("9876543210", "5551234567", "4441234567"):
+            self.assertNotIn(chat_id, output)
 
 
 if __name__ == "__main__":
