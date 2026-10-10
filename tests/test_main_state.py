@@ -42,6 +42,50 @@ class ProcessCommandsTests(unittest.TestCase):
         self.assertEqual(state.subscribers, {"42": None})
         self.assertEqual(state.last_update_id, 12)
 
+    def test_group_trumphere_in_topic_pins_thread(self):
+        state = BotState()
+        update = {"update_id": 5, "message": {
+            "text": "/trumphere@TrumpBot", "is_topic_message": True, "message_thread_id": 77,
+            "chat": {"id": -100555, "type": "supergroup"}}}
+        with mock.patch.object(main, "get_telegram_updates", return_value=[update]), \
+                mock.patch.object(main, "send_telegram_message") as send:
+            main.process_telegram_commands(state)
+        self.assertEqual(state.subscribers, {"-100555": "77"})
+        self.assertEqual(send.call_args.kwargs["thread_id"], "77")
+        self.assertIn("בנושא הזה", send.call_args.args[0])
+
+    def test_reply_thread_is_not_a_topic(self):
+        state = BotState()
+        update = {"update_id": 5, "message": {
+            "text": "/start", "message_thread_id": 9, "chat": {"id": -5, "type": "group"}}}
+        with mock.patch.object(main, "get_telegram_updates", return_value=[update]), \
+                mock.patch.object(main, "send_telegram_message"):
+            main.process_telegram_commands(state)
+        self.assertEqual(state.subscribers, {"-5": None})
+
+    def test_other_messages_are_ignored(self):
+        state = BotState()
+        updates = [
+            {"update_id": 1, "message": {"text": "hello", "chat": {"id": 1, "type": "private"}}},
+            {"update_id": 2, "message": {"chat": {"id": 1, "type": "private"}}},
+            {"update_id": 3, "message": {"text": "/stats", "chat": {"id": 1, "type": "private"}}},
+        ]
+        with mock.patch.object(main, "get_telegram_updates", return_value=updates), \
+                mock.patch.object(main, "send_telegram_message") as send:
+            main.process_telegram_commands(state)
+        self.assertEqual((state.subscribers, state.last_update_id), ({}, 3))
+        send.assert_not_called()
+
+    def test_added_to_channel_subscribes_and_welcomes_private(self):
+        state = BotState()
+        added = {"update_id": 8, "my_chat_member": {
+            "chat": {"id": 42, "type": "private"}, "new_chat_member": {"status": "member"}}}
+        with mock.patch.object(main, "get_telegram_updates", return_value=[added]), \
+                mock.patch.object(main, "send_telegram_message") as send:
+            main.process_telegram_commands(state)
+        self.assertEqual(state.subscribers, {"42": None})
+        self.assertEqual(send.call_args.kwargs["reply_markup"], main.REMOVE_KEYBOARD)
+
     def test_no_updates_leaves_state_untouched(self):
         state = BotState(subscribers={"1": None}, last_update_id=10)
         with mock.patch.object(main, "get_telegram_updates", return_value=[]):

@@ -1,5 +1,8 @@
 # Trump Truth Social → Telegram Bot
 
+[![Tests](https://github.com/aviniazov7/trump-telegram-bot/actions/workflows/tests.yml/badge.svg)](https://github.com/aviniazov7/trump-telegram-bot/actions/workflows/tests.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/aviniazov7/trump-telegram-bot/badges/coverage.json)](https://github.com/aviniazov7/trump-telegram-bot/actions/workflows/tests.yml)
+
 Fetches Donald Trump's latest posts from Truth Social, translates them to
 Hebrew, and broadcasts them to every subscriber. Runs on GitHub Actions
 every 10 minutes, uses the Python standard library only.
@@ -269,20 +272,39 @@ removed from the tree and from history; see
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -v          # stdlib only
+
+pip install -r requirements-dev.txt               # with coverage
+coverage run -m unittest discover -s tests && coverage report
 ```
 
-The tests use only the standard library and run on every pull request
-(`.github/workflows/tests.yml`).
+The tests never touch the network. HTTP is mocked at `urlopen`, so the real
+request-building and parsing code runs. What they cover:
+
+| File | Covers |
+|---|---|
+| `test_posts.py` | RSS/CNN parsing, `filter_new_posts`, deep-scan fallback, per-post checkpoints, resuming an interrupted broadcast |
+| `test_telegram.py` | No retry after timeouts, 429 `retry_after`, 403/`chat not found` unsubscribe, group migration, no chat IDs in logs |
+| `test_translation.py` | Gemini request/response handling, every fallback step of the translation chain |
+| `test_tagging.py` | Tag parser, keyword fallback, `analyze_post`, high-impact-first ordering, `sent_ahead` cursor |
+| `test_message.py` | Message layout, HTML escaping, tag line, splitting long messages without breaking tags |
+| `test_main_state.py`, `test_state.py` | State storage, migration, bot menu fingerprint, Telegram commands |
+
+CI (`.github/workflows/tests.yml`) runs on every pull request and every push to
+`main`. It fails if coverage drops below 90% (`.coveragerc`). On `main` it
+publishes the coverage figure to the orphan `badges` branch, as a single
+commit that is force-replaced each time, and the README badge reads it via
+shields.io. The badge appears after the first push to `main`.
 
 ## Layout
 
 ```
 .github/workflows/trump-check.yml   GitHub Actions cron workflow (read-only)
-.github/workflows/tests.yml         Unit tests on PRs / main
+.github/workflows/tests.yml         Unit tests + coverage on PRs / main; badge on main
 src/main.py                         Pipeline: fetch → translate → broadcast
 src/state.py                        State model + storage backends + migration
 tests/                              Unit tests (stdlib unittest)
+requirements-dev.txt, .coveragerc   Test-only tooling (coverage)
 docs/HISTORY_CLEANUP.md             Prepared git history rewrite for old state files
 data/                               Local-only state (gitignored)
 BOT-CONTROLS.sh                     gh-cli helper (status / run / logs)

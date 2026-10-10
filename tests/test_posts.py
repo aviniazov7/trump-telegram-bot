@@ -74,6 +74,25 @@ class FetchPostsTests(unittest.TestCase):
         with mock.patch.object(main, "http_get", return_value=rss(["3", "2", "1"])):
             self.assertEqual(len(main.fetch_posts_trumpstruth(limit=2)), 2)
 
+    def test_cnn_archive_parsing(self):
+        archive = [
+            {"id": "3", "created_at": "2026-10-10T18:59:16.056Z", "content": "<p>Big news &amp; more</p>",
+             "media": [], "media_attachments": [{"url": "https://img/1.jpg"}]},
+            {"id": "2", "created_at": "", "content": "RT: https://truthsocial.com/x"},
+            {"id": "1", "created_at": "", "content": "", "text": "Older post"},
+        ]
+        with mock.patch.object(main, "http_get", return_value=main.json.dumps(archive).encode()):
+            posts = main.fetch_posts_cnn_archive()
+        self.assertEqual([p["id"] for p in posts], ["3", "1"])  # RT-only post skipped
+        self.assertEqual(posts[0]["text"], "Big news & more")
+        self.assertEqual(posts[0]["url"], "https://truthsocial.com/@realDonaldTrump/3")
+        self.assertEqual(posts[0]["media_urls"], ["https://img/1.jpg"])
+
+    def test_rss_skips_placeholder_posts(self):
+        xml = rss(["2", "1"]).replace(b"Post number 2", b"[No Title]")
+        with mock.patch.object(main, "http_get", return_value=xml):
+            self.assertEqual([p["id"] for p in main.fetch_posts_trumpstruth()], ["1"])
+
     def test_sorts_newest_first_by_numeric_id(self):
         with mock.patch.object(main, "fetch_posts_trumpstruth", return_value=feed("2", "10", "3")):
             self.assertEqual([p["id"] for p in main.fetch_posts()], ["10", "3", "2"])
