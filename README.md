@@ -346,14 +346,17 @@ src/main.py                         Pipeline: fetch → translate → broadcast
 src/state.py                        State model + storage backends + migration
 tests/                              Unit tests (stdlib unittest)
 requirements-dev.txt, .coveragerc   Test-only tooling (coverage)
-docs/HISTORY_CLEANUP.md             Prepared git history rewrite for old state files
+docs/HISTORY_CLEANUP.md             Step-by-step git history rewrite for old state files (not run)
+docs/CLOUDFLARE_MIGRATION.md        Proposal: per-minute Cloudflare Worker scheduling
 data/                               Local-only state (gitignored)
 BOT-CONTROLS.sh                     gh-cli helper (status / run / logs)
 ```
 
 ## Configuration
 
-- **Schedule** — edit the `cron` expression in `trump-check.yml`.
+- **Schedule** — edit the `cron` expression in `trump-check.yml`. GitHub
+  runs it best effort: the real gaps are 2.5–8 h. See the proposal in
+  [docs/CLOUDFLARE_MIGRATION.md](docs/CLOUDFLARE_MIGRATION.md).
 - **Message format** — edit `build_message()` in `src/main.py`.
 - **Tags** — `MARKET_CATEGORIES` (topics and Hebrew labels), `IMPACT_MARKERS`
   and the classification rules in `GEMINI_SYSTEM_PROMPT`.
