@@ -51,6 +51,13 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LOCAL_STATE_FILE = DATA_DIR / "state.json"
 
+# Monitoring. ADMIN_CHAT_ID receives operational alerts (see alert_admin).
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+# Optional dead-man's switch URL (e.g. healthchecks.io), pinged after every
+# successful run. It alerts on its own when the pings stop — the one failure
+# the bot cannot report itself: not running at all.
+HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "").strip()
+
 # Use Asia/Jerusalem so Israel DST (UTC+2 winter / UTC+3 summer) is correct.
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
@@ -82,6 +89,14 @@ def _env_int(name: str, default: int) -> int:
 # (about a week). If last_seen is not within this many posts, the bot sends only
 # the newest one instead of flooding subscribers (see filter_new_posts).
 MAX_SCAN_POSTS = _env_int("MAX_SCAN_POSTS", 100)
+
+
+# Alert when the previous successful run is older than this.
+STALE_ALERT_MINUTES = _env_int("STALE_ALERT_MINUTES", 60)
+# Send the same kind of alert at most this often.
+ALERT_REPEAT_MINUTES = _env_int("ALERT_REPEAT_MINUTES", 60)
+# Refresh the stored heartbeat at most this often, to limit state writes.
+HEARTBEAT_WRITE_MINUTES = 5
 
 
 # ---- Gemini (primary translator) ----------------------------------------
@@ -1589,8 +1604,153 @@ def send_order(prepared: list[tuple[dict[str, Any], str, PostAnalysis]], in_flig
 
 
 # ---------------------------------------------------------------------------
+# Monitoring — admin alerts and the run heartbeat
+# ---------------------------------------------------------------------------
+
+
+def alert_admin(state: BotState, kind: str, text: str) -> bool:
+    """Send an operational alert to ADMIN_CHAT_ID, at most once an hour per kind.
+
+    Like every send, it never raises: monitoring can't break the broadcast.
+    """
+    if not ADMIN_CHAT_ID:
+        log.warning("Alert '%s' not sent — ADMIN_CHAT_ID is not set", kind)
+        return False
+    now = int(time.time())
+    if now - state.alerts.get(kind, 0) < ALERT_REPEAT_MINUTES * 60:
+        log.info("Alert '%s' already sent recently — not repeating it", kind)
+        return False
+    ok = bool(send_telegram_message(f"🚨 <b>התראת בוט טראמפ</b>\n{text}", chat_id=ADMIN_CHAT_ID))
+    if ok:
+        state.alerts[kind] = now
+        log.info("Alert '%s' sent to admin", kind)
+    return ok
+
+
+def _format_duration(seconds: int) -> str:
+    hours, minutes = divmod(max(seconds, 0) // 60, 60)
+    return f"{hours} שע׳ {minutes} דק׳" if hours else f"{minutes} דק׳"
+
+
+def check_heartbeat(state: BotState) -> None:
+    """Alert if the previous successful run is older than STALE_ALERT_MINUTES.
+
+    This fires at the start of the first run after an outage (GitHub skipped
+    the schedule, or runs kept failing). A bot that doesn't run at all can't
+    report anything — HEALTHCHECK_URL covers that.
+    """
+    if not state.last_success:
+        return
+    gap = int(time.time()) - state.last_success
+    if gap <= STALE_ALERT_MINUTES * 60:
+        return
+    since = datetime.fromtimestamp(state.last_success, ISRAEL_TZ).strftime("%d/%m %H:%M")
+    log.warning("No successful run for %ds (since %s)", gap, since)
+    alert_admin(
+        state,
+        "stale",
+        f"⏰ לא הייתה ריצה מוצלחת כבר {_format_duration(gap)} (מאז {since}).\n"
+        "הבוט רץ עכשיו שוב ומשלים פוסטים שהוחמצו. אם זה חוזר — בדוק את לוגי ה-Actions.",
+    )
+
+
+def record_success(state: BotState) -> None:
+    """Mark this run successful: refresh the heartbeat and ping HEALTHCHECK_URL."""
+    now = int(time.time())
+    if now - state.last_success >= HEARTBEAT_WRITE_MINUTES * 60:
+        state.last_success = now
+    if HEALTHCHECK_URL:
+        try:
+            http_get(HEALTHCHECK_URL, retries=2)
+        except Exception as exc:
+            log.warning("Healthcheck ping failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
+
+
+def broadcast_new_posts(state: BotState, persist: Any) -> bool:
+    """Fetch, translate, tag and send this run's new posts.
+
+    Returns False if no post source could be reached, so the run doesn't
+    count as successful.
+    """
+    last_seen_id = state.last_seen
+    log.info("Last seen post ID: %s", last_seen_id or "(none) — first run")
+
+    posts = fetch_posts(last_seen_id)
+    if not posts:
+        log.info("No posts fetched this run")
+        return False
+    if last_seen_id and not _contains(posts, last_seen_id):
+        alert_admin(
+            state,
+            "gap",
+            f"⚠️ הפוסט האחרון שנשלח לא נמצא ב-{len(posts)} הפוסטים האחרונים — "
+            "ייתכן שפוסטים הוחמצו. נשלח רק הפוסט החדש ביותר.",
+        )
+    new_posts = filter_new_posts(posts, last_seen_id)
+    if not new_posts:
+        log.info("No new posts this run")
+
+    log.info("Broadcasting %d new post(s) to %d subscriber(s)", len(new_posts), len(state.subscribers))
+
+    chronological_ids = [p["id"] for p in new_posts]
+    advance_cursor(state, chronological_ids)
+    already_sent = set(state.sent_ahead)
+
+    # Translate and classify everything first, so high-impact posts can be
+    # sent ahead of the rest of a backlog.
+    prepared: list[tuple[dict[str, Any], str, PostAnalysis]] = []
+    for post in new_posts:
+        if post["id"] in already_sent:
+            continue
+        if _budget_exceeded():
+            log.warning("Budget exceeded while translating — sending what is ready")
+            break
+        log.info("Processing post %s", post["id"])
+        analysis = analyze_post(post["text"])
+        message = build_message(post, analysis.hebrew, analysis.translated,
+                                analysis.categories, analysis.impact)
+        prepared.append((post, message, analysis))
+
+    untranslated = sum(1 for _, _, a in prepared if not a.translated)
+    if untranslated:
+        alert_admin(
+            state,
+            "translation",
+            f"⚠️ כל ספקי התרגום נכשלו ב-{untranslated} פוסט(ים) — הם נשלחים באנגלית בלבד.\n"
+            "בדוק את GEMINI_API_KEY ואת המכסה ב-AI Studio, ואת לוגי ה-Actions.",
+        )
+
+    # State is saved after every post, so a run that dies or runs out of time
+    # never re-sends what it already finished.
+    sent = 0
+    try:
+        for post, message, analysis in send_order(prepared, state.in_flight_post):
+            if _budget_exceeded():
+                log.warning("Budget exceeded — stopping at post %s to avoid overlapping next cron", post["id"])
+                break
+            if analysis.impact == "high":
+                log.info("Post %s is high-impact — sending first", post["id"])
+            if not broadcast_post(state, post, message):
+                break
+            advance_cursor(state, chronological_ids, post["id"])
+            persist()
+            sent += 1
+
+            if len(prepared) > 1:
+                time.sleep(1)
+    finally:
+        # Also covers an interrupted broadcast: its in-flight progress is
+        # saved so the next run skips the chats that already have the post.
+        persist()
+
+    log.info("Done — sent %d post(s), last_seen=%s, %d sent ahead",
+             sent, state.last_seen or "(none)", len(state.sent_ahead))
+    return True
 
 
 def main() -> None:
@@ -1622,7 +1782,7 @@ def main() -> None:
     )
 
     def persist() -> None:
-        """Write state only if it changed, so idle runs make no API writes."""
+        """Write state only if it changed (idle runs write only the heartbeat)."""
         nonlocal persisted
         if state == persisted:
             return
@@ -1633,6 +1793,9 @@ def main() -> None:
             sys.exit(1)
         persisted = state.copy()
         log.info("State saved")
+
+    # Alert the admin if the bot was down — before anything else can fail.
+    check_heartbeat(state)
 
     # Keep the slash-command menu cleared — the bot is broadcast-only. Telegram
     # remembers it, so this only runs when the config or the bot changes.
@@ -1649,68 +1812,15 @@ def main() -> None:
         log.warning("Budget exceeded after handling bot commands — exiting")
         return
 
-    subscribers = state.subscribers
-    if not subscribers:
+    if state.subscribers:
+        ok = broadcast_new_posts(state, persist)
+    else:
         log.info("No subscribers yet — nothing to broadcast")
-        return
+        ok = True
 
-    last_seen_id = state.last_seen
-    log.info("Last seen post ID: %s", last_seen_id or "(none) — first run")
-
-    posts = fetch_posts(last_seen_id)
-    new_posts = filter_new_posts(posts, last_seen_id) if posts else []
-    if not posts:
-        log.info("No posts fetched this run")
-    elif not new_posts:
-        log.info("No new posts this run")
-
-    log.info("Broadcasting %d new post(s) to %d subscriber(s)", len(new_posts), len(subscribers))
-
-    chronological_ids = [p["id"] for p in new_posts]
-    advance_cursor(state, chronological_ids)
-    already_sent = set(state.sent_ahead)
-
-    # Translate and classify everything first, so high-impact posts can be
-    # sent ahead of the rest of a backlog.
-    prepared: list[tuple[dict[str, Any], str, PostAnalysis]] = []
-    for post in new_posts:
-        if post["id"] in already_sent:
-            continue
-        if _budget_exceeded():
-            log.warning("Budget exceeded while translating — sending what is ready")
-            break
-        log.info("Processing post %s", post["id"])
-        analysis = analyze_post(post["text"])
-        message = build_message(post, analysis.hebrew, analysis.translated,
-                                analysis.categories, analysis.impact)
-        prepared.append((post, message, analysis))
-
-    # State is saved after every post, so a run that dies or runs out of time
-    # never re-sends what it already finished.
-    sent = 0
-    try:
-        for post, message, analysis in send_order(prepared, state.in_flight_post):
-            if _budget_exceeded():
-                log.warning("Budget exceeded — stopping at post %s to avoid overlapping next cron", post["id"])
-                break
-            if analysis.impact == "high":
-                log.info("Post %s is high-impact — sending first", post["id"])
-            if not broadcast_post(state, post, message):
-                break
-            advance_cursor(state, chronological_ids, post["id"])
-            persist()
-            sent += 1
-
-            if len(prepared) > 1:
-                time.sleep(1)
-    finally:
-        # Also covers an interrupted broadcast: its in-flight progress is
-        # saved so the next run skips the chats that already have the post.
-        persist()
-
-    log.info("Done — sent %d post(s), last_seen=%s, %d sent ahead",
-             sent, state.last_seen or "(none)", len(state.sent_ahead))
-
+    if ok:
+        record_success(state)
+    persist()
 
 if __name__ == "__main__":
     main()

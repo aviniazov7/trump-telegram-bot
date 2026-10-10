@@ -11,6 +11,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import main  # noqa: E402
+
+NOW = 1_800_000_000  # frozen time.time() in MainTestCase
 from state import BotState, FileStateStore, StateError  # noqa: E402
 
 
@@ -110,6 +112,7 @@ class MainTestCase(unittest.TestCase):
             mock.patch.object(main, "send_welcome"),
             mock.patch.object(main, "translate_to_hebrew", return_value=("שלום", True)),
             mock.patch.object(main.time, "sleep"),
+            mock.patch.object(main.time, "time", return_value=NOW),
         ]
         for p in patches:
             p.start()
@@ -141,7 +144,7 @@ class MainStateFlowTests(MainTestCase):
         (self.data / "last_seen.txt").write_text("p1\n")
         self.run_main(posts=[{"id": "p1", "text": "old", "created_at": ""}])
         self.assertEqual(self.store.load(), BotState(subscribers={"111": None}, last_seen="p1",
-                                                     menu_config=main.menu_fingerprint()))
+                                                     menu_config=main.menu_fingerprint(), last_success=NOW))
         self.sent.assert_not_called()  # p1 was already seen before migration
 
     def test_new_subscriber_and_new_post_are_persisted(self):
@@ -154,16 +157,22 @@ class MainStateFlowTests(MainTestCase):
         self.assertEqual(
             self.store.load(),
             BotState(subscribers={"111": None, "222": None}, last_seen="p2", last_update_id=4,
-                     menu_config=main.menu_fingerprint()),
+                     menu_config=main.menu_fingerprint(), last_success=NOW),
         )
         self.assertEqual({c.kwargs["chat_id"] for c in self.sent.call_args_list}, {"111", "222"})
 
     def test_idle_run_does_not_write(self):
         self.store.save(BotState(subscribers={"111": None}, last_seen="p1",
-                                 menu_config=main.menu_fingerprint()))
+                                 menu_config=main.menu_fingerprint(), last_success=NOW - 60))
         with mock.patch.object(self.store, "save") as save:
             self.run_main(posts=[{"id": "p1", "text": "old", "created_at": ""}])
         save.assert_not_called()
+
+    def test_idle_run_refreshes_an_old_heartbeat(self):
+        self.store.save(BotState(subscribers={"111": None}, last_seen="p1",
+                                 menu_config=main.menu_fingerprint(), last_success=NOW - 600))
+        self.run_main(posts=[{"id": "p1", "text": "old", "created_at": ""}])
+        self.assertEqual(self.store.load().last_success, NOW)
 
     def test_save_failure_exits_non_zero(self):
         self.store.save(BotState(subscribers={"111": None}, last_update_id=3))

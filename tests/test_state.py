@@ -138,12 +138,20 @@ class BotStateTests(unittest.TestCase):
         state.in_flight_post, state.in_flight_chats = "p9", ["111"]
         state.menu_config = "abc123"
         state.sent_ahead = ["p10", "p11"]
+        state.last_success = 1_800_000_000
+        state.alerts = {"stale": 1_799_999_000}
         self.assertEqual(BotState.from_json(state.to_json()), state)
         self.assertEqual(state.copy(), state)
 
     def test_optional_keys_omitted_when_unset(self):
         # Keeps idle state byte-identical to what earlier versions wrote.
         self.assertNotIn("in_flight", json.loads(sample_state().to_json()))
+
+    def test_rejects_bad_monitoring_fields(self):
+        for raw in ('{"version": 1, "alerts": ["x"]}', '{"version": 1, "alerts": {"x": "soon"}}',
+                    '{"version": 1, "last_success": "yesterday"}'):
+            with self.assertRaises(StateError):
+                BotState.from_json(raw)
 
     def test_rejects_bad_sent_ahead(self):
         with self.assertRaises(StateError):

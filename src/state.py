@@ -65,6 +65,11 @@ class BotState:
     # high-impact post jumps the queue). last_seen can only move past a post
     # once everything older is sent too, so these are skipped meanwhile.
     sent_ahead: list[str] = field(default_factory=list)
+    # Monitoring: when the last successful run ended (epoch seconds), and when
+    # each kind of admin alert was last sent (so alerts aren't repeated
+    # every run).
+    last_success: int = 0
+    alerts: dict[str, int] = field(default_factory=dict)
 
     def to_json(self) -> str:
         data: dict = {
@@ -81,6 +86,10 @@ class BotState:
             data["menu_config"] = self.menu_config
         if self.sent_ahead:
             data["sent_ahead"] = list(self.sent_ahead)
+        if self.last_success:
+            data["last_success"] = self.last_success
+        if self.alerts:
+            data["alerts"] = {k: self.alerts[k] for k in sorted(self.alerts)}
         return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
     @classmethod
@@ -112,6 +121,15 @@ class BotState:
         if not isinstance(sent_ahead, list):
             raise StateError("State 'sent_ahead' must be a list")
 
+        alerts = data.get("alerts") or {}
+        if not isinstance(alerts, dict):
+            raise StateError("State 'alerts' must be an object")
+        try:
+            last_success = int(data.get("last_success") or 0)
+            alerts = {str(k): int(v) for k, v in alerts.items()}
+        except (TypeError, ValueError) as exc:
+            raise StateError("State 'last_success' and 'alerts' must hold integers") from exc
+
         in_flight = data.get("in_flight") or {}
         if not isinstance(in_flight, dict) or not isinstance(in_flight.get("chats", []), list):
             raise StateError("State 'in_flight' must be {post, chats: [...]}")
@@ -123,6 +141,8 @@ class BotState:
             in_flight_chats=[str(c) for c in in_flight.get("chats", [])],
             menu_config=str(data.get("menu_config") or ""),
             sent_ahead=[str(i) for i in sent_ahead],
+            last_success=last_success,
+            alerts=alerts,
         )
 
     def copy(self) -> "BotState":
@@ -134,6 +154,8 @@ class BotState:
             in_flight_chats=list(self.in_flight_chats),
             menu_config=self.menu_config,
             sent_ahead=list(self.sent_ahead),
+            last_success=self.last_success,
+            alerts=dict(self.alerts),
         )
 
 

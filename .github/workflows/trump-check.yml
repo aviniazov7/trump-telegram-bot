@@ -33,6 +33,11 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Monitoring (optional): your chat ID for alerts, and a dead-man's
+          # switch URL (e.g. healthchecks.io) pinged after each successful run.
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          STALE_ALERT_MINUTES: ${{ vars.STALE_ALERT_MINUTES }}
           # Optional but recommended: Gemini is the primary translator. Without
           # a key the bot uses only the keyless providers.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

@@ -136,6 +136,38 @@ once. Otherwise it falls back to the free chain.
 The key travels in the `x-goog-api-key` header, never in a URL, so it can't
 appear in logs.
 
+## Monitoring
+
+Set the repository secret **`ADMIN_CHAT_ID`** to your own Telegram chat ID
+(send `/start` to the bot first). Alerts go there and nowhere else:
+
+| Alert | When |
+|---|---|
+| ⚠️ Translation failed | Every provider, Gemini and the free chain, failed for one or more posts, so they went out in English |
+| ⏰ No successful run | The previous successful run is older than `STALE_ALERT_MINUTES` (default 60). Sent by the first run that works again |
+| ⚠️ Possible missed posts | `last_seen` wasn't found in the scanned window, so only the newest post was sent |
+
+Each kind of alert is sent at most once per `ALERT_REPEAT_MINUTES` (default
+60), so a lasting problem doesn't spam you. The send times live in state
+(`alerts`).
+
+A "successful run" is one that loaded state and reached a post source.
+State keeps its end time in `last_success` (the heartbeat). The heartbeat is
+written at most every 5 minutes, which means that an idle run now makes one
+small state write.
+
+**Known limit: a bot that isn't running can't report that it's down.** The ⏰
+alert arrives only when a run finally starts. To learn about an outage *while*
+it happens, set the optional secret **`HEALTHCHECK_URL`** to a dead-man's
+switch such as a free [healthchecks.io](https://healthchecks.io) check (period
+60 min, with its Telegram integration). The bot pings it after every
+successful run, and the service alerts you when the pings stop.
+
+> With GitHub's current scheduling (real gaps of 2.5–8 h, see
+> [docs/CLOUDFLARE_MIGRATION.md](docs/CLOUDFLARE_MIGRATION.md)), the ⏰ alert
+> fires on most runs. That is accurate, but noisy. Until scheduling is fixed,
+> raise `STALE_ALERT_MINUTES` (repository variable), for example to `480`.
+
 ## Setup
 
 1. **Create a Telegram bot** with [@BotFather](https://t.me/BotFather) and
@@ -148,6 +180,11 @@ appear in logs.
      subscribes.
    - `STATE_TOKEN` — required. A fine-grained token the bot uses to read and
      write its state. See [State storage](#state-storage) for how to create it.
+   - `GEMINI_API_KEY` — recommended. Primary translator and market tagging
+     (see [Gemini setup](#gemini-setup)).
+   - `ADMIN_CHAT_ID` — recommended. Where operational alerts go (see
+     [Monitoring](#monitoring)).
+   - `HEALTHCHECK_URL` — optional. Dead-man's switch ping URL.
 3. **Enable GitHub Actions** for the repository. The workflow will run
    automatically every 10 minutes; you can also trigger it manually from
    *Actions → Trump Truth Social Check → Run workflow*.
@@ -162,6 +199,8 @@ The bot keeps a small amount of state between runs:
 - **last_seen**: the last post that was broadcast, so nothing is sent twice
 - **last_update_id**: the Telegram `getUpdates` offset, so each `/start` is
   handled once
+- **last_success** / **alerts**: heartbeat and alert throttling (see
+  [Monitoring](#monitoring))
 - **in_flight** (only while a broadcast is interrupted): the post being sent and
   the chats that already have it
 - **menu_config**: fingerprint of the bot menu last applied to Telegram
@@ -190,6 +229,7 @@ repository. The workflow has read-only access to the code.
 GitHub Actions (cron, every 10 min, concurrency group "trump-bot")
   └─ src/main.py
        1. store.load()             ← GitHub REST API: GET actions/variables/BOT_STATE
+          heartbeat check          → alert ADMIN_CHAT_ID if last_success > 1h ago
        2. reset bot menu           (only if menu_config fingerprint changed)
           handle Telegram updates  (mutates state in memory)
        3. store.save() if changed  → PATCH actions/variables/BOT_STATE
@@ -198,6 +238,7 @@ GitHub Actions (cron, every 10 min, concurrency group "trump-bot")
        6. send: in_flight post → 🔴 high impact → rest, each oldest first
             send to every subscriber not in in_flight
             store.save()           → PATCH (last_seen / sent_ahead)
+       7. record success           → last_success heartbeat, ping HEALTHCHECK_URL
 ```
 
 - `src/state.py` defines a `StateStore` interface with two backends that store
@@ -211,8 +252,8 @@ GitHub Actions (cron, every 10 min, concurrency group "trump-bot")
   before it contacts Telegram. The bot never assumes "no state" when the store
   is unreachable, because doing so would re-send old posts and then overwrite
   the real subscriber list. A failed write also turns the run red.
-- **Minimal writes.** State is written only when it changed, so an idle run
-  makes a single API read.
+- **Minimal writes.** State is written only when it changed. An idle run makes
+  one API read plus, at most every 5 minutes, one heartbeat write.
 - **No races.** The workflow's concurrency group means only one run at a time
   reads and writes the variable.
 - **Log redaction.** Actions logs of a public repo are public, so chat IDs are
