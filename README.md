@@ -1,5 +1,8 @@
 # Trump Truth Social → Telegram Bot
 
+> **Moving to Cloudflare Workers.** The Python bot now lives in `legacy/` and
+> keeps running on GitHub Actions until the Worker is verified.
+
 [![Tests](https://github.com/aviniazov7/trump-telegram-bot/actions/workflows/tests.yml/badge.svg)](https://github.com/aviniazov7/trump-telegram-bot/actions/workflows/tests.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/aviniazov7/trump-telegram-bot/badges/coverage.json)](https://github.com/aviniazov7/trump-telegram-bot/actions/workflows/tests.yml)
 
@@ -39,7 +42,7 @@ can be hours. Each run therefore catches up on everything it missed:
 
 ### Talking to Telegram
 
-All Bot API calls go through `telegram_call()` in `src/main.py`:
+All Bot API calls go through `telegram_call()` in `legacy/src/main.py`:
 
 - **No blind retries of `sendMessage`.** A timeout or a dropped connection
   after the request went out may still have delivered the message, so it is
@@ -227,7 +230,7 @@ repository. The workflow has read-only access to the code.
 
 ```
 GitHub Actions (cron, every 10 min, concurrency group "trump-bot")
-  └─ src/main.py
+  └─ legacy/src/main.py
        1. store.load()             ← GitHub REST API: GET actions/variables/BOT_STATE
           heartbeat check          → alert ADMIN_CHAT_ID if last_success > 1h ago
        2. reset bot menu           (only if menu_config fingerprint changed)
@@ -241,7 +244,7 @@ GitHub Actions (cron, every 10 min, concurrency group "trump-bot")
        7. record success           → last_success heartbeat, ping HEALTHCHECK_URL
 ```
 
-- `src/state.py` defines a `StateStore` interface with two backends that store
+- `legacy/src/state.py` defines a `StateStore` interface with two backends that store
   the same JSON document:
   - `GitHubVariableStateStore` (production) keeps the state in the
     **`BOT_STATE` repository Actions variable**, using a fine-grained token
@@ -317,6 +320,7 @@ in case it's needed) are in [docs/HISTORY_CLEANUP.md](docs/HISTORY_CLEANUP.md).
 ## Tests
 
 ```bash
+cd legacy
 python -m unittest discover -s tests -v          # stdlib only
 
 pip install -r requirements-dev.txt               # with coverage
@@ -336,7 +340,7 @@ request-building and parsing code runs. What they cover:
 | `test_main_state.py`, `test_state.py` | State storage, migration, bot menu fingerprint, Telegram commands |
 
 CI (`.github/workflows/tests.yml`) runs on every pull request and every push to
-`main`. It fails if coverage drops below 90% (`.coveragerc`). On `main` it
+`main`. It fails if coverage drops below 90% (`legacy/.coveragerc`). On `main` it
 publishes the coverage figure to the orphan `badges` branch, as a single
 commit that is force-replaced each time, and the README badge reads it via
 shields.io. The badge appears after the first push to `main`.
@@ -346,10 +350,10 @@ shields.io. The badge appears after the first push to `main`.
 ```
 .github/workflows/trump-check.yml   GitHub Actions cron workflow (read-only)
 .github/workflows/tests.yml         Unit tests + coverage on PRs / main; badge on main
-src/main.py                         Pipeline: fetch → translate → broadcast
-src/state.py                        State model + storage backends + migration
-tests/                              Unit tests (stdlib unittest)
-requirements-dev.txt, .coveragerc   Test-only tooling (coverage)
+legacy/src/main.py                   Pipeline: fetch → translate → broadcast
+legacy/src/state.py                   State model + storage backends + migration
+legacy/tests/                       Unit tests (stdlib unittest)
+legacy/requirements-dev.txt, legacy/.coveragerc   Test-only tooling (coverage)
 docs/HISTORY_CLEANUP.md             Step-by-step git history rewrite for old state files (not run)
 docs/CLOUDFLARE_MIGRATION.md        Proposal: per-minute Cloudflare Worker scheduling
 data/                               Local-only state (gitignored)
@@ -361,10 +365,10 @@ BOT-CONTROLS.sh                     gh-cli helper (status / run / logs)
 - **Schedule** — edit the `cron` expression in `trump-check.yml`. GitHub
   runs it best effort: the real gaps are 2.5–8 h. See the proposal in
   [docs/CLOUDFLARE_MIGRATION.md](docs/CLOUDFLARE_MIGRATION.md).
-- **Message format** — edit `build_message()` in `src/main.py`.
+- **Message format** — edit `build_message()` in `legacy/src/main.py`.
 - **Tags** — `MARKET_CATEGORIES` (topics and Hebrew labels), `IMPACT_MARKERS`
   and the classification rules in `GEMINI_SYSTEM_PROMPT`.
-- **Welcome text** — edit `send_welcome()` in `src/main.py`.
+- **Welcome text** — edit `send_welcome()` in `legacy/src/main.py`.
 
 ## Requirements
 

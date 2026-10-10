@@ -21,14 +21,18 @@ jobs:
           python-version: '3.12'
       # The bot itself is stdlib-only; coverage is a test-time tool.
       - name: Install test tools
+        working-directory: legacy
         run: pip install -r requirements-dev.txt
       - name: Run tests with coverage
+        working-directory: legacy
         run: coverage run -m unittest discover -s tests -v
       - name: Coverage report
+        working-directory: legacy
         run: |
           coverage report -m | tee -a "$GITHUB_STEP_SUMMARY"
           coverage json -q -o coverage.json
       - name: Build badge data
+        working-directory: legacy
         run: |
           python - <<'EOF'
           import json
@@ -41,7 +45,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-badge
-          path: coverage-badge.json
+          path: legacy/coverage-badge.json
           retention-days: 7
 
   # Publishes coverage-badge.json to the orphan `badges` branch, which the
