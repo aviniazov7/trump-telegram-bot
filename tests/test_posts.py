@@ -132,10 +132,10 @@ class BroadcastTests(unittest.TestCase):
             if crash_on and crash_on in message and chat_id == "b":
                 raise KeyboardInterrupt("runner killed")
             if chat_id in fail_chats:
-                return False
+                return main.SendResult(False)
             marker = next(w for w in message.split() if w.startswith("number-"))
             self.sends.append((chat_id, marker))
-            return True
+            return main.SendResult(True)
         return send
 
     def run_main(self, posts, **send_kwargs):

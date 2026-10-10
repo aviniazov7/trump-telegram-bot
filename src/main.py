@@ -18,11 +18,13 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -120,6 +122,12 @@ def _budget_exceeded() -> bool:
     return _script_deadline is not None and time.monotonic() > _script_deadline
 
 
+def _seconds_left() -> float:
+    if _script_deadline is None:
+        return float("inf")
+    return _script_deadline - time.monotonic()
+
+
 def redact_chat(chat_id: str | int | None) -> str:
     """Log-safe stand-in for a chat ID.
 
@@ -169,32 +177,6 @@ def http_get(
                 time.sleep(RETRY_DELAY * attempt)
     raise RuntimeError(f"Failed to GET {url} after {retries} attempts")
 
-
-def http_post(
-    url: str,
-    data: dict[str, Any],
-    retries: int = MAX_RETRIES,
-) -> dict[str, Any]:
-    """POST JSON request with bounded retries."""
-    body = json.dumps(data).encode()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": DEFAULT_USER_AGENT,
-        },
-        method="POST",
-    )
-    for attempt in range(1, retries + 1):
-        try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-                return json.loads(resp.read())
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-            log.warning("POST %s attempt %d/%d failed: %s", url, attempt, retries, exc)
-            if attempt < retries:
-                time.sleep(RETRY_DELAY * attempt)
-    raise RuntimeError(f"Failed to POST {url} after {retries} attempts")
 
 # ---------------------------------------------------------------------------
 # Fetch posts — trumpstruth.org RSS (primary) + CNN JSON (fallback)
@@ -697,6 +679,137 @@ def _split_text(text: str, max_len: int) -> list[str]:
     return chunks
 
 # ---------------------------------------------------------------------------
+# Telegram Bot API calls
+# ---------------------------------------------------------------------------
+#
+# sendMessage is not idempotent: if a request times out after Telegram got it,
+# sending it again delivers the post twice. So a failed send is retried only
+# when we know it never reached Telegram (connection refused, DNS failure) or
+# when Telegram itself said "not sent, retry after N seconds" (HTTP 429).
+# Read-only and set-style methods (getUpdates, setMyCommands) are safe to
+# retry and pass idempotent=True.
+
+# Errors raised before a single byte of the request reached Telegram.
+_NOT_SENT_ERRORS = (ConnectionRefusedError, socket.gaierror)
+
+TELEGRAM_ATTEMPTS = 3
+# Don't wait out a 429 longer than this; give up on that message instead.
+TELEGRAM_MAX_RETRY_AFTER = 30  # seconds
+
+# Telegram's answer when a chat can never receive messages from the bot again.
+# Any 403 means that (blocked, kicked, user deleted, never started the bot).
+_GONE_400_DESCRIPTIONS = ("chat not found", "group chat was deactivated", "peer_id_invalid")
+
+
+@dataclass
+class TelegramResponse:
+    ok: bool
+    result: Any = None
+    error_code: int = 0           # 0 = no HTTP answer (network error)
+    description: str = ""
+    retry_after: int = 0          # set on 429
+    migrate_to: str = ""          # set when a group was upgraded to a supergroup
+    uncertain: bool = False       # the request may have reached Telegram
+
+    @property
+    def chat_gone(self) -> bool:
+        if self.error_code == 403:
+            return True
+        return self.error_code == 400 and any(
+            d in self.description.lower() for d in _GONE_400_DESCRIPTIONS
+        )
+
+
+def _telegram_request(method: str, payload: dict[str, Any]) -> TelegramResponse:
+    """One HTTP round trip to the Bot API, never raising."""
+    req = urllib.request.Request(
+        f"{TELEGRAM_API}/{method}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        # 4xx/5xx still carry Telegram's JSON error body — that's where
+        # retry_after and the "blocked by the user" reason live.
+        raw = exc.read()
+        if not raw:
+            return TelegramResponse(ok=False, error_code=exc.code, description=str(exc.reason))
+    except urllib.error.URLError as exc:
+        return TelegramResponse(
+            ok=False,
+            description=str(exc.reason),
+            uncertain=not isinstance(exc.reason, _NOT_SENT_ERRORS),
+        )
+    except (TimeoutError, OSError) as exc:
+        # A read timeout or reset after the request went out: Telegram may
+        # well have delivered the message.
+        return TelegramResponse(ok=False, description=f"{type(exc).__name__}: {exc}", uncertain=True)
+
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return TelegramResponse(ok=False, description="non-JSON response", uncertain=True)
+    if not isinstance(data, dict):
+        return TelegramResponse(ok=False, description="unexpected response", uncertain=True)
+    params = data.get("parameters") or {}
+    return TelegramResponse(
+        ok=bool(data.get("ok")),
+        result=data.get("result"),
+        error_code=int(data.get("error_code") or 0),
+        description=str(data.get("description") or ""),
+        retry_after=int(params.get("retry_after") or 0),
+        migrate_to=str(params.get("migrate_to_chat_id") or ""),
+    )
+
+
+def telegram_call(
+    method: str,
+    payload: dict[str, Any],
+    *,
+    idempotent: bool = False,
+) -> TelegramResponse:
+    """Call a Bot API method, retrying only when it is safe to.
+
+    Logs only the method, error code and description: the full response can
+    contain chat IDs (migrate_to_chat_id), and Actions logs are public.
+    """
+    resp = TelegramResponse(ok=False)
+    for attempt in range(1, TELEGRAM_ATTEMPTS + 1):
+        resp = _telegram_request(method, payload)
+        if resp.ok:
+            return resp
+        last = attempt == TELEGRAM_ATTEMPTS
+
+        if resp.error_code == 429:
+            wait = max(resp.retry_after, 1)
+            if last or wait > TELEGRAM_MAX_RETRY_AFTER or wait >= _seconds_left():
+                log.warning("Telegram %s rate-limited (retry_after=%ds) — giving up", method, wait)
+                return resp
+            log.warning("Telegram %s rate-limited — waiting %ds as asked", method, wait)
+            time.sleep(wait)
+            continue
+
+        if resp.error_code == 0 or resp.error_code >= 500:
+            safe = idempotent or (resp.error_code == 0 and not resp.uncertain)
+            if safe and not last:
+                log.warning("Telegram %s attempt %d failed (%s) — retrying",
+                            method, attempt, resp.description or resp.error_code)
+                time.sleep(RETRY_DELAY * attempt)
+                continue
+            if not safe:
+                log.warning("Telegram %s failed and may have gone through (%s) — not retrying",
+                            method, resp.description or resp.error_code)
+                return resp
+
+        break
+
+    log.warning("Telegram %s failed: %s %s", method, resp.error_code or "network", resp.description)
+    return resp
+
+# ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
 
@@ -800,29 +913,44 @@ def _split_for_telegram(text: str, max_len: int = TELEGRAM_MAX_MESSAGE_LEN) -> l
 REMOVE_KEYBOARD: dict[str, Any] = {"remove_keyboard": True}
 
 
+@dataclass
+class SendResult:
+    """Outcome of send_telegram_message. Truthy when the message went out."""
+
+    ok: bool
+    gone: bool = False       # the chat can never be reached again: unsubscribe it
+    migrated_to: str = ""    # the group became a supergroup with this new ID
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
 def send_telegram_message(
     text: str,
     chat_id: str | None = None,
     reply_markup: dict[str, Any] | None = None,
     thread_id: str | None = None,
-) -> bool:
+) -> SendResult:
     """Send a message, splitting if it exceeds 4096 chars.
 
     ``thread_id`` pins the message to a specific forum topic in a group
     chat (Telegram's ``message_thread_id``). For private chats and groups
     without topics, leave it as None.
+
+    A chunk that fails is not retried blindly (see telegram_call), so a long
+    message can arrive partially; that beats arriving twice.
     """
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN not set")
-        return False
+        return SendResult(False)
 
     target = chat_id
     if not target:
         log.error("No chat_id provided")
-        return False
+        return SendResult(False)
 
-    url = f"{TELEGRAM_API}/sendMessage"
     chunks = _split_for_telegram(text)
+    migrated_to = ""
 
     for i, chunk in enumerate(chunks):
         payload: dict[str, Any] = {
@@ -838,18 +966,24 @@ def send_telegram_message(
         if reply_markup and i == len(chunks) - 1:
             payload["reply_markup"] = reply_markup
 
-        try:
-            result = http_post(url, payload)
-        except Exception as exc:
-            log.error("Failed to send Telegram message (chunk %d/%d): %s", i + 1, len(chunks), exc)
-            return False
+        resp = telegram_call("sendMessage", payload)
+        if not resp.ok and resp.migrate_to and not migrated_to:
+            # The group was upgraded to a supergroup. Telegram did not
+            # deliver to the old ID, so resend there once.
+            log.info("Chat %s migrated to %s", redact_chat(target), redact_chat(resp.migrate_to))
+            target = migrated_to = resp.migrate_to
+            payload["chat_id"] = target
+            resp = telegram_call("sendMessage", payload)
 
-        if not result.get("ok"):
-            log.error("Telegram API error (chunk %d/%d): %s", i + 1, len(chunks), result)
-            return False
+        if not resp.ok:
+            log.error(
+                "Failed to send to %s (chunk %d/%d): %s %s",
+                redact_chat(target), i + 1, len(chunks), resp.error_code or "network", resp.description,
+            )
+            return SendResult(False, gone=resp.chat_gone, migrated_to=migrated_to)
 
     log.info("Telegram message sent successfully to %s (%d chunk(s))", redact_chat(target), len(chunks))
-    return True
+    return SendResult(True, migrated_to=migrated_to)
 
 
 def send_post_message(
@@ -857,7 +991,7 @@ def send_post_message(
     hebrew: str,
     chat_id: str,
     translated: bool = True,
-) -> bool:
+) -> SendResult:
     """Send a translated post to a specific chat."""
     message = build_message(post, hebrew, translated)
     return send_telegram_message(message, chat_id=chat_id)
@@ -865,19 +999,15 @@ def send_post_message(
 
 def clear_bot_menu() -> None:
     """Clear the bot's slash-command menu so no commands are exposed."""
-    try:
-        http_post(f"{TELEGRAM_API}/setMyCommands", {"commands": []})
+    if telegram_call("setMyCommands", {"commands": []}, idempotent=True).ok:
         log.info("Cleared bot commands list")
-    except Exception as exc:
-        log.warning("Failed to clear bot commands: %s", exc)
+    else:
+        log.warning("Failed to clear bot commands")
 
-    try:
-        http_post(f"{TELEGRAM_API}/setChatMenuButton", {
-            "menu_button": {"type": "default"},
-        })
+    if telegram_call("setChatMenuButton", {"menu_button": {"type": "default"}}, idempotent=True).ok:
         log.info("Reset bot menu button to default")
-    except Exception as exc:
-        log.warning("Failed to reset menu button: %s", exc)
+    else:
+        log.warning("Failed to reset menu button")
 
 # ---------------------------------------------------------------------------
 # Subscribers — anyone who /start's the bot or adds it to a group/channel
@@ -916,6 +1046,25 @@ def remove_subscriber(state: BotState, chat_id: str) -> None:
     if chat_id and chat_id in state.subscribers:
         del state.subscribers[chat_id]
         log.info("Removed subscriber: %s (total: %d)", redact_chat(chat_id), len(state.subscribers))
+
+
+def drop_unreachable(state: BotState, chat_id: str) -> None:
+    """Unsubscribe a chat Telegram says we can never reach (403 / chat not found).
+
+    The configured owner chat is kept: seed_owner would only re-add it next
+    run, and a 403 there means the owner hasn't /start'ed the bot yet.
+    """
+    if chat_id == TELEGRAM_CHAT_ID:
+        log.error("Owner chat is unreachable — /start the bot from TELEGRAM_CHAT_ID")
+        return
+    log.info("Chat %s blocked the bot or no longer exists", redact_chat(chat_id))
+    remove_subscriber(state, chat_id)
+
+
+def migrate_subscriber(state: BotState, old_id: str, new_id: str) -> None:
+    """Follow a group that Telegram upgraded to a supergroup (new chat ID)."""
+    if old_id in state.subscribers:
+        state.subscribers.setdefault(new_id, state.subscribers.pop(old_id))
 
 # ---------------------------------------------------------------------------
 # Telegram — incoming updates (only /start subscribes; everything else ignored)
@@ -1212,9 +1361,15 @@ def broadcast_post(state: BotState, post: dict[str, Any], message: str) -> bool:
                 post["id"], len(done),
             )
             return False
-        if send_telegram_message(message, chat_id=chat_id, thread_id=state.subscribers[chat_id]):
+        result = send_telegram_message(message, chat_id=chat_id, thread_id=state.subscribers[chat_id])
+        if result.migrated_to:
+            migrate_subscriber(state, chat_id, result.migrated_to)
+            chat_id = result.migrated_to
+        if result:
             done.add(chat_id)
             state.in_flight_chats.append(chat_id)
+        elif result.gone:
+            drop_unreachable(state, chat_id)
         # Telegram broadcast rate limit is ~30 msgs/sec; small gap keeps
         # us well under that even with many subscribers.
         time.sleep(0.05)

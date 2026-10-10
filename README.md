@@ -30,6 +30,27 @@ can be hours. Each run therefore catches up on everything it missed:
   broadcast, the chats that already got it are saved as `in_flight`. The next
   run sends that post only to the chats still missing it.
 
+### Talking to Telegram
+
+All Bot API calls go through `telegram_call()` in `src/main.py`:
+
+- **No blind retries of `sendMessage`.** A timeout or a dropped connection
+  after the request went out may still have delivered the message, so it is
+  not retried. Retrying could post it twice. A send is retried only when it
+  provably never left (connection refused, DNS failure). Idempotent calls
+  (`getUpdates`, `setMyCommands`) do retry.
+- **429 rate limits.** The run waits the `retry_after` that Telegram asks for
+  (up to 30 s, within the run budget) and then retries. Telegram guarantees
+  that a 429 was not delivered.
+- **Dead chats are unsubscribed.** On a 403 (blocked, kicked, account deleted)
+  or `chat not found`, the chat is removed from the subscribers. The
+  `TELEGRAM_CHAT_ID` owner chat is the exception: it is never removed.
+- **Upgraded groups are followed.** When a group becomes a supergroup,
+  Telegram returns its new ID. The bot re-sends the message there and moves
+  the subscription, including its forum topic, to the new ID.
+- Error logs contain only the method, the error code and Telegram's
+  description, never the raw response, which can contain chat IDs.
+
 ## Translation
 
 Each post is translated to Hebrew by trying several providers in order, moving

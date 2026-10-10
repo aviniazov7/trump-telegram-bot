@@ -69,7 +69,7 @@ class MainTestCase(unittest.TestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        self.send_patch = mock.patch.object(main, "send_telegram_message", return_value=True)
+        self.send_patch = mock.patch.object(main, "send_telegram_message", return_value=main.SendResult(True))
         self.sent = self.send_patch.start()
         self.addCleanup(mock.patch.stopall)
 
@@ -148,7 +148,7 @@ class LogRedactionTests(MainTestCase):
             {"id": "p1", "text": "old", "created_at": "", "url": ""},
         ]
         updates = [private_start(1, 4441234567), kicked(2, -1009876543210)]
-        with mock.patch.object(main, "http_post", return_value={"ok": True}), \
+        with mock.patch.object(main, "_telegram_request", return_value=main.TelegramResponse(ok=True)), \
                 self.assertLogs(main.log, level="DEBUG") as logs:
             self.run_main(updates=updates, posts=posts)
         output = "\n".join(logs.output)
