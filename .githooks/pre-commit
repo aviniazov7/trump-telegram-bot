@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Blocks commits that contain secrets or real chat IDs.
+# Enable once with:  git config core.hooksPath .githooks
+exec bash scripts/check-secrets.sh --staged

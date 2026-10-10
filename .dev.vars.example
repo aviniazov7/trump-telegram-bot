@@ -1,0 +1,8 @@
+# Copy to .dev.vars for `npm run dev` (wrangler dev). .dev.vars is gitignored.
+# Placeholders only — never put real values in this example file.
+TELEGRAM_BOT_TOKEN=<from @BotFather>
+TELEGRAM_WEBHOOK_SECRET=<openssl rand -hex 32>
+GEMINI_API_KEY=<from https://aistudio.google.com/apikey>
+ADMIN_CHAT_ID=<your numeric Telegram chat id>
+# Optional
+HEALTHCHECK_URL=<https://hc-ping.com/your-check-uuid>
