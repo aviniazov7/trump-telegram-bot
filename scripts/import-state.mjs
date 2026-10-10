@@ -48,9 +48,9 @@ const entries = [];
 const inFlight = legacy.in_flight;
 if (inFlight?.post) {
   meta.pending[String(inFlight.post)] = now;
-  for (const chat of inFlight.chats ?? []) {
-    entries.push({ key: `sent:${inFlight.post}:${chat}`, value: "ok", expiration_ttl: SENT_TTL_S });
-  }
+  // Same shape as src/store.ts → putSendLog: one key per post, { chatId: status }.
+  const log = Object.fromEntries((inFlight.chats ?? []).map((chat) => [String(chat), "ok"]));
+  entries.push({ key: `sent:${inFlight.post}`, value: JSON.stringify(log), expiration_ttl: SENT_TTL_S });
 }
 
 const subscribers = Object.entries(legacy.subscribers ?? {});
