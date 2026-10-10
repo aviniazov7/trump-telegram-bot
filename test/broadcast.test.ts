@@ -2,7 +2,7 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { POST_RETRY_WINDOW_MS, menuFingerprint, runCron } from "../src/broadcast";
 import type { Config } from "../src/config";
-import { HEARTBEAT_WRITE_MS } from "../src/monitor";
+import { HEARTBEAT_WRITE_MS, resetMemoryMutes } from "../src/monitor";
 import { Store, emptyMeta } from "../src/store";
 import { CNN_HOST, GEMINI, type Handler, RSS_HOST, TELEGRAM, geminiAnswer, json, rssFeed, testCtx } from "./helpers";
 
@@ -11,6 +11,7 @@ const store = new Store(env.STATE);
 
 beforeEach(async () => {
   for (const { name } of (await env.STATE.list()).keys) await env.STATE.delete(name);
+  resetMemoryMutes();
 });
 
 /** A fake Telegram that records sends and can misbehave per chat. */
@@ -91,7 +92,7 @@ describe("new posts and idempotent delivery", () => {
     expect(tg.postsTo("b")).toEqual(["2", "3", "4"]);
     const meta = await store.getMeta();
     expect(meta).toMatchObject({ lastSeen: "4", sentAhead: [], pending: {} });
-    expect(await store.getSent("3", "a")).toBe("ok");
+    expect((await store.getSendLog("3")).a).toBe("ok");
   });
 
   it("never sends the same post twice, even if the cursor didn't move", async () => {
@@ -165,7 +166,7 @@ describe("Telegram errors during a broadcast", () => {
       throw new DOMException("timed out", "TimeoutError");
     });
     await first.run();
-    expect(await store.getSent("2", "a")).toBe("uncertain");
+    expect((await store.getSendLog("2")).a).toBe("uncertain");
     expect((await store.getMeta()).lastSeen).toBe("2");
 
     const second = setup({ feed: ["3", "2", "1"] });
@@ -232,7 +233,7 @@ describe("dry run", () => {
     expect(tg.sent.map((s) => s.chat)).toEqual(["999", "999"]);
     expect(tg.sent[0]?.text).toContain("DRY RUN");
     expect(tg.sent[0]?.text).toContain("ל-2 מנויים");
-    expect(await store.getSent("2", "a")).toBeNull();
+    expect((await store.getSendLog("2")).a).toBeUndefined();
     expect((await store.getMeta()).lastSeen).toBe("3");
   });
 
@@ -248,26 +249,32 @@ describe("dry run", () => {
 describe("monitoring", () => {
   const adminAlerts = (tg: FakeTelegram) => tg.sent.filter((s) => s.chat === "999" && s.text.includes("התראת"));
 
-  it("alerts when the last successful run is older than 15 minutes, once per hour", async () => {
-    await seed("1", ["a"], { lastSuccess: NOW - 20 * 60_000 });
+  it("alerts when the last successful run is too old, once per hour", async () => {
+    await seed("1", ["a"], { lastSuccess: NOW - 40 * 60_000 });
     const first = setup({ feed: ["1"] });
     await first.run();
-    expect(adminAlerts(first.tg)[0]?.text).toContain("20 דק׳");
+    expect(adminAlerts(first.tg)[0]?.text).toContain("40 דק׳");
     expect((await store.getMeta()).lastSuccess).toBe(NOW);
 
-    await store.putMeta({ ...(await store.getMeta()), lastSuccess: NOW - 20 * 60_000 });
+    resetMemoryMutes(); // a fresh Worker instance still sees the KV mute
+    await store.putMeta({ ...(await store.getMeta()), lastSuccess: NOW - 40 * 60_000 });
     const second = setup({ feed: ["1"] });
     await second.run();
-    expect(adminAlerts(second.tg)).toEqual([]); // muted for an hour
+    expect(adminAlerts(second.tg)).toEqual([]);
   });
 
-  it("doesn't alert within the threshold, and writes the heartbeat only every 10 minutes", async () => {
-    await seed("1", ["a"], { lastSuccess: NOW - 5 * 60_000 });
+  it("writes the heartbeat at most every 30 minutes and never calls a healthy gap stale", async () => {
+    expect(HEARTBEAT_WRITE_MS).toBe(30 * 60_000);
+    // 29 min since the last heartbeat write is normal, even with STALE_ALERT_MINUTES=15.
+    await seed("1", ["a"], { lastSuccess: NOW - 29 * 60_000 });
     const { tg, run } = setup({ feed: ["1"] });
     await run();
     expect(adminAlerts(tg)).toEqual([]);
-    expect((await store.getMeta()).lastSuccess).toBe(NOW - 5 * 60_000);
-    expect(HEARTBEAT_WRITE_MS).toBe(10 * 60_000);
+    expect((await store.getMeta()).lastSuccess).toBe(NOW - 29 * 60_000); // no write yet
+
+    await store.putMeta({ ...(await store.getMeta()), lastSuccess: NOW - 30 * 60_000 });
+    await setup({ feed: ["1"] }).run();
+    expect((await store.getMeta()).lastSuccess).toBe(NOW);
   });
 
   it("alerts after 10 runs in a row without a reachable source", async () => {
@@ -341,5 +348,133 @@ describe("bot menu", () => {
     await second.run();
     expect(second.tg.methods).toEqual([]);
     expect(await menuFingerprint("another-token")).not.toBe(await menuFingerprint("test-bot-token"));
+  });
+});
+
+/** KV wrapper whose writes fail on demand, like an exhausted free-plan quota. */
+class FlakyKV {
+  writes: string[] = [];
+  failAll = false;
+  failWhen: (key: string, priorWritesToKey: number) => boolean = () => false;
+
+  constructor(private readonly kv: KVNamespace) {}
+
+  private check(key: string) {
+    const prior = this.writes.filter((k) => k === key).length;
+    if (this.failAll || this.failWhen(key, prior)) throw new Error("KV put() limit exceeded for the day.");
+    this.writes.push(key);
+  }
+  get(...args: Parameters<KVNamespace["get"]>) {
+    return (this.kv.get as (...a: unknown[]) => unknown)(...args);
+  }
+  getWithMetadata(...args: Parameters<KVNamespace["getWithMetadata"]>) {
+    return (this.kv.getWithMetadata as (...a: unknown[]) => unknown)(...args);
+  }
+  list(...args: Parameters<KVNamespace["list"]>) {
+    return this.kv.list(...args);
+  }
+  async put(key: string, value: string, opts?: KVNamespacePutOptions) {
+    this.check(key);
+    return this.kv.put(key, value, opts);
+  }
+  async delete(key: string) {
+    this.check(key);
+    return this.kv.delete(key);
+  }
+}
+
+describe("KV write failures", () => {
+  const adminAlerts = (tg: FakeTelegram) => tg.sent.filter((s) => s.chat === "999" && s.text.includes("KV"));
+
+  function flakySetup(flaky: FlakyKV, feed: string[]) {
+    const s = setup({ feed });
+    return { ...s, run: () => runCron(s.ctx, new Store(flaky as unknown as KVNamespace)) };
+  }
+
+  it("stops all sends when the send log can't be saved, alerts once, and never re-sends", async () => {
+    await seed("1", ["a", "b"]);
+    const flaky = new FlakyKV(env.STATE);
+    // The reservation for post 2 succeeds; the write recording its outcome fails.
+    flaky.failWhen = (key, prior) => key === "sent:2" && prior >= 1;
+
+    const first = flakySetup(flaky, ["3", "2", "1"]);
+    await first.run();
+    expect(first.tg.postsTo("a")).toEqual(["2"]);
+    expect(first.tg.postsTo("b")).toEqual(["2"]);
+    // Halted: post 3 was not sent in this run.
+    expect(adminAlerts(first.tg)).toHaveLength(1);
+    expect(adminAlerts(first.tg)[0]?.text).toContain("עצרתי את כל השליחות");
+
+    // KV is now out of writes entirely: later runs send nothing and don't re-alert.
+    flaky.failAll = true;
+    for (let i = 0; i < 3; i++) {
+      const next = flakySetup(flaky, ["3", "2", "1"]);
+      await next.run();
+      expect(next.tg.sent.filter((s) => s.chat !== "999")).toEqual([]);
+      expect(adminAlerts(next.tg)).toEqual([]);
+    }
+
+    // Quota back: post 3 goes out; post 2 is never repeated (its reservation stands).
+    flaky.failAll = false;
+    flaky.failWhen = () => false;
+    const recovered = flakySetup(flaky, ["3", "2", "1"]);
+    await recovered.run();
+    expect(recovered.tg.postsTo("a")).toEqual(["3"]);
+    expect(recovered.tg.postsTo("b")).toEqual(["3"]);
+    expect((await store.getMeta()).lastSeen).toBe("3");
+  });
+
+  it("sends nothing when the reservation can't be written", async () => {
+    await seed("1", ["a", "b"]);
+    const flaky = new FlakyKV(env.STATE);
+    flaky.failWhen = (key) => key.startsWith("sent:");
+    const { tg, run } = flakySetup(flaky, ["2", "1"]);
+    await run();
+    expect(tg.sent.filter((s) => s.chat !== "999")).toEqual([]);
+    expect(adminAlerts(tg)).toHaveLength(1);
+  });
+
+  it("stops mid-post when unsubscribing a dead chat fails, and releases the rest", async () => {
+    await seed("1", ["a", "b", "c"]);
+    const flaky = new FlakyKV(env.STATE);
+    flaky.failWhen = (key) => key === "sub:a";
+    const first = flakySetup(flaky, ["2", "1"]);
+    first.tg.behavior.set("a", () => tgError(403, "Forbidden: bot was blocked by the user"));
+    await first.run();
+    expect(first.tg.sent.filter((s) => s.chat !== "999")).toEqual([]); // b and c not sent after the failure
+    const log = await store.getSendLog("2");
+    expect(log).toEqual({ a: "gone" }); // b and c released for the next run
+
+    flaky.failWhen = () => false;
+    const second = flakySetup(flaky, ["2", "1"]);
+    await second.run();
+    expect(second.tg.sent.map((s) => s.chat)).toEqual(["b", "c"]);
+  });
+
+  it("does not deliver a post whose analysis can't be cached", async () => {
+    await seed("1", ["a"]);
+    const flaky = new FlakyKV(env.STATE);
+    flaky.failWhen = (key) => key.startsWith("analysis:");
+    const { tg, run } = flakySetup(flaky, ["2", "1"]);
+    await run();
+    expect(tg.postsTo("a")).toEqual([]);
+  });
+
+  it("costs two send-log writes per post, however many subscribers", async () => {
+    await seed("1", ["a", "b", "c", "d", "e"]);
+    const flaky = new FlakyKV(env.STATE);
+    const { tg, run } = flakySetup(flaky, ["2", "1"]);
+    await run();
+    expect(tg.sent).toHaveLength(5);
+    expect(flaky.writes.filter((k) => k.startsWith("sent:"))).toEqual(["sent:2", "sent:2"]);
+    // reservation + result + analysis + meta (cursor); no heartbeat write yet
+    expect(flaky.writes).toHaveLength(4);
+  });
+
+  it("waits a second between the two writes to the same key (KV: 1 write/s/key)", async () => {
+    await seed("1", ["a"]);
+    const { ctx, run } = setup({ feed: ["2", "1"] });
+    await run();
+    expect(ctx.sleeps).toContain(1100);
   });
 });

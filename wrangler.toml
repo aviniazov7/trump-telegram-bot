@@ -27,7 +27,10 @@ id = "REPLACE_WITH_KV_NAMESPACE_ID"
 DRY_RUN = "true"
 GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_THINKING_LEVEL = ""
-STALE_ALERT_MINUTES = "15"
+# In-band "no successful run" alert. Can't be below the 30-min heartbeat
+# interval (+1 min) — the code clamps it. For faster detection use
+# HEALTHCHECK_URL (healthchecks.io), which costs no KV writes.
+STALE_ALERT_MINUTES = "35"
 SOURCE_FAILURE_ALERT_RUNS = "10"
 ALERT_REPEAT_MINUTES = "60"
 MAX_SCAN_POSTS = "100"

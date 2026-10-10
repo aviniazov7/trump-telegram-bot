@@ -37,7 +37,7 @@ export function loadConfig(env: Env): Config {
     dryRun: str(env.DRY_RUN).toLowerCase() !== "false",
     geminiModel: str(env.GEMINI_MODEL) || "gemini-3.8-flash",
     geminiThinkingLevel: str(env.GEMINI_THINKING_LEVEL).toLowerCase(),
-    staleAlertMinutes: int(env.STALE_ALERT_MINUTES, 15),
+    staleAlertMinutes: int(env.STALE_ALERT_MINUTES, 35),
     sourceFailureAlertRuns: int(env.SOURCE_FAILURE_ALERT_RUNS, 10),
     alertRepeatMinutes: int(env.ALERT_REPEAT_MINUTES, 60),
     maxScanPosts: int(env.MAX_SCAN_POSTS, 100),
