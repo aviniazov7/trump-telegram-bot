@@ -294,9 +294,13 @@ The first run after this change finds no `BOT_STATE` variable. It then reads
 the legacy `data/last_seen.txt`, `data/last_update_id.txt` and
 `data/subscribers.txt` from the checkout and creates the variable from them.
 The migration can only create the variable and never overwrites it, so every
-later run just loads `BOT_STATE` and ignores the files. The files are then
-removed from the tree and from history; see
-[docs/HISTORY_CLEANUP.md](docs/HISTORY_CLEANUP.md).
+later run just loads `BOT_STATE` and ignores the files.
+
+The branches on GitHub no longer contain any `data/` file. What remains is
+cached and old copies: unreachable commits, `refs/pull/1-4`, and the logs of 4
+runs from before log redaction. The audit and the exact cleanup steps (log
+deletion, a GitHub Support request, and a `git filter-repo` procedure
+in case it's needed) are in [docs/HISTORY_CLEANUP.md](docs/HISTORY_CLEANUP.md).
 
 ### Configuration
 
