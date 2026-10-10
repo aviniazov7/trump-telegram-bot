@@ -997,17 +997,38 @@ def send_post_message(
     return send_telegram_message(message, chat_id=chat_id)
 
 
-def clear_bot_menu() -> None:
-    """Clear the bot's slash-command menu so no commands are exposed."""
-    if telegram_call("setMyCommands", {"commands": []}, idempotent=True).ok:
-        log.info("Cleared bot commands list")
-    else:
-        log.warning("Failed to clear bot commands")
+# The bot is broadcast-only, so it exposes no slash commands and the default
+# menu button. Changing this triggers a one-time re-apply (see main()).
+BOT_MENU_CONFIG: dict[str, dict[str, Any]] = {
+    "setMyCommands": {"commands": []},
+    "setChatMenuButton": {"menu_button": {"type": "default"}},
+}
 
-    if telegram_call("setChatMenuButton", {"menu_button": {"type": "default"}}, idempotent=True).ok:
-        log.info("Reset bot menu button to default")
-    else:
-        log.warning("Failed to reset menu button")
+
+def menu_fingerprint() -> str:
+    """Identify the menu config together with the bot it was applied to.
+
+    Keyed with the bot token, so a new bot (new token) gets its menu set even
+    though the config itself didn't change — without storing the token.
+    """
+    config = json.dumps(BOT_MENU_CONFIG, sort_keys=True).encode()
+    return hmac.new(TELEGRAM_BOT_TOKEN.encode(), config, hashlib.sha256).hexdigest()[:16]
+
+
+def clear_bot_menu() -> bool:
+    """Clear the bot's slash-command menu so no commands are exposed.
+
+    Returns True only if every call succeeded, so a failure is retried on the
+    next run.
+    """
+    all_ok = True
+    for method, payload in BOT_MENU_CONFIG.items():
+        if telegram_call(method, payload, idempotent=True).ok:
+            log.info("Applied %s", method)
+        else:
+            log.warning("Failed to apply %s", method)
+            all_ok = False
+    return all_ok
 
 # ---------------------------------------------------------------------------
 # Subscribers — anyone who /start's the bot or adds it to a group/channel
@@ -1426,8 +1447,11 @@ def main() -> None:
         persisted = state.copy()
         log.info("State saved")
 
-    # Keep the slash-command menu cleared — the bot is broadcast-only.
-    clear_bot_menu()
+    # Keep the slash-command menu cleared — the bot is broadcast-only. Telegram
+    # remembers it, so this only runs when the config or the bot changes.
+    fingerprint = menu_fingerprint()
+    if state.menu_config != fingerprint and clear_bot_menu():
+        state.menu_config = fingerprint
 
     # Pick up new subscribers / kicks before broadcasting this round's posts.
     # Persist right away so a crash mid-broadcast doesn't lose a /start.

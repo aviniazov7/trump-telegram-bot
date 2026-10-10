@@ -95,7 +95,8 @@ class MainStateFlowTests(MainTestCase):
         (self.data / "subscribers.txt").write_text("111\n")
         (self.data / "last_seen.txt").write_text("p1\n")
         self.run_main(posts=[{"id": "p1", "text": "old", "created_at": ""}])
-        self.assertEqual(self.store.load(), BotState(subscribers={"111": None}, last_seen="p1"))
+        self.assertEqual(self.store.load(), BotState(subscribers={"111": None}, last_seen="p1",
+                                                     menu_config=main.menu_fingerprint()))
         self.sent.assert_not_called()  # p1 was already seen before migration
 
     def test_new_subscriber_and_new_post_are_persisted(self):
@@ -107,12 +108,14 @@ class MainStateFlowTests(MainTestCase):
         self.run_main(updates=[private_start(4, 222)], posts=posts)
         self.assertEqual(
             self.store.load(),
-            BotState(subscribers={"111": None, "222": None}, last_seen="p2", last_update_id=4),
+            BotState(subscribers={"111": None, "222": None}, last_seen="p2", last_update_id=4,
+                     menu_config=main.menu_fingerprint()),
         )
         self.assertEqual({c.kwargs["chat_id"] for c in self.sent.call_args_list}, {"111", "222"})
 
     def test_idle_run_does_not_write(self):
-        self.store.save(BotState(subscribers={"111": None}, last_seen="p1"))
+        self.store.save(BotState(subscribers={"111": None}, last_seen="p1",
+                                 menu_config=main.menu_fingerprint()))
         with mock.patch.object(self.store, "save") as save:
             self.run_main(posts=[{"id": "p1", "text": "old", "created_at": ""}])
         save.assert_not_called()
@@ -129,6 +132,45 @@ class MainStateFlowTests(MainTestCase):
         with mock.patch.object(main, "TELEGRAM_CHAT_ID", "999"):
             self.run_main()
         self.assertEqual(self.store.load().subscribers, {"999": None})
+
+
+class BotMenuTests(MainTestCase):
+    def test_menu_applied_once_then_skipped(self):
+        self.store.save(BotState(subscribers={"111": None}, last_seen="p1"))
+        self.run_main()
+        main.clear_bot_menu.assert_called_once()
+        self.assertEqual(self.store.load().menu_config, main.menu_fingerprint())
+
+        main.clear_bot_menu.reset_mock()
+        self.run_main()
+        main.clear_bot_menu.assert_not_called()
+
+    def test_failed_menu_reset_is_retried_next_run(self):
+        self.store.save(BotState(subscribers={"111": None}))
+        main.clear_bot_menu.return_value = False
+        self.run_main()
+        self.assertEqual(self.store.load().menu_config, "")
+
+    def test_menu_reapplied_when_config_changes(self):
+        self.store.save(BotState(menu_config=main.menu_fingerprint()))
+        changed = {"setMyCommands": {"commands": [{"command": "x", "description": "y"}]}}
+        with mock.patch.object(main, "BOT_MENU_CONFIG", changed):
+            self.run_main()
+        main.clear_bot_menu.assert_called_once()
+
+    def test_menu_reapplied_for_a_new_bot_token(self):
+        self.store.save(BotState(menu_config=main.menu_fingerprint()))
+        with mock.patch.object(main, "TELEGRAM_BOT_TOKEN", "another-bot"):
+            self.run_main()
+        main.clear_bot_menu.assert_called_once()
+
+
+class ClearBotMenuTests(unittest.TestCase):
+    def test_reports_partial_failure(self):
+        responses = [main.TelegramResponse(ok=True), main.TelegramResponse(ok=False)]
+        with mock.patch.object(main, "telegram_call", side_effect=responses) as call:
+            self.assertFalse(main.clear_bot_menu())
+        self.assertEqual([c.args[0] for c in call.call_args_list], ["setMyCommands", "setChatMenuButton"])
 
 
 class LogRedactionTests(MainTestCase):

@@ -10,6 +10,10 @@ The bot is **broadcast-only**:
 - No slash-command menu is shown. All other messages are ignored silently —
   users can't trigger any action.
 
+The empty menu is applied to Telegram once, then remembered: state keeps a
+fingerprint (`menu_config`) of `BOT_MENU_CONFIG` keyed with the bot token, and
+the two menu API calls run again only when the config or the bot changes.
+
 ## Fetching and delivery
 
 GitHub's scheduler often skips `*/10` cron runs, so the real gap between runs
@@ -117,6 +121,7 @@ The bot keeps a small amount of state between runs:
   handled once
 - **in_flight** (only while a broadcast is interrupted): the post being sent and
   the chats that already have it
+- **menu_config**: fingerprint of the bot menu last applied to Telegram
 
 ### Why the state is not in git
 
@@ -140,7 +145,8 @@ repository. The workflow has read-only access to the code.
 GitHub Actions (cron, every 10 min, concurrency group "trump-bot")
   └─ src/main.py
        1. store.load()             ← GitHub REST API: GET actions/variables/BOT_STATE
-       2. handle Telegram updates  (mutates state in memory)
+       2. reset bot menu           (only if menu_config fingerprint changed)
+          handle Telegram updates  (mutates state in memory)
        3. store.save() if changed  → PATCH actions/variables/BOT_STATE
        4. fetch ≤100 posts         ← trumpstruth.org RSS (CNN archive if last_seen not found)
        5. for each new post, oldest first:

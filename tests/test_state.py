@@ -133,10 +133,12 @@ class BotStateTests(unittest.TestCase):
         self.assertNotIn("999", state.subscribers)
         self.assertEqual(state.in_flight_chats, ["111"])
 
-    def test_in_flight_round_trip(self):
+    def test_optional_fields_round_trip(self):
         state = sample_state()
         state.in_flight_post, state.in_flight_chats = "p9", ["111"]
+        state.menu_config = "abc123"
         self.assertEqual(BotState.from_json(state.to_json()), state)
+        self.assertEqual(state.copy(), state)
 
     def test_optional_keys_omitted_when_unset(self):
         # Keeps idle state byte-identical to what earlier versions wrote.

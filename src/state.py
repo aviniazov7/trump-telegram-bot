@@ -58,6 +58,9 @@ class BotState:
     # chats that already have it, so the next run resumes instead of re-sending.
     in_flight_post: str = ""
     in_flight_chats: list[str] = field(default_factory=list)
+    # Fingerprint of the bot menu config last applied to Telegram, so the
+    # menu is reset only when that config (or the bot token) changes.
+    menu_config: str = ""
 
     def to_json(self) -> str:
         data: dict = {
@@ -70,6 +73,8 @@ class BotState:
         # exact shape older versions of the bot wrote and read.
         if self.in_flight_post:
             data["in_flight"] = {"post": self.in_flight_post, "chats": sorted(self.in_flight_chats)}
+        if self.menu_config:
+            data["menu_config"] = self.menu_config
         return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
     @classmethod
@@ -106,6 +111,7 @@ class BotState:
             last_update_id=last_update_id,
             in_flight_post=str(in_flight.get("post") or ""),
             in_flight_chats=[str(c) for c in in_flight.get("chats", [])],
+            menu_config=str(data.get("menu_config") or ""),
         )
 
     def copy(self) -> "BotState":
@@ -115,6 +121,7 @@ class BotState:
             last_update_id=self.last_update_id,
             in_flight_post=self.in_flight_post,
             in_flight_chats=list(self.in_flight_chats),
+            menu_config=self.menu_config,
         )
 
 
