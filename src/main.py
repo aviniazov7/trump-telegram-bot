@@ -18,11 +18,13 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -49,12 +51,18 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 LOCAL_STATE_FILE = DATA_DIR / "state.json"
 
+# Monitoring. ADMIN_CHAT_ID receives operational alerts (see alert_admin).
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+# Optional dead-man's switch URL (e.g. healthchecks.io), pinged after every
+# successful run. It alerts on its own when the pings stop — the one failure
+# the bot cannot report itself: not running at all.
+HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "").strip()
+
 # Use Asia/Jerusalem so Israel DST (UTC+2 winter / UTC+3 summer) is correct.
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
 MAX_RETRIES = 2
 RETRY_DELAY = 2  # seconds
-FETCH_LIMIT = 10
 HTTP_TIMEOUT = 15  # seconds per request
 
 # Telegram caps text messages at 4096 chars; leave a small margin for safety.
@@ -75,42 +83,54 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# ---- AI provider ---------------------------------------------------------
-# Used only as the last-resort link in the translation fallback chain (see
-# TRANSLATE_PROVIDERS). Set AI_PROVIDER to:
-#   - "pollinations" (default) — keyless, but currently answers 402, so this
-#     link is inert until one of the keyed providers below is configured.
-#   - "gemini"  — Google Gemini free tier (set GEMINI_API_KEY).
-#   - "claude"  — Anthropic API, paid (set ANTHROPIC_API_KEY).
-AI_PROVIDER = os.environ.get("AI_PROVIDER", "pollinations").strip().lower()
-AI_MAX_TOKENS = _env_int("AI_MAX_TOKENS", 1500)
-# Generous per-request timeout: a model call is slower than a translate call,
-# and this only runs after every keyless provider has already failed.
-AI_TIMEOUT = _env_int("AI_TIMEOUT", 60)
+# How far back a run looks for last_seen. GitHub's scheduler regularly skips
+# runs for hours, and Trump can post dozens of times in that gap, so this has to
+# cover a long outage: the trumpstruth RSS feed holds the latest 100 posts
+# (about a week). If last_seen is not within this many posts, the bot sends only
+# the newest one instead of flooding subscribers (see filter_new_posts).
+MAX_SCAN_POSTS = _env_int("MAX_SCAN_POSTS", 100)
 
-# Pollinations (no API key) — the default provider. OpenAI-compatible.
-POLLINATIONS_API_URL = "https://text.pollinations.ai/openai"
-POLLINATIONS_MODEL = os.environ.get("POLLINATIONS_MODEL", "openai").strip()
 
-# Google Gemini (free tier, needs a free key).
+# Alert when the previous successful run is older than this.
+STALE_ALERT_MINUTES = _env_int("STALE_ALERT_MINUTES", 60)
+# Send the same kind of alert at most this often.
+ALERT_REPEAT_MINUTES = _env_int("ALERT_REPEAT_MINUTES", 60)
+# Refresh the stored heartbeat at most this often, to limit state writes.
+HEARTBEAT_WRITE_MINUTES = 5
+
+
+# ---- Gemini (primary translator) ----------------------------------------
+# Google Gemini translates every post when GEMINI_API_KEY is set (free tier
+# key from https://aistudio.google.com/apikey). Without a key, or when Gemini
+# fails, the keyless providers in FREE_TRANSLATE_PROVIDERS take over.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
+# Empty values come from unset Actions variables, so fall back explicitly.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-3.8-flash"
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
 )
-
-# Anthropic Claude (paid) — optional alternative provider.
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_VERSION = "2023-06-01"
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8").strip()
+# Optional: "minimal" / "low" / "medium" / "high". Unset = the model's default.
+# Thinking tokens count against GEMINI_MAX_TOKENS.
+GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "").strip().lower()
+GEMINI_MAX_TOKENS = _env_int("GEMINI_MAX_TOKENS", 8192)
+GEMINI_TIMEOUT = _env_int("GEMINI_TIMEOUT", 60)
+# A 429 from the free tier says how long to wait; wait at most this long.
+GEMINI_MAX_RETRY_DELAY = 30  # seconds
+# A post is sent to Gemini in one piece; Truth Social posts are far shorter.
+GEMINI_MAX_CHARS = 12000
 
 _script_deadline: float | None = None
 
 
 def _budget_exceeded() -> bool:
     return _script_deadline is not None and time.monotonic() > _script_deadline
+
+
+def _seconds_left() -> float:
+    if _script_deadline is None:
+        return float("inf")
+    return _script_deadline - time.monotonic()
 
 
 def redact_chat(chat_id: str | int | None) -> str:
@@ -163,32 +183,6 @@ def http_get(
     raise RuntimeError(f"Failed to GET {url} after {retries} attempts")
 
 
-def http_post(
-    url: str,
-    data: dict[str, Any],
-    retries: int = MAX_RETRIES,
-) -> dict[str, Any]:
-    """POST JSON request with bounded retries."""
-    body = json.dumps(data).encode()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": DEFAULT_USER_AGENT,
-        },
-        method="POST",
-    )
-    for attempt in range(1, retries + 1):
-        try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-                return json.loads(resp.read())
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
-            log.warning("POST %s attempt %d/%d failed: %s", url, attempt, retries, exc)
-            if attempt < retries:
-                time.sleep(RETRY_DELAY * attempt)
-    raise RuntimeError(f"Failed to POST {url} after {retries} attempts")
-
 # ---------------------------------------------------------------------------
 # Fetch posts — trumpstruth.org RSS (primary) + CNN JSON (fallback)
 # ---------------------------------------------------------------------------
@@ -237,7 +231,7 @@ def _is_meaningful_text(text: str) -> bool:
     return True
 
 
-def fetch_posts_trumpstruth() -> list[dict[str, Any]]:
+def fetch_posts_trumpstruth(limit: int = MAX_SCAN_POSTS) -> list[dict[str, Any]]:
     """Fetch posts from trumpstruth.org RSS feed (primary source)."""
     log.info("Fetching posts from trumpstruth.org RSS feed")
     raw = http_get(TRUMPSTRUTH_RSS)
@@ -270,14 +264,14 @@ def fetch_posts_trumpstruth() -> list[dict[str, Any]]:
             "media_urls": [],
         })
 
-        if len(posts) >= FETCH_LIMIT:
+        if len(posts) >= limit:
             break
 
     log.info("Fetched %d posts from trumpstruth.org", len(posts))
     return posts
 
 
-def fetch_posts_cnn_archive() -> list[dict[str, Any]]:
+def fetch_posts_cnn_archive(limit: int = MAX_SCAN_POSTS) -> list[dict[str, Any]]:
     """Fallback: fetch posts from CNN's Truth Social archive JSON."""
     log.info("Fetching posts from CNN archive (fallback)")
     raw = http_get(CNN_ARCHIVE_JSON)
@@ -307,28 +301,58 @@ def fetch_posts_cnn_archive() -> list[dict[str, Any]]:
             "media_urls": media_urls,
         })
 
-        if len(posts) >= FETCH_LIMIT:
+        if len(posts) >= limit:
             break
 
     log.info("Fetched %d posts from CNN archive", len(posts))
     return posts
 
 
-def fetch_posts() -> list[dict[str, Any]]:
-    """Fetch posts with fallback chain."""
+def _newest_first(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order posts newest first.
+
+    Both sources already list newest first, but filter_new_posts depends on it,
+    so don't trust that blindly. Truth Social IDs are snowflakes that grow over
+    time; if any ID isn't numeric, keep the source's order.
+    """
+    if all(str(p.get("id", "")).isdigit() for p in posts):
+        return sorted(posts, key=lambda p: int(p["id"]), reverse=True)
+    return posts
+
+
+def _contains(posts: list[dict[str, Any]], post_id: str) -> bool:
+    return any(p["id"] == post_id for p in posts)
+
+
+def fetch_posts(last_seen_id: str = "") -> list[dict[str, Any]]:
+    """Fetch up to MAX_SCAN_POSTS recent posts, newest first.
+
+    trumpstruth.org is the primary source. The CNN archive is used when it
+    fails, and also when its window doesn't reach back to last_seen_id: the
+    archive holds the full history, so it can still find the gap's start if
+    the RSS feed dropped or reordered items.
+    """
+    posts: list[dict[str, Any]] = []
     try:
-        posts = fetch_posts_trumpstruth()
-        if posts:
-            return posts
+        posts = _newest_first(fetch_posts_trumpstruth())
     except Exception as exc:
         log.warning("trumpstruth.org RSS failed: %s", exc)
 
+    if posts and (not last_seen_id or _contains(posts, last_seen_id)):
+        return posts
+    if posts:
+        log.warning("last_seen not in the RSS window of %d posts — checking the CNN archive", len(posts))
+
     try:
-        posts = fetch_posts_cnn_archive()
-        if posts:
-            return posts
+        archive = _newest_first(fetch_posts_cnn_archive())
     except Exception as exc:
         log.warning("CNN archive fallback failed: %s", exc)
+        archive = []
+
+    if archive and (not posts or _contains(archive, last_seen_id)):
+        return archive
+    if posts:
+        return posts
 
     log.error("All fetch methods failed")
     return []
@@ -414,15 +438,6 @@ URL_RE = re.compile(r"https?://\S+|www\.\S+")
 # Under this many Latin words a chunk (a bare link, "MAGA!", a hashtag) can
 # legitimately come back unchanged, so we don't insist on Hebrew in the answer.
 MIN_LATIN_WORDS_FOR_HEBREW_CHECK = 3
-
-TRANSLATE_AI_SYSTEM = (
-    "You are a translation engine. Translate the user's English text into "
-    "Hebrew. Reply with the Hebrew translation only — no preamble, no "
-    "commentary, no transliteration, no quotation marks. Keep line breaks, "
-    "names, numbers and URLs as they are. Translate faithfully even when the "
-    "text is political or heated; you are rendering it, not endorsing it."
-)
-
 
 def _latin_word_count(text: str) -> int:
     """Count Latin-script words, ignoring any URLs."""
@@ -529,17 +544,6 @@ def _translate_mymemory(chunk: str) -> str | None:
     return text if isinstance(text, str) else None
 
 
-def _translate_ai(chunk: str) -> str | None:
-    """Last resort: the configured AI provider.
-
-    Does not share Google's rate limits, but the keyless default currently
-    answers 402, so this only contributes once a key is configured.
-    """
-    if not _ai_key_available():
-        return None
-    return _ai_complete(TRANSLATE_AI_SYSTEM, chunk)
-
-
 def _translate_lingva(chunk: str) -> str | None:
     """Try each Lingva instance in turn; the first real answer wins."""
     path = urllib.parse.quote(chunk, safe="")
@@ -568,18 +572,274 @@ def _translate_lingva(chunk: str) -> str | None:
     return None
 
 
-# (name, function, max characters per request), best first.
-#
-# The AI entry is last on purpose: the keyless default (Pollinations) started
-# answering 402 Payment Required, so it only contributes when GEMINI_API_KEY or
-# ANTHROPIC_API_KEY is set. Everything above it needs no key at all.
-TRANSLATE_PROVIDERS: list[tuple[str, Any, int]] = [
+# ---------------------------------------------------------------------------
+# Gemini — primary translator
+# ---------------------------------------------------------------------------
+
+GEMINI_SYSTEM_PROMPT = """\
+You translate posts that Donald Trump published on Truth Social into Hebrew,
+for an Israeli audience that follows the news and the markets.
+
+Translation rules:
+- Translate the whole post accurately and completely. Do not summarize, omit,
+  add, explain, or soften anything, and do not intensify it either.
+- Write natural, fluent modern Hebrew, the way Israeli news outlets quote him.
+  Keep his register: short punchy sentences stay short, exclamation marks stay,
+  and words he writes in ALL CAPS for emphasis keep that emphasis.
+- Names of people, places, organizations, and media outlets: use the spelling
+  Israeli media use (Donald Trump = דונלד טראמפ, Joe Biden = ג'ו ביידן,
+  Federal Reserve = הפדרל ריזרב). Without an established Hebrew form,
+  transliterate the name and add the English in parentheses once.
+- Keep numbers, percentages, dollar amounts, dates, stock tickers, hashtags,
+  @handles, and URLs exactly as written.
+- Use precise economic and political terms: tariffs = מכסים,
+  interest rates = ריבית, trade deal = הסכם סחר.
+- Keep the original line breaks.
+- Stay politically neutral. You render his words; you neither endorse nor
+  criticize them. Add no commentary, disclaimers, or quotation marks.
+
+Market classification (judge the English original):
+- "categories": every topic that applies, from: tariffs (tariffs, trade
+  deals, import duties), fed_rates (the Federal Reserve, its chair, interest
+  rates), oil (oil, gas, OPEC, energy supply), crypto (cryptocurrencies,
+  stablecoins, digital assets), china (China, Xi, Chinese companies), stocks
+  (the stock market or specific listed companies). Use "other" only when none
+  of these applies.
+- "impact": how likely the post is to move financial markets in the coming
+  hours.
+  high   = a concrete new action, threat, or deadline with market consequences:
+           new, raised, paused, or removed tariffs; a direct demand on the Fed
+           over rates; sanctions or moves affecting oil supply; crypto policy;
+           a deal or rupture with China; a statement that targets a specific
+           listed company.
+  medium = market-related commentary without a concrete new action: praising
+           the stock market, criticizing the Fed in general terms, repeating
+           known trade positions.
+  low    = no plausible market effect: campaigning, endorsements, media or
+           personal attacks, greetings.
+
+Return JSON only, matching the response schema.
+"""
+
+# Machine keys → Hebrew hashtag labels, in display order.
+MARKET_CATEGORIES: dict[str, str] = {
+    "tariffs": "מכסים",
+    "fed_rates": "ריבית_הפד",
+    "oil": "נפט",
+    "crypto": "קריפטו",
+    "china": "סין",
+    "stocks": "מניות",
+    "other": "כללי",
+}
+IMPACT_LEVELS = ("high", "medium", "low")
+
+GEMINI_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "hebrew": {"type": "STRING", "description": "The full Hebrew translation"},
+        "categories": {
+            "type": "ARRAY",
+            "items": {"type": "STRING", "enum": list(MARKET_CATEGORIES)},
+        },
+        "impact": {"type": "STRING", "enum": list(IMPACT_LEVELS)},
+    },
+    "required": ["hebrew", "categories", "impact"],
+    "propertyOrdering": ["hebrew", "categories", "impact"],
+}
+
+
+class GeminiError(RuntimeError):
+    """Gemini gave no usable answer. Callers fall back to the free providers."""
+
+
+def _gemini_request(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST to Gemini once, waiting out one short 429 if the run allows it."""
+    body = json.dumps(payload).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": DEFAULT_USER_AGENT,
+        # In a header, not the URL, so the key never shows up in error logs.
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+    for attempt in (1, 2):
+        req = urllib.request.Request(GEMINI_API_URL, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            delay = _gemini_retry_delay(detail)
+            if exc.code == 429 and attempt == 1 and delay is not None \
+                    and delay <= GEMINI_MAX_RETRY_DELAY and delay < _seconds_left():
+                log.warning("Gemini rate-limited — waiting %ds as asked", delay)
+                time.sleep(delay)
+                continue
+            raise GeminiError(f"HTTP {exc.code}: {detail[:300]}") from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise GeminiError(f"{type(exc).__name__}: {exc}") from exc
+    raise GeminiError("rate-limited")
+
+
+def _gemini_retry_delay(error_body: str) -> int | None:
+    """Seconds from a 429's RetryInfo detail ("retryDelay": "23s"), if any."""
+    m = re.search(r'"retryDelay"\s*:\s*"(\d+)(?:\.\d+)?s"', error_body)
+    return int(m.group(1)) + 1 if m else None
+
+
+def _gemini_json(text: str) -> dict[str, Any]:
+    """Ask Gemini about one post and return its parsed JSON answer."""
+    if not GEMINI_API_KEY:
+        raise GeminiError("GEMINI_API_KEY not set")
+    generation_config: dict[str, Any] = {
+        "temperature": 0.2,
+        "maxOutputTokens": GEMINI_MAX_TOKENS,
+        "responseMimeType": "application/json",
+        "responseSchema": GEMINI_RESPONSE_SCHEMA,
+    }
+    if GEMINI_THINKING_LEVEL:
+        generation_config["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING_LEVEL}
+    result = _gemini_request({
+        "systemInstruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": text}]}],
+        "generationConfig": generation_config,
+    })
+
+    try:
+        candidate = result["candidates"][0]
+    except (KeyError, IndexError, TypeError):
+        block = (result.get("promptFeedback") or {}).get("blockReason") if isinstance(result, dict) else None
+        raise GeminiError(f"no candidates (blockReason={block})") from None
+    finish = candidate.get("finishReason", "STOP")
+    if finish != "STOP":
+        # MAX_TOKENS would hand us a truncated translation; SAFETY etc. none.
+        raise GeminiError(f"finishReason={finish}")
+    parts = (candidate.get("content") or {}).get("parts") or []
+    # Thinking models may return their reasoning as separate "thought" parts.
+    raw = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought"))
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise GeminiError(f"answer is not JSON: {raw[:120]!r}") from exc
+    if not isinstance(data, dict):
+        raise GeminiError("answer is not a JSON object")
+    return data
+
+
+def _translate_gemini(chunk: str) -> str | None:
+    """Gemini's translation of one post (no keyless rate limits, best quality)."""
+    if not GEMINI_API_KEY:
+        return None
+    hebrew = _gemini_json(chunk).get("hebrew")
+    return hebrew.strip() if isinstance(hebrew, str) else None
+
+
+# (name, function, max characters per request), best first. None of the free
+# providers needs a key; they are what a deployment without GEMINI_API_KEY
+# runs on, and the fallback whenever Gemini fails.
+FREE_TRANSLATE_PROVIDERS: list[tuple[str, Any, int]] = [
     ("google-gtx", _translate_google_gtx, MAX_TRANSLATE_CHUNK),
     ("google-clients5", _translate_google_clients5, MAX_TRANSLATE_CHUNK),
     ("lingva", _translate_lingva, LINGVA_MAX_CHUNK),
     ("mymemory", _translate_mymemory, MYMEMORY_MAX_CHUNK),
-    ("ai", _translate_ai, MAX_TRANSLATE_CHUNK),
 ]
+TRANSLATE_PROVIDERS: list[tuple[str, Any, int]] = [
+    ("gemini", _translate_gemini, GEMINI_MAX_CHARS),
+    *FREE_TRANSLATE_PROVIDERS,
+]
+
+# ---------------------------------------------------------------------------
+# Market-impact tagging
+# ---------------------------------------------------------------------------
+
+_CATEGORY_ALIASES = {
+    "tariff": "tariffs", "trade": "tariffs",
+    "fed": "fed_rates", "rates": "fed_rates", "interest_rates": "fed_rates", "fed/rates": "fed_rates",
+    "energy": "oil", "stock": "stocks", "stock_market": "stocks",
+}
+
+# Used only when Gemini can't classify a post. It finds topics, but can't
+# judge impact, so a keyword match never earns a 🔴.
+_KEYWORD_CATEGORIES: dict[str, re.Pattern[str]] = {
+    "tariffs": re.compile(r"\btariffs?\b|\bduties\b|trade (?:deal|war|deficit)|reciprocal", re.I),
+    "fed_rates": re.compile(r"\bthe fed\b|federal reserve|\bpowell\b|interest rates?|rate cuts?", re.I),
+    "oil": re.compile(r"\boil\b|\bopec\b|\bcrude\b|gasoline|drill(?:ing)?\b|\bnatural gas\b", re.I),
+    "crypto": re.compile(r"crypto|bitcoin|\bbtc\b|stablecoin|digital assets?|blockchain", re.I),
+    "china": re.compile(r"\bchina\b|\bchinese\b|\bxi\b|beijing", re.I),
+    "stocks": re.compile(r"stock market|\bstocks?\b|\bdow\b|nasdaq|s&p|wall street|all[- ]time high", re.I),
+}
+
+
+def parse_market_tags(data: Any) -> tuple[list[str], str | None]:
+    """Validate Gemini's categories and impact.
+
+    Unknown categories are dropped, aliases mapped, duplicates removed and the
+    result put in display order; "other" is dropped when a real topic is
+    present. Returns ``([], None)``-ish values the caller can fall back from.
+    """
+    if not isinstance(data, dict):
+        return [], None
+    found: set[str] = set()
+    raw = data.get("categories")
+    if isinstance(raw, str):
+        raw = [raw]
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            key = item.strip().lower().replace(" ", "_").replace("-", "_")
+            key = _CATEGORY_ALIASES.get(key, key)
+            if key in MARKET_CATEGORIES:
+                found.add(key)
+    if len(found) > 1:
+        found.discard("other")
+    categories = [c for c in MARKET_CATEGORIES if c in found]
+
+    impact = data.get("impact")
+    impact = impact.strip().lower() if isinstance(impact, str) else None
+    return categories, impact if impact in IMPACT_LEVELS else None
+
+
+def keyword_categories(text: str) -> list[str]:
+    """Best-effort topics from keywords, for when Gemini is unavailable."""
+    found = [key for key, pattern in _KEYWORD_CATEGORIES.items() if pattern.search(text)]
+    return found or ["other"]
+
+
+@dataclass
+class PostAnalysis:
+    hebrew: str
+    translated: bool
+    categories: list[str]
+    impact: str | None    # None when Gemini couldn't classify the post
+    provider: str = ""
+
+
+def analyze_post(text: str) -> PostAnalysis:
+    """Translate a post and tag its market impact, with one Gemini call.
+
+    Falls back to the free translation chain plus keyword topics (no impact
+    level) when Gemini is not configured or fails.
+    """
+    if GEMINI_API_KEY and _needs_translation(text) and len(text) <= GEMINI_MAX_CHARS:
+        try:
+            data = _gemini_json(text)
+        except GeminiError as exc:
+            log.warning("Translation provider gemini failed: %s", exc)
+        else:
+            hebrew = data.get("hebrew")
+            hebrew = hebrew.strip() if isinstance(hebrew, str) else ""
+            if _looks_translated(text, hebrew):
+                categories, impact = parse_market_tags(data)
+                if not categories:
+                    categories, impact = keyword_categories(text), None
+                log.info("Translated and tagged post via gemini: %s, impact=%s",
+                         ",".join(categories), impact)
+                return PostAnalysis(hebrew, True, categories, impact, "gemini")
+            log.warning("Translation provider gemini returned %s",
+                        "no answer" if not hebrew else "untranslated text")
+
+    hebrew, translated = translate_to_hebrew(text, FREE_TRANSLATE_PROVIDERS)
+    return PostAnalysis(hebrew, translated, keyword_categories(text), None, "free" if translated else "")
 
 
 def _translate_with_provider(
@@ -615,7 +875,10 @@ def _translate_with_provider(
     return "".join(parts)
 
 
-def translate_to_hebrew(text: str) -> tuple[str, bool]:
+def translate_to_hebrew(
+    text: str,
+    providers: list[tuple[str, Any, int]] | None = None,
+) -> tuple[str, bool]:
     """Translate English text to Hebrew, trying each provider in turn.
 
     Returns ``(text, translated)``. When ``translated`` is False every provider
@@ -625,7 +888,10 @@ def translate_to_hebrew(text: str) -> tuple[str, bool]:
     if not text.strip():
         return text, True
 
-    for name, translate_chunk, max_chunk in TRANSLATE_PROVIDERS:
+    providers = TRANSLATE_PROVIDERS if providers is None else providers
+    for name, translate_chunk, max_chunk in providers:
+        if name == "gemini" and not GEMINI_API_KEY:
+            continue
         translated = _translate_with_provider(name, translate_chunk, max_chunk, text)
         if translated is not None:
             log.info("Translated post via %s", name)
@@ -633,7 +899,7 @@ def translate_to_hebrew(text: str) -> tuple[str, bool]:
 
     log.error(
         "All %d translation providers failed — sending the English original",
-        len(TRANSLATE_PROVIDERS),
+        len(providers),
     )
     return text, False
 
@@ -658,6 +924,137 @@ def _split_text(text: str, max_len: int) -> list[str]:
         chunks.append(text[:cut])
         text = text[cut:].lstrip()
     return chunks
+
+# ---------------------------------------------------------------------------
+# Telegram Bot API calls
+# ---------------------------------------------------------------------------
+#
+# sendMessage is not idempotent: if a request times out after Telegram got it,
+# sending it again delivers the post twice. So a failed send is retried only
+# when we know it never reached Telegram (connection refused, DNS failure) or
+# when Telegram itself said "not sent, retry after N seconds" (HTTP 429).
+# Read-only and set-style methods (getUpdates, setMyCommands) are safe to
+# retry and pass idempotent=True.
+
+# Errors raised before a single byte of the request reached Telegram.
+_NOT_SENT_ERRORS = (ConnectionRefusedError, socket.gaierror)
+
+TELEGRAM_ATTEMPTS = 3
+# Don't wait out a 429 longer than this; give up on that message instead.
+TELEGRAM_MAX_RETRY_AFTER = 30  # seconds
+
+# Telegram's answer when a chat can never receive messages from the bot again.
+# Any 403 means that (blocked, kicked, user deleted, never started the bot).
+_GONE_400_DESCRIPTIONS = ("chat not found", "group chat was deactivated", "peer_id_invalid")
+
+
+@dataclass
+class TelegramResponse:
+    ok: bool
+    result: Any = None
+    error_code: int = 0           # 0 = no HTTP answer (network error)
+    description: str = ""
+    retry_after: int = 0          # set on 429
+    migrate_to: str = ""          # set when a group was upgraded to a supergroup
+    uncertain: bool = False       # the request may have reached Telegram
+
+    @property
+    def chat_gone(self) -> bool:
+        if self.error_code == 403:
+            return True
+        return self.error_code == 400 and any(
+            d in self.description.lower() for d in _GONE_400_DESCRIPTIONS
+        )
+
+
+def _telegram_request(method: str, payload: dict[str, Any]) -> TelegramResponse:
+    """One HTTP round trip to the Bot API, never raising."""
+    req = urllib.request.Request(
+        f"{TELEGRAM_API}/{method}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        # 4xx/5xx still carry Telegram's JSON error body — that's where
+        # retry_after and the "blocked by the user" reason live.
+        raw = exc.read()
+        if not raw:
+            return TelegramResponse(ok=False, error_code=exc.code, description=str(exc.reason))
+    except urllib.error.URLError as exc:
+        return TelegramResponse(
+            ok=False,
+            description=str(exc.reason),
+            uncertain=not isinstance(exc.reason, _NOT_SENT_ERRORS),
+        )
+    except (TimeoutError, OSError) as exc:
+        # A read timeout or reset after the request went out: Telegram may
+        # well have delivered the message.
+        return TelegramResponse(ok=False, description=f"{type(exc).__name__}: {exc}", uncertain=True)
+
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return TelegramResponse(ok=False, description="non-JSON response", uncertain=True)
+    if not isinstance(data, dict):
+        return TelegramResponse(ok=False, description="unexpected response", uncertain=True)
+    params = data.get("parameters") or {}
+    return TelegramResponse(
+        ok=bool(data.get("ok")),
+        result=data.get("result"),
+        error_code=int(data.get("error_code") or 0),
+        description=str(data.get("description") or ""),
+        retry_after=int(params.get("retry_after") or 0),
+        migrate_to=str(params.get("migrate_to_chat_id") or ""),
+    )
+
+
+def telegram_call(
+    method: str,
+    payload: dict[str, Any],
+    *,
+    idempotent: bool = False,
+) -> TelegramResponse:
+    """Call a Bot API method, retrying only when it is safe to.
+
+    Logs only the method, error code and description: the full response can
+    contain chat IDs (migrate_to_chat_id), and Actions logs are public.
+    """
+    resp = TelegramResponse(ok=False)
+    for attempt in range(1, TELEGRAM_ATTEMPTS + 1):
+        resp = _telegram_request(method, payload)
+        if resp.ok:
+            return resp
+        last = attempt == TELEGRAM_ATTEMPTS
+
+        if resp.error_code == 429:
+            wait = max(resp.retry_after, 1)
+            if last or wait > TELEGRAM_MAX_RETRY_AFTER or wait >= _seconds_left():
+                log.warning("Telegram %s rate-limited (retry_after=%ds) — giving up", method, wait)
+                return resp
+            log.warning("Telegram %s rate-limited — waiting %ds as asked", method, wait)
+            time.sleep(wait)
+            continue
+
+        if resp.error_code == 0 or resp.error_code >= 500:
+            safe = idempotent or (resp.error_code == 0 and not resp.uncertain)
+            if safe and not last:
+                log.warning("Telegram %s attempt %d failed (%s) — retrying",
+                            method, attempt, resp.description or resp.error_code)
+                time.sleep(RETRY_DELAY * attempt)
+                continue
+            if not safe:
+                log.warning("Telegram %s failed and may have gone through (%s) — not retrying",
+                            method, resp.description or resp.error_code)
+                return resp
+
+        break
+
+    log.warning("Telegram %s failed: %s %s", method, resp.error_code or "network", resp.description)
+    return resp
 
 # ---------------------------------------------------------------------------
 # Telegram
@@ -696,12 +1093,41 @@ def _parse_iso(date_str: str) -> datetime:
     return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
 
 
-def build_message(post: dict[str, Any], hebrew: str, translated: bool = True) -> str:
+IMPACT_MARKERS = {
+    "high": "🔴 <b>השפעה גבוהה על השווקים</b>",
+    "medium": "🟠 השפעה בינונית על השווקים",
+    "low": "⚪ השפעה נמוכה על השווקים",
+}
+
+
+def build_tag_line(categories: list[str] | None, impact: str | None) -> str:
+    """The first line of a message: impact marker and topic hashtags.
+
+    Single line, so _split_for_telegram never cuts through its <b> tag.
+    """
+    labels = [MARKET_CATEGORIES[c] for c in (categories or []) if c in MARKET_CATEGORIES]
+    tags = " ".join(f"#{label}" for label in labels)
+    marker = IMPACT_MARKERS.get(impact or "")
+    if marker and tags:
+        return f"{marker} · {tags}"
+    if marker:
+        return marker
+    return f"🏷️ {tags}" if tags else ""
+
+
+def build_message(
+    post: dict[str, Any],
+    hebrew: str,
+    translated: bool = True,
+    categories: list[str] | None = None,
+    impact: str | None = None,
+) -> str:
     """Build the Telegram message in HTML format — English text + Hebrew translation.
 
     When ``translated`` is False the translation providers all failed, so the
     post goes out with a notice instead of the English original repeated under
-    a "תרגום לעברית" heading.
+    a "תרגום לעברית" heading. ``categories``/``impact`` add the market tag line
+    on top (see build_tag_line).
     """
     original = html.escape(post["text"])
     timestamp = format_timestamp(post["created_at"])
@@ -717,8 +1143,10 @@ def build_message(post: dict[str, Any], hebrew: str, translated: bool = True) ->
             "⚠️ <b>התרגום לעברית נכשל כרגע — הפוסט מוצג באנגלית בלבד.</b>\n"
         )
 
+    tag_line = build_tag_line(categories, impact)
     msg = (
-        "🇺🇸 <b>טראמפ — פוסט חדש</b>\n"
+        (f"{tag_line}\n" if tag_line else "")
+        + "🇺🇸 <b>טראמפ — פוסט חדש</b>\n"
         f"🕐 {timestamp}\n"
         "\n"
         f"{original}\n"
@@ -763,29 +1191,44 @@ def _split_for_telegram(text: str, max_len: int = TELEGRAM_MAX_MESSAGE_LEN) -> l
 REMOVE_KEYBOARD: dict[str, Any] = {"remove_keyboard": True}
 
 
+@dataclass
+class SendResult:
+    """Outcome of send_telegram_message. Truthy when the message went out."""
+
+    ok: bool
+    gone: bool = False       # the chat can never be reached again: unsubscribe it
+    migrated_to: str = ""    # the group became a supergroup with this new ID
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
 def send_telegram_message(
     text: str,
     chat_id: str | None = None,
     reply_markup: dict[str, Any] | None = None,
     thread_id: str | None = None,
-) -> bool:
+) -> SendResult:
     """Send a message, splitting if it exceeds 4096 chars.
 
     ``thread_id`` pins the message to a specific forum topic in a group
     chat (Telegram's ``message_thread_id``). For private chats and groups
     without topics, leave it as None.
+
+    A chunk that fails is not retried blindly (see telegram_call), so a long
+    message can arrive partially; that beats arriving twice.
     """
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN not set")
-        return False
+        return SendResult(False)
 
     target = chat_id
     if not target:
         log.error("No chat_id provided")
-        return False
+        return SendResult(False)
 
-    url = f"{TELEGRAM_API}/sendMessage"
     chunks = _split_for_telegram(text)
+    migrated_to = ""
 
     for i, chunk in enumerate(chunks):
         payload: dict[str, Any] = {
@@ -801,18 +1244,24 @@ def send_telegram_message(
         if reply_markup and i == len(chunks) - 1:
             payload["reply_markup"] = reply_markup
 
-        try:
-            result = http_post(url, payload)
-        except Exception as exc:
-            log.error("Failed to send Telegram message (chunk %d/%d): %s", i + 1, len(chunks), exc)
-            return False
+        resp = telegram_call("sendMessage", payload)
+        if not resp.ok and resp.migrate_to and not migrated_to:
+            # The group was upgraded to a supergroup. Telegram did not
+            # deliver to the old ID, so resend there once.
+            log.info("Chat %s migrated to %s", redact_chat(target), redact_chat(resp.migrate_to))
+            target = migrated_to = resp.migrate_to
+            payload["chat_id"] = target
+            resp = telegram_call("sendMessage", payload)
 
-        if not result.get("ok"):
-            log.error("Telegram API error (chunk %d/%d): %s", i + 1, len(chunks), result)
-            return False
+        if not resp.ok:
+            log.error(
+                "Failed to send to %s (chunk %d/%d): %s %s",
+                redact_chat(target), i + 1, len(chunks), resp.error_code or "network", resp.description,
+            )
+            return SendResult(False, gone=resp.chat_gone, migrated_to=migrated_to)
 
     log.info("Telegram message sent successfully to %s (%d chunk(s))", redact_chat(target), len(chunks))
-    return True
+    return SendResult(True, migrated_to=migrated_to)
 
 
 def send_post_message(
@@ -820,27 +1269,44 @@ def send_post_message(
     hebrew: str,
     chat_id: str,
     translated: bool = True,
-) -> bool:
+) -> SendResult:
     """Send a translated post to a specific chat."""
     message = build_message(post, hebrew, translated)
     return send_telegram_message(message, chat_id=chat_id)
 
 
-def clear_bot_menu() -> None:
-    """Clear the bot's slash-command menu so no commands are exposed."""
-    try:
-        http_post(f"{TELEGRAM_API}/setMyCommands", {"commands": []})
-        log.info("Cleared bot commands list")
-    except Exception as exc:
-        log.warning("Failed to clear bot commands: %s", exc)
+# The bot is broadcast-only, so it exposes no slash commands and the default
+# menu button. Changing this triggers a one-time re-apply (see main()).
+BOT_MENU_CONFIG: dict[str, dict[str, Any]] = {
+    "setMyCommands": {"commands": []},
+    "setChatMenuButton": {"menu_button": {"type": "default"}},
+}
 
-    try:
-        http_post(f"{TELEGRAM_API}/setChatMenuButton", {
-            "menu_button": {"type": "default"},
-        })
-        log.info("Reset bot menu button to default")
-    except Exception as exc:
-        log.warning("Failed to reset menu button: %s", exc)
+
+def menu_fingerprint() -> str:
+    """Identify the menu config together with the bot it was applied to.
+
+    Keyed with the bot token, so a new bot (new token) gets its menu set even
+    though the config itself didn't change — without storing the token.
+    """
+    config = json.dumps(BOT_MENU_CONFIG, sort_keys=True).encode()
+    return hmac.new(TELEGRAM_BOT_TOKEN.encode(), config, hashlib.sha256).hexdigest()[:16]
+
+
+def clear_bot_menu() -> bool:
+    """Clear the bot's slash-command menu so no commands are exposed.
+
+    Returns True only if every call succeeded, so a failure is retried on the
+    next run.
+    """
+    all_ok = True
+    for method, payload in BOT_MENU_CONFIG.items():
+        if telegram_call(method, payload, idempotent=True).ok:
+            log.info("Applied %s", method)
+        else:
+            log.warning("Failed to apply %s", method)
+            all_ok = False
+    return all_ok
 
 # ---------------------------------------------------------------------------
 # Subscribers — anyone who /start's the bot or adds it to a group/channel
@@ -879,6 +1345,25 @@ def remove_subscriber(state: BotState, chat_id: str) -> None:
     if chat_id and chat_id in state.subscribers:
         del state.subscribers[chat_id]
         log.info("Removed subscriber: %s (total: %d)", redact_chat(chat_id), len(state.subscribers))
+
+
+def drop_unreachable(state: BotState, chat_id: str) -> None:
+    """Unsubscribe a chat Telegram says we can never reach (403 / chat not found).
+
+    The configured owner chat is kept: seed_owner would only re-add it next
+    run, and a 403 there means the owner hasn't /start'ed the bot yet.
+    """
+    if chat_id == TELEGRAM_CHAT_ID:
+        log.error("Owner chat is unreachable — /start the bot from TELEGRAM_CHAT_ID")
+        return
+    log.info("Chat %s blocked the bot or no longer exists", redact_chat(chat_id))
+    remove_subscriber(state, chat_id)
+
+
+def migrate_subscriber(state: BotState, old_id: str, new_id: str) -> None:
+    """Follow a group that Telegram upgraded to a supergroup (new chat ID)."""
+    if old_id in state.subscribers:
+        state.subscribers.setdefault(new_id, state.subscribers.pop(old_id))
 
 # ---------------------------------------------------------------------------
 # Telegram — incoming updates (only /start subscribes; everything else ignored)
@@ -1027,126 +1512,245 @@ def process_telegram_commands(state: BotState) -> None:
         state.last_update_id = max_update_id
 
 # ---------------------------------------------------------------------------
-# AI provider — last-resort translation fallback
+# Broadcast — one post to every subscriber, resumable
 # ---------------------------------------------------------------------------
-#
-# Only _translate_ai uses these. The keyless default (Pollinations) currently
-# answers 402 Payment Required, so this link contributes nothing unless
-# GEMINI_API_KEY or ANTHROPIC_API_KEY is set; the keyless providers ahead of it
-# in TRANSLATE_PROVIDERS carry translation on their own.
 
 
-def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any] | None:
-    """POST JSON to url and return the parsed response, or None on failure."""
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT, **headers},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
-            return json.loads(resp.read())
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
-        log.warning("AI request to %s failed: %s", url, exc)
-        return None
+def broadcast_post(state: BotState, post: dict[str, Any], message: str) -> bool:
+    """Send one post to every subscriber who doesn't have it yet.
 
+    Returns True when the post is finished: every subscriber was tried and at
+    least one (in this run or an earlier, interrupted one) received it. The
+    caller then advances last_seen.
 
-def _call_pollinations(system: str, user: str) -> str | None:
-    """Call Pollinations' keyless AI (OpenAI-compatible); text or None."""
-    payload = {
-        "model": POLLINATIONS_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    }
-    result = _post_json(POLLINATIONS_API_URL, payload, {})
-    if not result:
-        return None
-    try:
-        text = result["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        log.warning("Unexpected Pollinations response shape: %s", result)
-        return None
-    text = (text or "").strip()
-    return text or None
-
-
-def _call_gemini(system: str, user: str) -> str | None:
-    """Call Google's Gemini API (free tier, raw HTTP); return text or None."""
-    if not GEMINI_API_KEY:
-        return None
-    payload = {
-        "system_instruction": {"parts": [{"text": system}]},
-        "contents": [{"parts": [{"text": user}]}],
-        "generationConfig": {"maxOutputTokens": AI_MAX_TOKENS},
-    }
-    result = _post_json(GEMINI_API_URL, payload, {"x-goog-api-key": GEMINI_API_KEY})
-    if not result:
-        return None
-    try:
-        parts = result["candidates"][0]["content"]["parts"]
-    except (KeyError, IndexError, TypeError):
-        log.warning("Unexpected Gemini response shape: %s", result)
-        return None
-    text = "".join(p.get("text", "") for p in parts).strip()
-    return text or None
-
-
-def _call_claude(system: str, user: str) -> str | None:
-    """Call the Claude Messages API (raw HTTP) and return the text, or None."""
-    if not ANTHROPIC_API_KEY:
-        return None
-    payload = {
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": AI_MAX_TOKENS,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
-    }
-    result = _post_json(ANTHROPIC_API_URL, payload, {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": ANTHROPIC_VERSION,
-    })
-    if not result:
-        return None
-    if result.get("stop_reason") == "refusal":
-        log.warning("Claude API refused the request")
-        return None
-    parts = [
-        block.get("text", "")
-        for block in result.get("content", [])
-        if block.get("type") == "text"
-    ]
-    text = "".join(parts).strip()
-    return text or None
-
-
-def _ai_complete(system: str, user: str) -> str | None:
-    """Run the configured AI provider, returning its text or None."""
-    if AI_PROVIDER == "claude":
-        return _call_claude(system, user)
-    if AI_PROVIDER == "gemini":
-        return _call_gemini(system, user)
-    return _call_pollinations(system, user)
-
-
-def _ai_key_available() -> bool:
-    """Whether the configured provider is usable (has a key, if it needs one).
-
-    Pollinations is keyless, so it always reports available — it can still fail
-    at call time, which _looks_translated catches.
+    Returns False when the run budget ran out mid-broadcast, or when nobody at
+    all could be reached (Telegram down) — the post must be retried next run.
+    Progress is kept in state.in_flight_*, so on retry the chats that already
+    got the post are skipped instead of receiving it twice.
     """
-    if AI_PROVIDER == "claude":
-        return bool(ANTHROPIC_API_KEY)
-    if AI_PROVIDER == "gemini":
-        return bool(GEMINI_API_KEY)
+    if state.in_flight_post != post["id"]:
+        state.in_flight_post = post["id"]
+        state.in_flight_chats = []
+    done = set(state.in_flight_chats)
+
+    for chat_id in sorted(state.subscribers):
+        if chat_id in done:
+            continue
+        if _budget_exceeded():
+            log.warning(
+                "Budget exceeded mid-broadcast of post %s — %d chat(s) done, resuming next run",
+                post["id"], len(done),
+            )
+            return False
+        result = send_telegram_message(message, chat_id=chat_id, thread_id=state.subscribers[chat_id])
+        if result.migrated_to:
+            migrate_subscriber(state, chat_id, result.migrated_to)
+            chat_id = result.migrated_to
+        if result:
+            done.add(chat_id)
+            state.in_flight_chats.append(chat_id)
+        elif result.gone:
+            drop_unreachable(state, chat_id)
+        # Telegram broadcast rate limit is ~30 msgs/sec; small gap keeps
+        # us well under that even with many subscribers.
+        time.sleep(0.05)
+
+    if not done:
+        log.warning("Failed to deliver post %s to any subscriber — stopping to retry next run", post["id"])
+        return False
     return True
+
+
+def advance_cursor(state: BotState, chronological_ids: list[str], sent_id: str = "") -> None:
+    """Record ``sent_id`` as broadcast and move last_seen as far as it can go.
+
+    Posts can go out of order (high impact first), but last_seen means
+    "everything up to here is done", so it only moves past a post once all
+    older new posts are sent too. Posts sent ahead of it wait in
+    state.sent_ahead and are skipped until the cursor catches up.
+    """
+    done = set(state.sent_ahead)
+    if sent_id:
+        done.add(sent_id)
+    ids = chronological_ids
+    if state.last_seen in ids:
+        ids = ids[ids.index(state.last_seen) + 1:]
+    for post_id in ids:
+        if post_id not in done:
+            break
+        state.last_seen = post_id
+        done.discard(post_id)
+    # Keep only IDs still ahead of the cursor; anything else is stale.
+    state.sent_ahead = [i for i in chronological_ids if i in done]
+    if sent_id and state.in_flight_post == sent_id:
+        state.in_flight_post, state.in_flight_chats = "", []
+
+
+def send_order(prepared: list[tuple[dict[str, Any], str, PostAnalysis]], in_flight: str) -> list:
+    """Order prepared posts for sending.
+
+    1. A post whose broadcast was interrupted, so its progress isn't lost.
+    2. High-impact posts, oldest first — market-moving news can't wait
+       behind a backlog of campaign posts.
+    3. Everything else, oldest first.
+    """
+    def rank(item: tuple[dict[str, Any], str, PostAnalysis]) -> int:
+        post, _, analysis = item
+        if post["id"] == in_flight:
+            return 0
+        return 1 if analysis.impact == "high" else 2
+
+    return sorted(prepared, key=rank)  # stable: keeps chronological order
+
+
+# ---------------------------------------------------------------------------
+# Monitoring — admin alerts and the run heartbeat
+# ---------------------------------------------------------------------------
+
+
+def alert_admin(state: BotState, kind: str, text: str) -> bool:
+    """Send an operational alert to ADMIN_CHAT_ID, at most once an hour per kind.
+
+    Like every send, it never raises: monitoring can't break the broadcast.
+    """
+    if not ADMIN_CHAT_ID:
+        log.warning("Alert '%s' not sent — ADMIN_CHAT_ID is not set", kind)
+        return False
+    now = int(time.time())
+    if now - state.alerts.get(kind, 0) < ALERT_REPEAT_MINUTES * 60:
+        log.info("Alert '%s' already sent recently — not repeating it", kind)
+        return False
+    ok = bool(send_telegram_message(f"🚨 <b>התראת בוט טראמפ</b>\n{text}", chat_id=ADMIN_CHAT_ID))
+    if ok:
+        state.alerts[kind] = now
+        log.info("Alert '%s' sent to admin", kind)
+    return ok
+
+
+def _format_duration(seconds: int) -> str:
+    hours, minutes = divmod(max(seconds, 0) // 60, 60)
+    return f"{hours} שע׳ {minutes} דק׳" if hours else f"{minutes} דק׳"
+
+
+def check_heartbeat(state: BotState) -> None:
+    """Alert if the previous successful run is older than STALE_ALERT_MINUTES.
+
+    This fires at the start of the first run after an outage (GitHub skipped
+    the schedule, or runs kept failing). A bot that doesn't run at all can't
+    report anything — HEALTHCHECK_URL covers that.
+    """
+    if not state.last_success:
+        return
+    gap = int(time.time()) - state.last_success
+    if gap <= STALE_ALERT_MINUTES * 60:
+        return
+    since = datetime.fromtimestamp(state.last_success, ISRAEL_TZ).strftime("%d/%m %H:%M")
+    log.warning("No successful run for %ds (since %s)", gap, since)
+    alert_admin(
+        state,
+        "stale",
+        f"⏰ לא הייתה ריצה מוצלחת כבר {_format_duration(gap)} (מאז {since}).\n"
+        "הבוט רץ עכשיו שוב ומשלים פוסטים שהוחמצו. אם זה חוזר — בדוק את לוגי ה-Actions.",
+    )
+
+
+def record_success(state: BotState) -> None:
+    """Mark this run successful: refresh the heartbeat and ping HEALTHCHECK_URL."""
+    now = int(time.time())
+    if now - state.last_success >= HEARTBEAT_WRITE_MINUTES * 60:
+        state.last_success = now
+    if HEALTHCHECK_URL:
+        try:
+            http_get(HEALTHCHECK_URL, retries=2)
+        except Exception as exc:
+            log.warning("Healthcheck ping failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
+
+
+def broadcast_new_posts(state: BotState, persist: Any) -> bool:
+    """Fetch, translate, tag and send this run's new posts.
+
+    Returns False if no post source could be reached, so the run doesn't
+    count as successful.
+    """
+    last_seen_id = state.last_seen
+    log.info("Last seen post ID: %s", last_seen_id or "(none) — first run")
+
+    posts = fetch_posts(last_seen_id)
+    if not posts:
+        log.info("No posts fetched this run")
+        return False
+    if last_seen_id and not _contains(posts, last_seen_id):
+        alert_admin(
+            state,
+            "gap",
+            f"⚠️ הפוסט האחרון שנשלח לא נמצא ב-{len(posts)} הפוסטים האחרונים — "
+            "ייתכן שפוסטים הוחמצו. נשלח רק הפוסט החדש ביותר.",
+        )
+    new_posts = filter_new_posts(posts, last_seen_id)
+    if not new_posts:
+        log.info("No new posts this run")
+
+    log.info("Broadcasting %d new post(s) to %d subscriber(s)", len(new_posts), len(state.subscribers))
+
+    chronological_ids = [p["id"] for p in new_posts]
+    advance_cursor(state, chronological_ids)
+    already_sent = set(state.sent_ahead)
+
+    # Translate and classify everything first, so high-impact posts can be
+    # sent ahead of the rest of a backlog.
+    prepared: list[tuple[dict[str, Any], str, PostAnalysis]] = []
+    for post in new_posts:
+        if post["id"] in already_sent:
+            continue
+        if _budget_exceeded():
+            log.warning("Budget exceeded while translating — sending what is ready")
+            break
+        log.info("Processing post %s", post["id"])
+        analysis = analyze_post(post["text"])
+        message = build_message(post, analysis.hebrew, analysis.translated,
+                                analysis.categories, analysis.impact)
+        prepared.append((post, message, analysis))
+
+    untranslated = sum(1 for _, _, a in prepared if not a.translated)
+    if untranslated:
+        alert_admin(
+            state,
+            "translation",
+            f"⚠️ כל ספקי התרגום נכשלו ב-{untranslated} פוסט(ים) — הם נשלחים באנגלית בלבד.\n"
+            "בדוק את GEMINI_API_KEY ואת המכסה ב-AI Studio, ואת לוגי ה-Actions.",
+        )
+
+    # State is saved after every post, so a run that dies or runs out of time
+    # never re-sends what it already finished.
+    sent = 0
+    try:
+        for post, message, analysis in send_order(prepared, state.in_flight_post):
+            if _budget_exceeded():
+                log.warning("Budget exceeded — stopping at post %s to avoid overlapping next cron", post["id"])
+                break
+            if analysis.impact == "high":
+                log.info("Post %s is high-impact — sending first", post["id"])
+            if not broadcast_post(state, post, message):
+                break
+            advance_cursor(state, chronological_ids, post["id"])
+            persist()
+            sent += 1
+
+            if len(prepared) > 1:
+                time.sleep(1)
+    finally:
+        # Also covers an interrupted broadcast: its in-flight progress is
+        # saved so the next run skips the chats that already have the post.
+        persist()
+
+    log.info("Done — sent %d post(s), last_seen=%s, %d sent ahead",
+             sent, state.last_seen or "(none)", len(state.sent_ahead))
+    return True
 
 
 def main() -> None:
@@ -1178,7 +1782,7 @@ def main() -> None:
     )
 
     def persist() -> None:
-        """Write state only if it changed, so idle runs make no API writes."""
+        """Write state only if it changed (idle runs write only the heartbeat)."""
         nonlocal persisted
         if state == persisted:
             return
@@ -1190,8 +1794,14 @@ def main() -> None:
         persisted = state.copy()
         log.info("State saved")
 
-    # Keep the slash-command menu cleared — the bot is broadcast-only.
-    clear_bot_menu()
+    # Alert the admin if the bot was down — before anything else can fail.
+    check_heartbeat(state)
+
+    # Keep the slash-command menu cleared — the bot is broadcast-only. Telegram
+    # remembers it, so this only runs when the config or the bot changes.
+    fingerprint = menu_fingerprint()
+    if state.menu_config != fingerprint and clear_bot_menu():
+        state.menu_config = fingerprint
 
     # Pick up new subscribers / kicks before broadcasting this round's posts.
     # Persist right away so a crash mid-broadcast doesn't lose a /start.
@@ -1202,61 +1812,15 @@ def main() -> None:
         log.warning("Budget exceeded after handling bot commands — exiting")
         return
 
-    subscribers = state.subscribers
-    if not subscribers:
+    if state.subscribers:
+        ok = broadcast_new_posts(state, persist)
+    else:
         log.info("No subscribers yet — nothing to broadcast")
-        return
+        ok = True
 
-    last_seen_id = state.last_seen
-    log.info("Last seen post ID: %s", last_seen_id or "(none) — first run")
-
-    posts = fetch_posts()
-    new_posts = filter_new_posts(posts, last_seen_id) if posts else []
-    if not posts:
-        log.info("No posts fetched this run")
-    elif not new_posts:
-        log.info("No new posts this run")
-
-    log.info("Broadcasting %d new post(s) to %d subscriber(s)", len(new_posts), len(subscribers))
-
-    # Translate and broadcast each new post to every subscriber.
-    latest_id = ""
-    for post in new_posts:
-        if _budget_exceeded():
-            log.warning("Budget exceeded — stopping at post %s to avoid overlapping next cron", post["id"])
-            break
-
-        log.info("Processing post %s", post["id"])
-        hebrew, translated = translate_to_hebrew(post["text"])
-        message = build_message(post, hebrew, translated)
-
-        delivered = 0
-        for sub_chat_id in sorted(subscribers):
-            if _budget_exceeded():
-                log.warning("Budget exceeded mid-broadcast — stopping")
-                break
-            sub_thread_id = subscribers[sub_chat_id]
-            if send_telegram_message(message, chat_id=sub_chat_id, thread_id=sub_thread_id):
-                delivered += 1
-            # Telegram broadcast rate limit is ~30 msgs/sec; small gap keeps
-            # us well under that even with many subscribers.
-            time.sleep(0.05)
-
-        if delivered > 0:
-            latest_id = post["id"]
-        else:
-            log.warning("Failed to deliver post %s to any subscriber — stopping to retry next run", post["id"])
-            break
-
-        if len(new_posts) > 1:
-            time.sleep(1)
-
-    if latest_id:
-        state.last_seen = latest_id
-        persist()
-
-    log.info("Done — processed up to post %s", latest_id or "(none)")
-
+    if ok:
+        record_success(state)
+    persist()
 
 if __name__ == "__main__":
     main()

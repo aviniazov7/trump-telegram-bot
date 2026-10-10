@@ -1,5 +1,8 @@
 # Trump Truth Social → Telegram Bot
 
+[![Tests](https://github.com/aviniazov7/trump-telegram-bot/actions/workflows/tests.yml/badge.svg)](https://github.com/aviniazov7/trump-telegram-bot/actions/workflows/tests.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/aviniazov7/trump-telegram-bot/badges/coverage.json)](https://github.com/aviniazov7/trump-telegram-bot/actions/workflows/tests.yml)
+
 Fetches Donald Trump's latest posts from Truth Social, translates them to
 Hebrew, and broadcasts them to every subscriber. Runs on GitHub Actions
 every 10 minutes, uses the Python standard library only.
@@ -10,43 +13,160 @@ The bot is **broadcast-only**:
 - No slash-command menu is shown. All other messages are ignored silently —
   users can't trigger any action.
 
+The empty menu is applied to Telegram once, then remembered: state keeps a
+fingerprint (`menu_config`) of `BOT_MENU_CONFIG` keyed with the bot token, and
+the two menu API calls run again only when the config or the bot changes.
+
+## Fetching and delivery
+
+GitHub's scheduler often skips `*/10` cron runs, so the real gap between runs
+can be hours. Each run therefore catches up on everything it missed:
+
+- **Deep scan.** The run reads up to `MAX_SCAN_POSTS` (default 100) recent
+  posts from the trumpstruth.org RSS feed, which covers about a week, and looks
+  for `last_seen` in them. If the feed's window doesn't reach `last_seen`, the
+  run checks the CNN archive, which holds the full history. Every post after
+  `last_seen` is sent, oldest first.
+- **Safe cap.** If `last_seen` can't be found at all (on the first run, or
+  after an outage longer than the scan window), only the newest post is sent,
+  so subscribers aren't flooded.
+- **Checkpoint after every post.** `last_seen` is saved as soon as a post has
+  gone to every subscriber. A run that crashes or runs out of time never
+  re-sends posts it already finished.
+- **Resumable broadcast.** If a run stops partway through one post's
+  broadcast, the chats that already got it are saved as `in_flight`. The next
+  run sends that post only to the chats still missing it.
+
+### Talking to Telegram
+
+All Bot API calls go through `telegram_call()` in `src/main.py`:
+
+- **No blind retries of `sendMessage`.** A timeout or a dropped connection
+  after the request went out may still have delivered the message, so it is
+  not retried. Retrying could post it twice. A send is retried only when it
+  provably never left (connection refused, DNS failure). Idempotent calls
+  (`getUpdates`, `setMyCommands`) do retry.
+- **429 rate limits.** The run waits the `retry_after` that Telegram asks for
+  (up to 30 s, within the run budget) and then retries. Telegram guarantees
+  that a 429 was not delivered.
+- **Dead chats are unsubscribed.** On a 403 (blocked, kicked, account deleted)
+  or `chat not found`, the chat is removed from the subscribers. The
+  `TELEGRAM_CHAT_ID` owner chat is the exception: it is never removed.
+- **Upgraded groups are followed.** When a group becomes a supergroup,
+  Telegram returns its new ID. The bot re-sends the message there and moves
+  the subscription, including its forum topic, to the new ID.
+- Error logs contain only the method, the error code and Telegram's
+  description, never the raw response, which can contain chat IDs.
+
 ## Translation
 
-Each post is translated to Hebrew by trying several providers in order, moving
-on as soon as one returns real Hebrew:
+Each post is translated to Hebrew by trying providers in order, moving on as
+soon as one returns real Hebrew:
 
-1. Google's keyless translate endpoint (`translate.googleapis.com`)
-2. A second Google host (`clients5.google.com`), rate-limited separately
-3. Lingva — keyless Google Translate front ends, several public instances
-4. MyMemory's free API (no key)
-5. An AI model — only when an API key is configured (see below)
+1. **Google Gemini** (primary, needs `GEMINI_API_KEY`). It gets the whole post
+   with a prompt that asks for an accurate, complete translation. Names follow
+   Israeli-media spelling. Numbers, tickers, hashtags and URLs are kept as
+   written. The tone stays neutral, with no commentary. The answer comes back
+   as JSON against a schema.
+2. Google's keyless translate endpoint (`translate.googleapis.com`)
+3. A second Google host (`clients5.google.com`), rate-limited separately
+4. Lingva — keyless Google Translate front ends, several public instances
+5. MyMemory's free API (no key)
 
-The fallback chain matters because GitHub Actions runs on shared IPs that
-Google's free endpoint intermittently answers with HTTP 429, which previously
-left posts untranslated whenever the throttle happened to hit. A provider that
-echoes the English back or returns a quota notice is treated as a failure
-rather than a translation. If every provider fails, the
-post is still broadcast, but it is clearly marked as untranslated instead of
+Providers 2–5 are the free chain. They need no key, so a deployment without
+`GEMINI_API_KEY` runs on them alone, exactly as before. They are unofficial
+endpoints: GitHub Actions' shared IPs regularly get HTTP 429 from Google, and
+public Lingva instances come and go, which is why Gemini is now primary.
+
+Any answer that is empty, still English, cut off (`MAX_TOKENS`) or not valid
+JSON counts as a failure, not a translation. If every provider fails, the post
+is still broadcast, but it is clearly marked as untranslated instead of
 showing English under a "translated to Hebrew" heading.
 
-## AI provider (optional)
+## Market-impact tags
 
-The bot needs no API key: the first four translation providers above are all
-keyless. The fifth is an AI model, used only when every keyless provider has
-failed.
+The same Gemini call that translates a post also classifies it:
 
-The default AI provider is **Pollinations**, which needs no key but currently
-answers `HTTP 402 Payment Required` from GitHub Actions — so out of the box
-that last link is inert. To make it a real fallback, set one of:
+- **Topics:** `tariffs`, `fed_rates`, `oil`, `crypto`, `china`, `stocks`, or
+  `other`. A post can have several.
+- **Impact:** `high` (a concrete new action, threat or deadline: new tariffs,
+  a demand on the Fed, oil-supply moves, crypto policy, a deal or rupture with
+  China, a named listed company), `medium` (market talk without a new action),
+  or `low`.
 
-- **Google Gemini** (free tier): `AI_PROVIDER=gemini` + a free `GEMINI_API_KEY`
-  from <https://aistudio.google.com/apikey> (no credit card).
-- **Anthropic Claude** (paid): `AI_PROVIDER=claude` + `ANTHROPIC_API_KEY`.
+The first line of every message shows the impact and the topics:
 
-Other optional env vars: `POLLINATIONS_MODEL` (default `openai`),
-`GEMINI_MODEL` (default `gemini-2.0-flash`), `ANTHROPIC_MODEL` (default
-`claude-opus-4-8`), `AI_MAX_TOKENS` (default `1500`), `AI_TIMEOUT` seconds
-(default `60`).
+```
+🔴 השפעה גבוהה על השווקים · #מכסים #סין      ← high
+🟠 השפעה בינונית על השווקים · #ריבית_הפד     ← medium
+⚪ השפעה נמוכה על השווקים · #כללי             ← low
+🏷️ #נפט                                       ← Gemini unavailable: keyword topics, no impact
+```
+
+**High-impact posts go first.** A run translates and classifies its whole
+backlog before sending anything. Then it sends, in this order: a post whose
+broadcast was interrupted, then every 🔴 post (oldest first), then the rest
+(oldest first). Because posts can now go out of order, state keeps
+`sent_ahead`, the posts already sent past `last_seen`. `last_seen` only moves
+once everything older has been sent as well, so an interrupted run never skips
+or repeats a post.
+
+When Gemini is unavailable, topics come from a keyword list
+(`_KEYWORD_CATEGORIES`). Keywords can't judge impact, so these posts never get
+a 🔴 and are sent in plain chronological order.
+
+### Gemini setup
+
+1. Create a free key at <https://aistudio.google.com/apikey> (no credit card
+   needed).
+2. Add it as the repository secret **`GEMINI_API_KEY`**.
+3. Optional: set repository variables (*Settings → Secrets and variables →
+   Actions → Variables*) to override the defaults:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Model ID. Check *AI Studio → Rate limits* for which models your free tier includes |
+| `GEMINI_THINKING_LEVEL` | (model default) | `minimal` / `low` / `medium` / `high`; lower is faster |
+
+Also available as env vars: `GEMINI_MAX_TOKENS` (default `8192`, includes
+thinking tokens) and `GEMINI_TIMEOUT` seconds (default `60`). When the free
+tier answers 429 with a short `retryDelay` (≤30 s), the bot waits and retries
+once. Otherwise it falls back to the free chain.
+
+The key travels in the `x-goog-api-key` header, never in a URL, so it can't
+appear in logs.
+
+## Monitoring
+
+Set the repository secret **`ADMIN_CHAT_ID`** to your own Telegram chat ID
+(send `/start` to the bot first). Alerts go there and nowhere else:
+
+| Alert | When |
+|---|---|
+| ⚠️ Translation failed | Every provider, Gemini and the free chain, failed for one or more posts, so they went out in English |
+| ⏰ No successful run | The previous successful run is older than `STALE_ALERT_MINUTES` (default 60). Sent by the first run that works again |
+| ⚠️ Possible missed posts | `last_seen` wasn't found in the scanned window, so only the newest post was sent |
+
+Each kind of alert is sent at most once per `ALERT_REPEAT_MINUTES` (default
+60), so a lasting problem doesn't spam you. The send times live in state
+(`alerts`).
+
+A "successful run" is one that loaded state and reached a post source.
+State keeps its end time in `last_success` (the heartbeat). The heartbeat is
+written at most every 5 minutes, which means that an idle run now makes one
+small state write.
+
+**Known limit: a bot that isn't running can't report that it's down.** The ⏰
+alert arrives only when a run finally starts. To learn about an outage *while*
+it happens, set the optional secret **`HEALTHCHECK_URL`** to a dead-man's
+switch such as a free [healthchecks.io](https://healthchecks.io) check (period
+60 min, with its Telegram integration). The bot pings it after every
+successful run, and the service alerts you when the pings stop.
+
+> With GitHub's current scheduling (real gaps of 2.5–8 h, see
+> [docs/CLOUDFLARE_MIGRATION.md](docs/CLOUDFLARE_MIGRATION.md)), the ⏰ alert
+> fires on most runs. That is accurate, but noisy. Until scheduling is fixed,
+> raise `STALE_ALERT_MINUTES` (repository variable), for example to `480`.
 
 ## Setup
 
@@ -60,6 +180,11 @@ Other optional env vars: `POLLINATIONS_MODEL` (default `openai`),
      subscribes.
    - `STATE_TOKEN` — required. A fine-grained token the bot uses to read and
      write its state. See [State storage](#state-storage) for how to create it.
+   - `GEMINI_API_KEY` — recommended. Primary translator and market tagging
+     (see [Gemini setup](#gemini-setup)).
+   - `ADMIN_CHAT_ID` — recommended. Where operational alerts go (see
+     [Monitoring](#monitoring)).
+   - `HEALTHCHECK_URL` — optional. Dead-man's switch ping URL.
 3. **Enable GitHub Actions** for the repository. The workflow will run
    automatically every 10 minutes; you can also trigger it manually from
    *Actions → Trump Truth Social Check → Run workflow*.
@@ -74,6 +199,13 @@ The bot keeps a small amount of state between runs:
 - **last_seen**: the last post that was broadcast, so nothing is sent twice
 - **last_update_id**: the Telegram `getUpdates` offset, so each `/start` is
   handled once
+- **last_success** / **alerts**: heartbeat and alert throttling (see
+  [Monitoring](#monitoring))
+- **in_flight** (only while a broadcast is interrupted): the post being sent and
+  the chats that already have it
+- **menu_config**: fingerprint of the bot menu last applied to Telegram
+- **sent_ahead**: posts newer than `last_seen` that were already sent out of
+  order (high impact first)
 
 ### Why the state is not in git
 
@@ -97,10 +229,16 @@ repository. The workflow has read-only access to the code.
 GitHub Actions (cron, every 10 min, concurrency group "trump-bot")
   └─ src/main.py
        1. store.load()             ← GitHub REST API: GET actions/variables/BOT_STATE
-       2. handle Telegram updates  (mutates state in memory)
+          heartbeat check          → alert ADMIN_CHAT_ID if last_success > 1h ago
+       2. reset bot menu           (only if menu_config fingerprint changed)
+          handle Telegram updates  (mutates state in memory)
        3. store.save() if changed  → PATCH actions/variables/BOT_STATE
-       4. broadcast new posts
-       5. store.save() if changed  → PATCH (new last_seen)
+       4. fetch ≤100 posts         ← trumpstruth.org RSS (CNN archive if last_seen not found)
+       5. translate + tag every new post   ← one Gemini call per post (free chain on failure)
+       6. send: in_flight post → 🔴 high impact → rest, each oldest first
+            send to every subscriber not in in_flight
+            store.save()           → PATCH (last_seen / sent_ahead)
+       7. record success           → last_success heartbeat, ping HEALTHCHECK_URL
 ```
 
 - `src/state.py` defines a `StateStore` interface with two backends that store
@@ -114,8 +252,8 @@ GitHub Actions (cron, every 10 min, concurrency group "trump-bot")
   before it contacts Telegram. The bot never assumes "no state" when the store
   is unreachable, because doing so would re-send old posts and then overwrite
   the real subscriber list. A failed write also turns the run red.
-- **Minimal writes.** State is written only when it changed, so an idle run
-  makes a single API read.
+- **Minimal writes.** State is written only when it changed. An idle run makes
+  one API read plus, at most every 5 minutes, one heartbeat write.
 - **No races.** The workflow's concurrency group means only one run at a time
   reads and writes the variable.
 - **Log redaction.** Actions logs of a public repo are public, so chat IDs are
@@ -156,9 +294,13 @@ The first run after this change finds no `BOT_STATE` variable. It then reads
 the legacy `data/last_seen.txt`, `data/last_update_id.txt` and
 `data/subscribers.txt` from the checkout and creates the variable from them.
 The migration can only create the variable and never overwrites it, so every
-later run just loads `BOT_STATE` and ignores the files. The files are then
-removed from the tree and from history; see
-[docs/HISTORY_CLEANUP.md](docs/HISTORY_CLEANUP.md).
+later run just loads `BOT_STATE` and ignores the files.
+
+The branches on GitHub no longer contain any `data/` file. What remains is
+cached and old copies: unreachable commits, `refs/pull/1-4`, and the logs of 4
+runs from before log redaction. The audit and the exact cleanup steps (log
+deletion, a GitHub Support request, and a `git filter-repo` procedure
+in case it's needed) are in [docs/HISTORY_CLEANUP.md](docs/HISTORY_CLEANUP.md).
 
 ### Configuration
 
@@ -168,35 +310,60 @@ removed from the tree and from history; see
 | `STATE_TOKEN` | — | Fine-grained PAT (github backend) |
 | `STATE_VARIABLE` | `BOT_STATE` | Variable name (github backend) |
 | `STATE_FILE` | `data/state.json` | Path (file backend) |
+| `MAX_SCAN_POSTS` | `100` | How many recent posts a run scans for `last_seen` |
 
 `GITHUB_REPOSITORY` and `GITHUB_API_URL` are set by Actions automatically.
 
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -v          # stdlib only
+
+pip install -r requirements-dev.txt               # with coverage
+coverage run -m unittest discover -s tests && coverage report
 ```
 
-The tests use only the standard library and run on every pull request
-(`.github/workflows/tests.yml`).
+The tests never touch the network. HTTP is mocked at `urlopen`, so the real
+request-building and parsing code runs. What they cover:
+
+| File | Covers |
+|---|---|
+| `test_posts.py` | RSS/CNN parsing, `filter_new_posts`, deep-scan fallback, per-post checkpoints, resuming an interrupted broadcast |
+| `test_telegram.py` | No retry after timeouts, 429 `retry_after`, 403/`chat not found` unsubscribe, group migration, no chat IDs in logs |
+| `test_translation.py` | Gemini request/response handling, every fallback step of the translation chain |
+| `test_tagging.py` | Tag parser, keyword fallback, `analyze_post`, high-impact-first ordering, `sent_ahead` cursor |
+| `test_message.py` | Message layout, HTML escaping, tag line, splitting long messages without breaking tags |
+| `test_main_state.py`, `test_state.py` | State storage, migration, bot menu fingerprint, Telegram commands |
+
+CI (`.github/workflows/tests.yml`) runs on every pull request and every push to
+`main`. It fails if coverage drops below 90% (`.coveragerc`). On `main` it
+publishes the coverage figure to the orphan `badges` branch, as a single
+commit that is force-replaced each time, and the README badge reads it via
+shields.io. The badge appears after the first push to `main`.
 
 ## Layout
 
 ```
 .github/workflows/trump-check.yml   GitHub Actions cron workflow (read-only)
-.github/workflows/tests.yml         Unit tests on PRs / main
+.github/workflows/tests.yml         Unit tests + coverage on PRs / main; badge on main
 src/main.py                         Pipeline: fetch → translate → broadcast
 src/state.py                        State model + storage backends + migration
 tests/                              Unit tests (stdlib unittest)
-docs/HISTORY_CLEANUP.md             Prepared git history rewrite for old state files
+requirements-dev.txt, .coveragerc   Test-only tooling (coverage)
+docs/HISTORY_CLEANUP.md             Step-by-step git history rewrite for old state files (not run)
+docs/CLOUDFLARE_MIGRATION.md        Proposal: per-minute Cloudflare Worker scheduling
 data/                               Local-only state (gitignored)
 BOT-CONTROLS.sh                     gh-cli helper (status / run / logs)
 ```
 
 ## Configuration
 
-- **Schedule** — edit the `cron` expression in `trump-check.yml`.
+- **Schedule** — edit the `cron` expression in `trump-check.yml`. GitHub
+  runs it best effort: the real gaps are 2.5–8 h. See the proposal in
+  [docs/CLOUDFLARE_MIGRATION.md](docs/CLOUDFLARE_MIGRATION.md).
 - **Message format** — edit `build_message()` in `src/main.py`.
+- **Tags** — `MARKET_CATEGORIES` (topics and Hebrew labels), `IMPACT_MARKERS`
+  and the classification rules in `GEMINI_SYSTEM_PROMPT`.
 - **Welcome text** — edit `send_welcome()` in `src/main.py`.
 
 ## Requirements

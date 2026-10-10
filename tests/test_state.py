@@ -126,9 +126,40 @@ class BotStateTests(unittest.TestCase):
 
     def test_copy_is_independent(self):
         state = sample_state()
+        state.in_flight_chats = ["111"]
         clone = state.copy()
         clone.subscribers["999"] = None
+        clone.in_flight_chats.append("999")
         self.assertNotIn("999", state.subscribers)
+        self.assertEqual(state.in_flight_chats, ["111"])
+
+    def test_optional_fields_round_trip(self):
+        state = sample_state()
+        state.in_flight_post, state.in_flight_chats = "p9", ["111"]
+        state.menu_config = "abc123"
+        state.sent_ahead = ["p10", "p11"]
+        state.last_success = 1_800_000_000
+        state.alerts = {"stale": 1_799_999_000}
+        self.assertEqual(BotState.from_json(state.to_json()), state)
+        self.assertEqual(state.copy(), state)
+
+    def test_optional_keys_omitted_when_unset(self):
+        # Keeps idle state byte-identical to what earlier versions wrote.
+        self.assertNotIn("in_flight", json.loads(sample_state().to_json()))
+
+    def test_rejects_bad_monitoring_fields(self):
+        for raw in ('{"version": 1, "alerts": ["x"]}', '{"version": 1, "alerts": {"x": "soon"}}',
+                    '{"version": 1, "last_success": "yesterday"}'):
+            with self.assertRaises(StateError):
+                BotState.from_json(raw)
+
+    def test_rejects_bad_sent_ahead(self):
+        with self.assertRaises(StateError):
+            BotState.from_json('{"version": 1, "sent_ahead": "p1"}')
+
+    def test_rejects_bad_in_flight(self):
+        with self.assertRaises(StateError):
+            BotState.from_json('{"version": 1, "in_flight": {"post": "1", "chats": "a"}}')
 
 
 # ---------------------------------------------------------------------------
