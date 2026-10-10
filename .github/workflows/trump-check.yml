@@ -33,9 +33,12 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Optional: only used as the last-resort translation provider, and
-          # only when AI_PROVIDER=gemini.
+          # Optional but recommended: Gemini is the primary translator. Without
+          # a key the bot uses only the keyless providers.
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Optional repository variables (Settings → Variables); empty = default.
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GEMINI_THINKING_LEVEL: ${{ vars.GEMINI_THINKING_LEVEL }}
           # Runtime state (subscribers, last seen post, Telegram offset) is kept
           # in the BOT_STATE repository variable, never in git. STATE_TOKEN is a
           # fine-grained PAT for this repo only, with "Variables: Read and write".

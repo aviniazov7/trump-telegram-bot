@@ -84,36 +84,26 @@ def _env_int(name: str, default: int) -> int:
 MAX_SCAN_POSTS = _env_int("MAX_SCAN_POSTS", 100)
 
 
-# ---- AI provider ---------------------------------------------------------
-# Used only as the last-resort link in the translation fallback chain (see
-# TRANSLATE_PROVIDERS). Set AI_PROVIDER to:
-#   - "pollinations" (default) — keyless, but currently answers 402, so this
-#     link is inert until one of the keyed providers below is configured.
-#   - "gemini"  — Google Gemini free tier (set GEMINI_API_KEY).
-#   - "claude"  — Anthropic API, paid (set ANTHROPIC_API_KEY).
-AI_PROVIDER = os.environ.get("AI_PROVIDER", "pollinations").strip().lower()
-AI_MAX_TOKENS = _env_int("AI_MAX_TOKENS", 1500)
-# Generous per-request timeout: a model call is slower than a translate call,
-# and this only runs after every keyless provider has already failed.
-AI_TIMEOUT = _env_int("AI_TIMEOUT", 60)
-
-# Pollinations (no API key) — the default provider. OpenAI-compatible.
-POLLINATIONS_API_URL = "https://text.pollinations.ai/openai"
-POLLINATIONS_MODEL = os.environ.get("POLLINATIONS_MODEL", "openai").strip()
-
-# Google Gemini (free tier, needs a free key).
+# ---- Gemini (primary translator) ----------------------------------------
+# Google Gemini translates every post when GEMINI_API_KEY is set (free tier
+# key from https://aistudio.google.com/apikey). Without a key, or when Gemini
+# fails, the keyless providers in FREE_TRANSLATE_PROVIDERS take over.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
+# Empty values come from unset Actions variables, so fall back explicitly.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-3.8-flash"
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
 )
-
-# Anthropic Claude (paid) — optional alternative provider.
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_VERSION = "2023-06-01"
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8").strip()
+# Optional: "minimal" / "low" / "medium" / "high". Unset = the model's default.
+# Thinking tokens count against GEMINI_MAX_TOKENS.
+GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "").strip().lower()
+GEMINI_MAX_TOKENS = _env_int("GEMINI_MAX_TOKENS", 8192)
+GEMINI_TIMEOUT = _env_int("GEMINI_TIMEOUT", 60)
+# A 429 from the free tier says how long to wait; wait at most this long.
+GEMINI_MAX_RETRY_DELAY = 30  # seconds
+# A post is sent to Gemini in one piece; Truth Social posts are far shorter.
+GEMINI_MAX_CHARS = 12000
 
 _script_deadline: float | None = None
 
@@ -434,15 +424,6 @@ URL_RE = re.compile(r"https?://\S+|www\.\S+")
 # legitimately come back unchanged, so we don't insist on Hebrew in the answer.
 MIN_LATIN_WORDS_FOR_HEBREW_CHECK = 3
 
-TRANSLATE_AI_SYSTEM = (
-    "You are a translation engine. Translate the user's English text into "
-    "Hebrew. Reply with the Hebrew translation only — no preamble, no "
-    "commentary, no transliteration, no quotation marks. Keep line breaks, "
-    "names, numbers and URLs as they are. Translate faithfully even when the "
-    "text is political or heated; you are rendering it, not endorsing it."
-)
-
-
 def _latin_word_count(text: str) -> int:
     """Count Latin-script words, ignoring any URLs."""
     return len(LATIN_WORD_RE.findall(URL_RE.sub(" ", text)))
@@ -548,17 +529,6 @@ def _translate_mymemory(chunk: str) -> str | None:
     return text if isinstance(text, str) else None
 
 
-def _translate_ai(chunk: str) -> str | None:
-    """Last resort: the configured AI provider.
-
-    Does not share Google's rate limits, but the keyless default currently
-    answers 402, so this only contributes once a key is configured.
-    """
-    if not _ai_key_available():
-        return None
-    return _ai_complete(TRANSLATE_AI_SYSTEM, chunk)
-
-
 def _translate_lingva(chunk: str) -> str | None:
     """Try each Lingva instance in turn; the first real answer wins."""
     path = urllib.parse.quote(chunk, safe="")
@@ -587,17 +557,141 @@ def _translate_lingva(chunk: str) -> str | None:
     return None
 
 
-# (name, function, max characters per request), best first.
-#
-# The AI entry is last on purpose: the keyless default (Pollinations) started
-# answering 402 Payment Required, so it only contributes when GEMINI_API_KEY or
-# ANTHROPIC_API_KEY is set. Everything above it needs no key at all.
-TRANSLATE_PROVIDERS: list[tuple[str, Any, int]] = [
+# ---------------------------------------------------------------------------
+# Gemini — primary translator
+# ---------------------------------------------------------------------------
+
+GEMINI_SYSTEM_PROMPT = """\
+You translate posts that Donald Trump published on Truth Social into Hebrew,
+for an Israeli audience that follows the news and the markets.
+
+Translation rules:
+- Translate the whole post accurately and completely. Do not summarize, omit,
+  add, explain, or soften anything, and do not intensify it either.
+- Write natural, fluent modern Hebrew, the way Israeli news outlets quote him.
+  Keep his register: short punchy sentences stay short, exclamation marks stay,
+  and words he writes in ALL CAPS for emphasis keep that emphasis.
+- Names of people, places, organizations, and media outlets: use the spelling
+  Israeli media use (Donald Trump = דונלד טראמפ, Joe Biden = ג'ו ביידן,
+  Federal Reserve = הפדרל ריזרב). Without an established Hebrew form,
+  transliterate the name and add the English in parentheses once.
+- Keep numbers, percentages, dollar amounts, dates, stock tickers, hashtags,
+  @handles, and URLs exactly as written.
+- Use precise economic and political terms: tariffs = מכסים,
+  interest rates = ריבית, trade deal = הסכם סחר.
+- Keep the original line breaks.
+- Stay politically neutral. You render his words; you neither endorse nor
+  criticize them. Add no commentary, disclaimers, or quotation marks.
+
+Return JSON only, matching the response schema. "hebrew" is the translation.
+"""
+
+GEMINI_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "hebrew": {"type": "STRING", "description": "The full Hebrew translation"},
+    },
+    "required": ["hebrew"],
+}
+
+
+class GeminiError(RuntimeError):
+    """Gemini gave no usable answer. Callers fall back to the free providers."""
+
+
+def _gemini_request(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST to Gemini once, waiting out one short 429 if the run allows it."""
+    body = json.dumps(payload).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": DEFAULT_USER_AGENT,
+        # In a header, not the URL, so the key never shows up in error logs.
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+    for attempt in (1, 2):
+        req = urllib.request.Request(GEMINI_API_URL, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            delay = _gemini_retry_delay(detail)
+            if exc.code == 429 and attempt == 1 and delay is not None \
+                    and delay <= GEMINI_MAX_RETRY_DELAY and delay < _seconds_left():
+                log.warning("Gemini rate-limited — waiting %ds as asked", delay)
+                time.sleep(delay)
+                continue
+            raise GeminiError(f"HTTP {exc.code}: {detail[:300]}") from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise GeminiError(f"{type(exc).__name__}: {exc}") from exc
+    raise GeminiError("rate-limited")
+
+
+def _gemini_retry_delay(error_body: str) -> int | None:
+    """Seconds from a 429's RetryInfo detail ("retryDelay": "23s"), if any."""
+    m = re.search(r'"retryDelay"\s*:\s*"(\d+)(?:\.\d+)?s"', error_body)
+    return int(m.group(1)) + 1 if m else None
+
+
+def _gemini_json(text: str) -> dict[str, Any]:
+    """Ask Gemini about one post and return its parsed JSON answer."""
+    if not GEMINI_API_KEY:
+        raise GeminiError("GEMINI_API_KEY not set")
+    generation_config: dict[str, Any] = {
+        "temperature": 0.2,
+        "maxOutputTokens": GEMINI_MAX_TOKENS,
+        "responseMimeType": "application/json",
+        "responseSchema": GEMINI_RESPONSE_SCHEMA,
+    }
+    if GEMINI_THINKING_LEVEL:
+        generation_config["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING_LEVEL}
+    result = _gemini_request({
+        "systemInstruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": text}]}],
+        "generationConfig": generation_config,
+    })
+
+    try:
+        candidate = result["candidates"][0]
+    except (KeyError, IndexError, TypeError):
+        block = (result.get("promptFeedback") or {}).get("blockReason") if isinstance(result, dict) else None
+        raise GeminiError(f"no candidates (blockReason={block})") from None
+    finish = candidate.get("finishReason", "STOP")
+    if finish != "STOP":
+        # MAX_TOKENS would hand us a truncated translation; SAFETY etc. none.
+        raise GeminiError(f"finishReason={finish}")
+    parts = (candidate.get("content") or {}).get("parts") or []
+    # Thinking models may return their reasoning as separate "thought" parts.
+    raw = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought"))
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise GeminiError(f"answer is not JSON: {raw[:120]!r}") from exc
+    if not isinstance(data, dict):
+        raise GeminiError("answer is not a JSON object")
+    return data
+
+
+def _translate_gemini(chunk: str) -> str | None:
+    """Gemini's translation of one post (no keyless rate limits, best quality)."""
+    if not GEMINI_API_KEY:
+        return None
+    hebrew = _gemini_json(chunk).get("hebrew")
+    return hebrew.strip() if isinstance(hebrew, str) else None
+
+
+# (name, function, max characters per request), best first. None of the free
+# providers needs a key; they are what a deployment without GEMINI_API_KEY
+# runs on, and the fallback whenever Gemini fails.
+FREE_TRANSLATE_PROVIDERS: list[tuple[str, Any, int]] = [
     ("google-gtx", _translate_google_gtx, MAX_TRANSLATE_CHUNK),
     ("google-clients5", _translate_google_clients5, MAX_TRANSLATE_CHUNK),
     ("lingva", _translate_lingva, LINGVA_MAX_CHUNK),
     ("mymemory", _translate_mymemory, MYMEMORY_MAX_CHUNK),
-    ("ai", _translate_ai, MAX_TRANSLATE_CHUNK),
+]
+TRANSLATE_PROVIDERS: list[tuple[str, Any, int]] = [
+    ("gemini", _translate_gemini, GEMINI_MAX_CHARS),
+    *FREE_TRANSLATE_PROVIDERS,
 ]
 
 
@@ -634,7 +728,10 @@ def _translate_with_provider(
     return "".join(parts)
 
 
-def translate_to_hebrew(text: str) -> tuple[str, bool]:
+def translate_to_hebrew(
+    text: str,
+    providers: list[tuple[str, Any, int]] | None = None,
+) -> tuple[str, bool]:
     """Translate English text to Hebrew, trying each provider in turn.
 
     Returns ``(text, translated)``. When ``translated`` is False every provider
@@ -644,7 +741,10 @@ def translate_to_hebrew(text: str) -> tuple[str, bool]:
     if not text.strip():
         return text, True
 
-    for name, translate_chunk, max_chunk in TRANSLATE_PROVIDERS:
+    providers = TRANSLATE_PROVIDERS if providers is None else providers
+    for name, translate_chunk, max_chunk in providers:
+        if name == "gemini" and not GEMINI_API_KEY:
+            continue
         translated = _translate_with_provider(name, translate_chunk, max_chunk, text)
         if translated is not None:
             log.info("Translated post via %s", name)
@@ -652,7 +752,7 @@ def translate_to_hebrew(text: str) -> tuple[str, bool]:
 
     log.error(
         "All %d translation providers failed — sending the English original",
-        len(TRANSLATE_PROVIDERS),
+        len(providers),
     )
     return text, False
 
@@ -1232,124 +1332,6 @@ def process_telegram_commands(state: BotState) -> None:
 
     if max_update_id > last_update_id:
         state.last_update_id = max_update_id
-
-# ---------------------------------------------------------------------------
-# AI provider — last-resort translation fallback
-# ---------------------------------------------------------------------------
-#
-# Only _translate_ai uses these. The keyless default (Pollinations) currently
-# answers 402 Payment Required, so this link contributes nothing unless
-# GEMINI_API_KEY or ANTHROPIC_API_KEY is set; the keyless providers ahead of it
-# in TRANSLATE_PROVIDERS carry translation on their own.
-
-
-def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any] | None:
-    """POST JSON to url and return the parsed response, or None on failure."""
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT, **headers},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
-            return json.loads(resp.read())
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
-        log.warning("AI request to %s failed: %s", url, exc)
-        return None
-
-
-def _call_pollinations(system: str, user: str) -> str | None:
-    """Call Pollinations' keyless AI (OpenAI-compatible); text or None."""
-    payload = {
-        "model": POLLINATIONS_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    }
-    result = _post_json(POLLINATIONS_API_URL, payload, {})
-    if not result:
-        return None
-    try:
-        text = result["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        log.warning("Unexpected Pollinations response shape: %s", result)
-        return None
-    text = (text or "").strip()
-    return text or None
-
-
-def _call_gemini(system: str, user: str) -> str | None:
-    """Call Google's Gemini API (free tier, raw HTTP); return text or None."""
-    if not GEMINI_API_KEY:
-        return None
-    payload = {
-        "system_instruction": {"parts": [{"text": system}]},
-        "contents": [{"parts": [{"text": user}]}],
-        "generationConfig": {"maxOutputTokens": AI_MAX_TOKENS},
-    }
-    result = _post_json(GEMINI_API_URL, payload, {"x-goog-api-key": GEMINI_API_KEY})
-    if not result:
-        return None
-    try:
-        parts = result["candidates"][0]["content"]["parts"]
-    except (KeyError, IndexError, TypeError):
-        log.warning("Unexpected Gemini response shape: %s", result)
-        return None
-    text = "".join(p.get("text", "") for p in parts).strip()
-    return text or None
-
-
-def _call_claude(system: str, user: str) -> str | None:
-    """Call the Claude Messages API (raw HTTP) and return the text, or None."""
-    if not ANTHROPIC_API_KEY:
-        return None
-    payload = {
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": AI_MAX_TOKENS,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
-    }
-    result = _post_json(ANTHROPIC_API_URL, payload, {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": ANTHROPIC_VERSION,
-    })
-    if not result:
-        return None
-    if result.get("stop_reason") == "refusal":
-        log.warning("Claude API refused the request")
-        return None
-    parts = [
-        block.get("text", "")
-        for block in result.get("content", [])
-        if block.get("type") == "text"
-    ]
-    text = "".join(parts).strip()
-    return text or None
-
-
-def _ai_complete(system: str, user: str) -> str | None:
-    """Run the configured AI provider, returning its text or None."""
-    if AI_PROVIDER == "claude":
-        return _call_claude(system, user)
-    if AI_PROVIDER == "gemini":
-        return _call_gemini(system, user)
-    return _call_pollinations(system, user)
-
-
-def _ai_key_available() -> bool:
-    """Whether the configured provider is usable (has a key, if it needs one).
-
-    Pollinations is keyless, so it always reports available — it can still fail
-    at call time, which _looks_translated catches.
-    """
-    if AI_PROVIDER == "claude":
-        return bool(ANTHROPIC_API_KEY)
-    if AI_PROVIDER == "gemini":
-        return bool(GEMINI_API_KEY)
-    return True
-
 
 # ---------------------------------------------------------------------------
 # Broadcast — one post to every subscriber, resumable

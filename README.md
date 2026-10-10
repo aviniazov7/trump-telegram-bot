@@ -57,41 +57,49 @@ All Bot API calls go through `telegram_call()` in `src/main.py`:
 
 ## Translation
 
-Each post is translated to Hebrew by trying several providers in order, moving
-on as soon as one returns real Hebrew:
+Each post is translated to Hebrew by trying providers in order, moving on as
+soon as one returns real Hebrew:
 
-1. Google's keyless translate endpoint (`translate.googleapis.com`)
-2. A second Google host (`clients5.google.com`), rate-limited separately
-3. Lingva — keyless Google Translate front ends, several public instances
-4. MyMemory's free API (no key)
-5. An AI model — only when an API key is configured (see below)
+1. **Google Gemini** (primary, needs `GEMINI_API_KEY`). It gets the whole post
+   with a prompt that asks for an accurate, complete translation. Names follow
+   Israeli-media spelling. Numbers, tickers, hashtags and URLs are kept as
+   written. The tone stays neutral, with no commentary. The answer comes back
+   as JSON against a schema.
+2. Google's keyless translate endpoint (`translate.googleapis.com`)
+3. A second Google host (`clients5.google.com`), rate-limited separately
+4. Lingva — keyless Google Translate front ends, several public instances
+5. MyMemory's free API (no key)
 
-The fallback chain matters because GitHub Actions runs on shared IPs that
-Google's free endpoint intermittently answers with HTTP 429, which previously
-left posts untranslated whenever the throttle happened to hit. A provider that
-echoes the English back or returns a quota notice is treated as a failure
-rather than a translation. If every provider fails, the
-post is still broadcast, but it is clearly marked as untranslated instead of
+Providers 2–5 are the free chain. They need no key, so a deployment without
+`GEMINI_API_KEY` runs on them alone, exactly as before. They are unofficial
+endpoints: GitHub Actions' shared IPs regularly get HTTP 429 from Google, and
+public Lingva instances come and go, which is why Gemini is now primary.
+
+Any answer that is empty, still English, cut off (`MAX_TOKENS`) or not valid
+JSON counts as a failure, not a translation. If every provider fails, the post
+is still broadcast, but it is clearly marked as untranslated instead of
 showing English under a "translated to Hebrew" heading.
 
-## AI provider (optional)
+### Gemini setup
 
-The bot needs no API key: the first four translation providers above are all
-keyless. The fifth is an AI model, used only when every keyless provider has
-failed.
+1. Create a free key at <https://aistudio.google.com/apikey> (no credit card
+   needed).
+2. Add it as the repository secret **`GEMINI_API_KEY`**.
+3. Optional: set repository variables (*Settings → Secrets and variables →
+   Actions → Variables*) to override the defaults:
 
-The default AI provider is **Pollinations**, which needs no key but currently
-answers `HTTP 402 Payment Required` from GitHub Actions — so out of the box
-that last link is inert. To make it a real fallback, set one of:
+| Variable | Default | Meaning |
+|---|---|---|
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Model ID. Check *AI Studio → Rate limits* for which models your free tier includes |
+| `GEMINI_THINKING_LEVEL` | (model default) | `minimal` / `low` / `medium` / `high`; lower is faster |
 
-- **Google Gemini** (free tier): `AI_PROVIDER=gemini` + a free `GEMINI_API_KEY`
-  from <https://aistudio.google.com/apikey> (no credit card).
-- **Anthropic Claude** (paid): `AI_PROVIDER=claude` + `ANTHROPIC_API_KEY`.
+Also available as env vars: `GEMINI_MAX_TOKENS` (default `8192`, includes
+thinking tokens) and `GEMINI_TIMEOUT` seconds (default `60`). When the free
+tier answers 429 with a short `retryDelay` (≤30 s), the bot waits and retries
+once. Otherwise it falls back to the free chain.
 
-Other optional env vars: `POLLINATIONS_MODEL` (default `openai`),
-`GEMINI_MODEL` (default `gemini-2.0-flash`), `ANTHROPIC_MODEL` (default
-`claude-opus-4-8`), `AI_MAX_TOKENS` (default `1500`), `AI_TIMEOUT` seconds
-(default `60`).
+The key travels in the `x-goog-api-key` header, never in a URL, so it can't
+appear in logs.
 
 ## Setup
 
