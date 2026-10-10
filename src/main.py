@@ -54,7 +54,6 @@ ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
 MAX_RETRIES = 2
 RETRY_DELAY = 2  # seconds
-FETCH_LIMIT = 10
 HTTP_TIMEOUT = 15  # seconds per request
 
 # Telegram caps text messages at 4096 chars; leave a small margin for safety.
@@ -73,6 +72,14 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, "").strip())
     except (ValueError, TypeError):
         return default
+
+
+# How far back a run looks for last_seen. GitHub's scheduler regularly skips
+# runs for hours, and Trump can post dozens of times in that gap, so this has to
+# cover a long outage: the trumpstruth RSS feed holds the latest 100 posts
+# (about a week). If last_seen is not within this many posts, the bot sends only
+# the newest one instead of flooding subscribers (see filter_new_posts).
+MAX_SCAN_POSTS = _env_int("MAX_SCAN_POSTS", 100)
 
 
 # ---- AI provider ---------------------------------------------------------
@@ -237,7 +244,7 @@ def _is_meaningful_text(text: str) -> bool:
     return True
 
 
-def fetch_posts_trumpstruth() -> list[dict[str, Any]]:
+def fetch_posts_trumpstruth(limit: int = MAX_SCAN_POSTS) -> list[dict[str, Any]]:
     """Fetch posts from trumpstruth.org RSS feed (primary source)."""
     log.info("Fetching posts from trumpstruth.org RSS feed")
     raw = http_get(TRUMPSTRUTH_RSS)
@@ -270,14 +277,14 @@ def fetch_posts_trumpstruth() -> list[dict[str, Any]]:
             "media_urls": [],
         })
 
-        if len(posts) >= FETCH_LIMIT:
+        if len(posts) >= limit:
             break
 
     log.info("Fetched %d posts from trumpstruth.org", len(posts))
     return posts
 
 
-def fetch_posts_cnn_archive() -> list[dict[str, Any]]:
+def fetch_posts_cnn_archive(limit: int = MAX_SCAN_POSTS) -> list[dict[str, Any]]:
     """Fallback: fetch posts from CNN's Truth Social archive JSON."""
     log.info("Fetching posts from CNN archive (fallback)")
     raw = http_get(CNN_ARCHIVE_JSON)
@@ -307,28 +314,58 @@ def fetch_posts_cnn_archive() -> list[dict[str, Any]]:
             "media_urls": media_urls,
         })
 
-        if len(posts) >= FETCH_LIMIT:
+        if len(posts) >= limit:
             break
 
     log.info("Fetched %d posts from CNN archive", len(posts))
     return posts
 
 
-def fetch_posts() -> list[dict[str, Any]]:
-    """Fetch posts with fallback chain."""
+def _newest_first(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order posts newest first.
+
+    Both sources already list newest first, but filter_new_posts depends on it,
+    so don't trust that blindly. Truth Social IDs are snowflakes that grow over
+    time; if any ID isn't numeric, keep the source's order.
+    """
+    if all(str(p.get("id", "")).isdigit() for p in posts):
+        return sorted(posts, key=lambda p: int(p["id"]), reverse=True)
+    return posts
+
+
+def _contains(posts: list[dict[str, Any]], post_id: str) -> bool:
+    return any(p["id"] == post_id for p in posts)
+
+
+def fetch_posts(last_seen_id: str = "") -> list[dict[str, Any]]:
+    """Fetch up to MAX_SCAN_POSTS recent posts, newest first.
+
+    trumpstruth.org is the primary source. The CNN archive is used when it
+    fails, and also when its window doesn't reach back to last_seen_id: the
+    archive holds the full history, so it can still find the gap's start if
+    the RSS feed dropped or reordered items.
+    """
+    posts: list[dict[str, Any]] = []
     try:
-        posts = fetch_posts_trumpstruth()
-        if posts:
-            return posts
+        posts = _newest_first(fetch_posts_trumpstruth())
     except Exception as exc:
         log.warning("trumpstruth.org RSS failed: %s", exc)
 
+    if posts and (not last_seen_id or _contains(posts, last_seen_id)):
+        return posts
+    if posts:
+        log.warning("last_seen not in the RSS window of %d posts — checking the CNN archive", len(posts))
+
     try:
-        posts = fetch_posts_cnn_archive()
-        if posts:
-            return posts
+        archive = _newest_first(fetch_posts_cnn_archive())
     except Exception as exc:
         log.warning("CNN archive fallback failed: %s", exc)
+        archive = []
+
+    if archive and (not posts or _contains(archive, last_seen_id)):
+        return archive
+    if posts:
+        return posts
 
     log.error("All fetch methods failed")
     return []
@@ -1145,6 +1182,50 @@ def _ai_key_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Broadcast — one post to every subscriber, resumable
+# ---------------------------------------------------------------------------
+
+
+def broadcast_post(state: BotState, post: dict[str, Any], message: str) -> bool:
+    """Send one post to every subscriber who doesn't have it yet.
+
+    Returns True when the post is finished: every subscriber was tried and at
+    least one (in this run or an earlier, interrupted one) received it. The
+    caller then advances last_seen.
+
+    Returns False when the run budget ran out mid-broadcast, or when nobody at
+    all could be reached (Telegram down) — the post must be retried next run.
+    Progress is kept in state.in_flight_*, so on retry the chats that already
+    got the post are skipped instead of receiving it twice.
+    """
+    if state.in_flight_post != post["id"]:
+        state.in_flight_post = post["id"]
+        state.in_flight_chats = []
+    done = set(state.in_flight_chats)
+
+    for chat_id in sorted(state.subscribers):
+        if chat_id in done:
+            continue
+        if _budget_exceeded():
+            log.warning(
+                "Budget exceeded mid-broadcast of post %s — %d chat(s) done, resuming next run",
+                post["id"], len(done),
+            )
+            return False
+        if send_telegram_message(message, chat_id=chat_id, thread_id=state.subscribers[chat_id]):
+            done.add(chat_id)
+            state.in_flight_chats.append(chat_id)
+        # Telegram broadcast rate limit is ~30 msgs/sec; small gap keeps
+        # us well under that even with many subscribers.
+        time.sleep(0.05)
+
+    if not done:
+        log.warning("Failed to deliver post %s to any subscriber — stopping to retry next run", post["id"])
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -1210,7 +1291,7 @@ def main() -> None:
     last_seen_id = state.last_seen
     log.info("Last seen post ID: %s", last_seen_id or "(none) — first run")
 
-    posts = fetch_posts()
+    posts = fetch_posts(last_seen_id)
     new_posts = filter_new_posts(posts, last_seen_id) if posts else []
     if not posts:
         log.info("No posts fetched this run")
@@ -1219,40 +1300,31 @@ def main() -> None:
 
     log.info("Broadcasting %d new post(s) to %d subscriber(s)", len(new_posts), len(subscribers))
 
-    # Translate and broadcast each new post to every subscriber.
+    # Oldest first. State is saved after every post, so a run that dies or
+    # runs out of time never re-sends what it already finished.
     latest_id = ""
-    for post in new_posts:
-        if _budget_exceeded():
-            log.warning("Budget exceeded — stopping at post %s to avoid overlapping next cron", post["id"])
-            break
-
-        log.info("Processing post %s", post["id"])
-        hebrew, translated = translate_to_hebrew(post["text"])
-        message = build_message(post, hebrew, translated)
-
-        delivered = 0
-        for sub_chat_id in sorted(subscribers):
+    try:
+        for post in new_posts:
             if _budget_exceeded():
-                log.warning("Budget exceeded mid-broadcast — stopping")
+                log.warning("Budget exceeded — stopping at post %s to avoid overlapping next cron", post["id"])
                 break
-            sub_thread_id = subscribers[sub_chat_id]
-            if send_telegram_message(message, chat_id=sub_chat_id, thread_id=sub_thread_id):
-                delivered += 1
-            # Telegram broadcast rate limit is ~30 msgs/sec; small gap keeps
-            # us well under that even with many subscribers.
-            time.sleep(0.05)
 
-        if delivered > 0:
+            log.info("Processing post %s", post["id"])
+            hebrew, translated = translate_to_hebrew(post["text"])
+            message = build_message(post, hebrew, translated)
+
+            if not broadcast_post(state, post, message):
+                break
+            state.last_seen = post["id"]
+            state.in_flight_post, state.in_flight_chats = "", []
+            persist()
             latest_id = post["id"]
-        else:
-            log.warning("Failed to deliver post %s to any subscriber — stopping to retry next run", post["id"])
-            break
 
-        if len(new_posts) > 1:
-            time.sleep(1)
-
-    if latest_id:
-        state.last_seen = latest_id
+            if len(new_posts) > 1:
+                time.sleep(1)
+    finally:
+        # Also covers an interrupted broadcast: its in-flight progress is
+        # saved so the next run skips the chats that already have the post.
         persist()
 
     log.info("Done — processed up to post %s", latest_id or "(none)")

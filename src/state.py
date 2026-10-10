@@ -54,18 +54,23 @@ class BotState:
     subscribers: dict[str, str | None] = field(default_factory=dict)
     last_seen: str = ""
     last_update_id: int = 0
+    # A post whose broadcast was interrupted (run budget ran out), and the
+    # chats that already have it, so the next run resumes instead of re-sending.
+    in_flight_post: str = ""
+    in_flight_chats: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:
-        return json.dumps(
-            {
-                "version": STATE_VERSION,
-                "last_seen": self.last_seen,
-                "last_update_id": self.last_update_id,
-                "subscribers": {k: self.subscribers[k] for k in sorted(self.subscribers)},
-            },
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
+        data: dict = {
+            "version": STATE_VERSION,
+            "last_seen": self.last_seen,
+            "last_update_id": self.last_update_id,
+            "subscribers": {k: self.subscribers[k] for k in sorted(self.subscribers)},
+        }
+        # Optional keys are written only when set, so a quiet state keeps the
+        # exact shape older versions of the bot wrote and read.
+        if self.in_flight_post:
+            data["in_flight"] = {"post": self.in_flight_post, "chats": sorted(self.in_flight_chats)}
+        return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
     @classmethod
     def from_json(cls, raw: str) -> "BotState":
@@ -91,14 +96,26 @@ class BotState:
             last_update_id = int(data.get("last_update_id") or 0)
         except (TypeError, ValueError) as exc:
             raise StateError("State 'last_update_id' must be an integer") from exc
+
+        in_flight = data.get("in_flight") or {}
+        if not isinstance(in_flight, dict) or not isinstance(in_flight.get("chats", []), list):
+            raise StateError("State 'in_flight' must be {post, chats: [...]}")
         return cls(
             subscribers=subscribers,
             last_seen=str(data.get("last_seen") or ""),
             last_update_id=last_update_id,
+            in_flight_post=str(in_flight.get("post") or ""),
+            in_flight_chats=[str(c) for c in in_flight.get("chats", [])],
         )
 
     def copy(self) -> "BotState":
-        return BotState(dict(self.subscribers), self.last_seen, self.last_update_id)
+        return BotState(
+            subscribers=dict(self.subscribers),
+            last_seen=self.last_seen,
+            last_update_id=self.last_update_id,
+            in_flight_post=self.in_flight_post,
+            in_flight_chats=list(self.in_flight_chats),
+        )
 
 
 # ---------------------------------------------------------------------------

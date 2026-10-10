@@ -10,6 +10,26 @@ The bot is **broadcast-only**:
 - No slash-command menu is shown. All other messages are ignored silently —
   users can't trigger any action.
 
+## Fetching and delivery
+
+GitHub's scheduler often skips `*/10` cron runs, so the real gap between runs
+can be hours. Each run therefore catches up on everything it missed:
+
+- **Deep scan.** The run reads up to `MAX_SCAN_POSTS` (default 100) recent
+  posts from the trumpstruth.org RSS feed, which covers about a week, and looks
+  for `last_seen` in them. If the feed's window doesn't reach `last_seen`, the
+  run checks the CNN archive, which holds the full history. Every post after
+  `last_seen` is sent, oldest first.
+- **Safe cap.** If `last_seen` can't be found at all (on the first run, or
+  after an outage longer than the scan window), only the newest post is sent,
+  so subscribers aren't flooded.
+- **Checkpoint after every post.** `last_seen` is saved as soon as a post has
+  gone to every subscriber. A run that crashes or runs out of time never
+  re-sends posts it already finished.
+- **Resumable broadcast.** If a run stops partway through one post's
+  broadcast, the chats that already got it are saved as `in_flight`. The next
+  run sends that post only to the chats still missing it.
+
 ## Translation
 
 Each post is translated to Hebrew by trying several providers in order, moving
@@ -74,6 +94,8 @@ The bot keeps a small amount of state between runs:
 - **last_seen**: the last post that was broadcast, so nothing is sent twice
 - **last_update_id**: the Telegram `getUpdates` offset, so each `/start` is
   handled once
+- **in_flight** (only while a broadcast is interrupted): the post being sent and
+  the chats that already have it
 
 ### Why the state is not in git
 
@@ -99,8 +121,10 @@ GitHub Actions (cron, every 10 min, concurrency group "trump-bot")
        1. store.load()             ← GitHub REST API: GET actions/variables/BOT_STATE
        2. handle Telegram updates  (mutates state in memory)
        3. store.save() if changed  → PATCH actions/variables/BOT_STATE
-       4. broadcast new posts
-       5. store.save() if changed  → PATCH (new last_seen)
+       4. fetch ≤100 posts         ← trumpstruth.org RSS (CNN archive if last_seen not found)
+       5. for each new post, oldest first:
+            translate → send to every subscriber not in in_flight
+            store.save()           → PATCH (last_seen = this post)
 ```
 
 - `src/state.py` defines a `StateStore` interface with two backends that store
@@ -168,6 +192,7 @@ removed from the tree and from history; see
 | `STATE_TOKEN` | — | Fine-grained PAT (github backend) |
 | `STATE_VARIABLE` | `BOT_STATE` | Variable name (github backend) |
 | `STATE_FILE` | `data/state.json` | Path (file backend) |
+| `MAX_SCAN_POSTS` | `100` | How many recent posts a run scans for `last_seen` |
 
 `GITHUB_REPOSITORY` and `GITHUB_API_URL` are set by Actions automatically.
 
