@@ -1,6 +1,12 @@
 # Proposal: move scheduling to a Cloudflare Worker
 
-**Status: proposal only. Nothing here is implemented.**
+**Status: implemented** on the `cloudflare-worker` branch. The README
+describes the result (setup, cutover, rollback). The owner chose Workers KV
+over the Durable Object recommended below, and the Worker contains the
+duplicate-send risk with a per-send key (`sent:<post>:<chat>`), with no
+read-modify-write and no overlapping runs. `Store` (src/store.ts) is the only
+place to change if a Durable Object is ever needed. The rest of this document
+is the original proposal, kept for its reasoning.
 
 ## Why
 

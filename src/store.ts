@@ -1,0 +1,170 @@
+/**
+ * Bot state in Workers KV.
+ *
+ * Keys:
+ *   meta                    cursor (lastSeen, sentAhead), posts in progress,
+ *                           heartbeat, source-failure counter, menu fingerprint
+ *   sub:<chatId>            one key per subscriber; forum topic in metadata
+ *   sent:<postId>           send log for that post: { chatId: status }.
+ *                           Written twice per post per run — the batch is
+ *                           reserved ("sending") BEFORE anything is sent,
+ *                           then the outcomes are recorded. Expires after
+ *                           30 days.
+ *   analysis:<postId>       cached translation + tags, so a resumed post is
+ *                           sent with the exact same text. Expires after 7 days.
+ *   alert:<kind>            exists while that alert is muted (TTL = repeat window)
+ *
+ * Why the send log is reserved before sending: a KV write can fail (the free
+ * plan allows 1,000 writes a day per account). If the record were written
+ * only after a send, a failed write would leave no trace and the next run
+ * would send the post again. With the reservation, a failed reservation
+ * means nothing is sent, and a failed final write leaves the chats marked
+ * "sending", which counts as delivered — at most once, never twice.
+ *
+ * Subscribers are one key each: the webhook (adding) and the cron (removing
+ * dead chats) never write the same key, so neither overwrites the other.
+ *
+ * Every write goes through write(): any failure becomes a KvWriteError, which
+ * stops the run's sends immediately (see broadcast.ts).
+ */
+import type { Cursor } from "./posts";
+import type { PostAnalysis } from "./tagging";
+import type { SendStatus } from "./telegram";
+
+/** A KV write or delete failed (quota exhausted, rate limit, outage). */
+export class KvWriteError extends Error {
+  constructor(what: string, cause: unknown) {
+    super(`KV write failed (${what}): ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "KvWriteError";
+  }
+}
+
+/** "sending" = reserved by a run that may or may not have finished the send. */
+export type LogStatus = SendStatus | "sending";
+export type SendLog = Record<string, LogStatus>;
+
+export interface Meta extends Cursor {
+  v: 1;
+  /** Posts started but not finished: postId → first attempt (ms). */
+  pending: Record<string, number>;
+  /** Fingerprint of the bot menu last applied to Telegram. */
+  menu: string;
+  /** End of the last successful run (ms); the heartbeat. */
+  lastSuccess: number;
+  /** Consecutive runs in which no post source could be reached. */
+  sourceFailures: number;
+}
+
+export const emptyMeta = (): Meta => ({
+  v: 1,
+  lastSeen: "",
+  sentAhead: [],
+  pending: {},
+  menu: "",
+  lastSuccess: 0,
+  sourceFailures: 0,
+});
+
+export interface Subscriber {
+  chatId: string;
+  threadId: string | null;
+}
+
+const DAY_S = 24 * 60 * 60;
+export const SENT_TTL_S = 30 * DAY_S;
+export const ANALYSIS_TTL_S = 7 * DAY_S;
+/** KV's minimum expirationTtl. */
+const MIN_TTL_S = 60;
+
+export class Store {
+  /** KV writes made through this Store (for logs and tests). */
+  writes = 0;
+
+  constructor(private readonly kv: KVNamespace) {}
+
+  private async write(what: string, op: () => Promise<void>): Promise<void> {
+    try {
+      await op();
+      this.writes += 1;
+    } catch (err) {
+      throw new KvWriteError(what, err);
+    }
+  }
+
+  async getMeta(): Promise<Meta> {
+    const raw = await this.kv.get<Partial<Meta>>("meta", "json");
+    if (!raw) return emptyMeta();
+    const meta = { ...emptyMeta(), ...raw };
+    if (meta.v !== 1) throw new Error(`Unsupported state version ${String(meta.v)}`);
+    return meta;
+  }
+
+  async putMeta(meta: Meta): Promise<void> {
+    await this.write("meta", () => this.kv.put("meta", JSON.stringify(meta)));
+  }
+
+  async listSubscribers(): Promise<Subscriber[]> {
+    const subs: Subscriber[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.kv.list<{ thread?: string | null }>({ prefix: "sub:", cursor });
+      for (const key of page.keys) {
+        subs.push({ chatId: key.name.slice(4), threadId: key.metadata?.thread ?? null });
+      }
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+    return subs.sort((a, b) => a.chatId.localeCompare(b.chatId));
+  }
+
+  async getSubscriber(chatId: string): Promise<Subscriber | null> {
+    const { value, metadata } = await this.kv.getWithMetadata<{ thread?: string | null }>(`sub:${chatId}`);
+    return value === null ? null : { chatId, threadId: metadata?.thread ?? null };
+  }
+
+  async putSubscriber(chatId: string, threadId: string | null): Promise<void> {
+    // Thread in metadata, so listSubscribers needs no per-key reads.
+    await this.write("subscriber", () => this.kv.put(`sub:${chatId}`, "1", { metadata: { thread: threadId } }));
+  }
+
+  async deleteSubscriber(chatId: string): Promise<void> {
+    await this.write("subscriber delete", () => this.kv.delete(`sub:${chatId}`));
+  }
+
+  async getSendLog(postId: string): Promise<SendLog> {
+    return (await this.kv.get<SendLog>(`sent:${postId}`, "json")) ?? {};
+  }
+
+  async putSendLog(postId: string, log: SendLog): Promise<void> {
+    await this.write("send log", () =>
+      this.kv.put(`sent:${postId}`, JSON.stringify(log), { expirationTtl: SENT_TTL_S }),
+    );
+  }
+
+  async getAnalysis(postId: string): Promise<PostAnalysis | null> {
+    return this.kv.get<PostAnalysis>(`analysis:${postId}`, "json");
+  }
+
+  async putAnalysis(postId: string, analysis: PostAnalysis): Promise<void> {
+    await this.write("analysis", () =>
+      this.kv.put(`analysis:${postId}`, JSON.stringify(analysis), { expirationTtl: ANALYSIS_TTL_S }),
+    );
+  }
+
+  async alertMuted(kind: string): Promise<boolean> {
+    return (await this.kv.get(`alert:${kind}`)) !== null;
+  }
+
+  async muteAlert(kind: string, seconds: number): Promise<void> {
+    await this.write("alert mute", () =>
+      this.kv.put(`alert:${kind}`, "1", { expirationTtl: Math.max(MIN_TTL_S, seconds) }),
+    );
+  }
+
+  async get(key: string): Promise<string | null> {
+    return this.kv.get(key);
+  }
+
+  async put(key: string, value: string): Promise<void> {
+    await this.write(key, () => this.kv.put(key, value));
+  }
+}

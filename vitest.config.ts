@@ -1,0 +1,30 @@
+import { cloudflareTest } from "@cloudflare/vitest-plugin";
+import { defineConfig } from "vitest/config";
+
+// Tests run inside the Workers runtime (workerd) with a local KV namespace.
+// The bindings below are test-only placeholders, never real secrets.
+export default defineConfig({
+  plugins: [
+    cloudflareTest({
+      wrangler: { configPath: "./wrangler.toml" },
+      miniflare: {
+        bindings: {
+          TELEGRAM_BOT_TOKEN: "test-bot-token",
+          TELEGRAM_WEBHOOK_SECRET: "test-webhook-secret-0123456789abcdef",
+          GEMINI_API_KEY: "test-gemini-key",
+          ADMIN_CHAT_ID: "999",
+          DRY_RUN: "false",
+        },
+      },
+    }),
+  ],
+  test: {
+    include: ["test/**/*.test.ts"],
+    coverage: {
+      provider: "istanbul",
+      include: ["src/**/*.ts"],
+      reporter: ["text", "json-summary"],
+      thresholds: { lines: 85 },
+    },
+  },
+});

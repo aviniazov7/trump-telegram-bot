@@ -1,0 +1,85 @@
+name: Deploy Worker
+
+# Optional continuous deployment, gated by a manual approval.
+#
+# - Does nothing until the repository secrets CLOUDFLARE_API_TOKEN and
+#   CLOUDFLARE_ACCOUNT_ID exist (see README → Deploy from GitHub).
+# - The deploy job runs in the `production` environment, which requires a
+#   reviewer's approval (Settings → Environments → production → Required
+#   reviewers) and only accepts the main branch. Nothing reaches Cloudflare
+#   until someone clicks "Approve and deploy" on the run.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'wrangler.toml'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  # Runs without the environment, so no approval is requested when there is
+  # nothing to deploy with.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      configured: ${{ steps.config.outputs.configured }}
+    steps:
+      - id: config
+        env:
+          HAS_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        run: |
+          echo "configured=$HAS_TOKEN" >> "$GITHUB_OUTPUT"
+          [ "$HAS_TOKEN" = "true" ] || echo "::notice::CLOUDFLARE_API_TOKEN is not set — nothing to deploy."
+      - uses: actions/checkout@v4
+        if: steps.config.outputs.configured == 'true'
+      - name: Refuse to deploy with a placeholder KV namespace id
+        if: steps.config.outputs.configured == 'true'
+        run: |
+          if grep -q 'REPLACE_WITH_KV_NAMESPACE_ID' wrangler.toml; then
+            echo "::error::Set the KV namespace id in wrangler.toml first (README → Setup)."
+            exit 1
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.config.outputs.configured == 'true'
+        with:
+          node-version: '22'
+          cache: npm
+      - if: steps.config.outputs.configured == 'true'
+        run: npm ci
+      - name: Tests
+        if: steps.config.outputs.configured == 'true'
+        run: npm test
+
+  deploy:
+    needs: check
+    if: needs.check.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Required reviewers on this environment = manual approval before deploy.
+    environment:
+      name: production
+      url: https://dash.cloudflare.com/?to=/:account/workers/services/view/trump-telegram-bot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.141.0'
+          command: deploy

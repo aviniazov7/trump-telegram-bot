@@ -21,3 +21,15 @@ data/
 coverage.json
 coverage-badge.json
 htmlcov/
+
+# Cloudflare Worker
+node_modules/
+.wrangler/
+coverage/
+# Local secrets for `wrangler dev` — never commit. See .dev.vars.example.
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+dist/

@@ -49,4 +49,5 @@ jobs:
           # fine-grained PAT for this repo only, with "Variables: Read and write".
           STATE_BACKEND: github
           STATE_TOKEN: ${{ secrets.STATE_TOKEN }}
-        run: python src/main.py
+        # The Python bot now lives in legacy/ until the Cloudflare Worker takes over.
+        run: python legacy/src/main.py

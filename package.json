@@ -1,0 +1,28 @@
+{
+  "name": "trump-telegram-bot",
+  "private": true,
+  "type": "module",
+  "description": "Trump's Truth Social posts, translated to Hebrew and tagged for market impact, broadcast on Telegram. Runs as a Cloudflare Worker.",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome lint src test scripts && tsc --noEmit",
+    "format": "biome format --write src test scripts",
+    "secrets:check": "bash scripts/check-secrets.sh",
+    "webhook:set": "node scripts/telegram-webhook.mjs set",
+    "webhook:info": "node scripts/telegram-webhook.mjs info",
+    "webhook:delete": "node scripts/telegram-webhook.mjs delete"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14",
+    "@cloudflare/vitest-plugin": "1.2.8",
+    "@cloudflare/workers-types": "5.20260926.1",
+    "@vitest/coverage-istanbul": "4.1.11",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11",
+    "wrangler": "4.141.0"
+  }
+}

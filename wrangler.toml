@@ -1,0 +1,43 @@
+# Cloudflare Worker for the Trump → Hebrew Telegram bot.
+#
+# NO SECRETS IN THIS FILE — the repository is public. Secrets are set with
+#   npx wrangler secret put TELEGRAM_BOT_TOKEN        (and the others, see README)
+# Locally they come from .dev.vars, which is gitignored.
+
+name = "trump-telegram-bot"
+main = "src/index.ts"
+compatibility_date = "2026-09-25"
+workers_dev = true
+
+[triggers]
+# Every 5 minutes. Each run stops starting new work after
+# RUN_TIME_BUDGET_SECONDS, far inside the interval, so runs never overlap.
+crons = ["*/5 * * * *"]
+
+[[kv_namespaces]]
+binding = "STATE"
+# Not a secret: replace with the id printed by
+#   npx wrangler kv namespace create STATE
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[vars]
+# Shadow mode: posts are processed but sent ONLY to ADMIN_CHAT_ID, as a
+# preview, while the legacy GitHub Actions bot keeps serving subscribers.
+# Flip to "false" at cutover (see README → Cutover).
+DRY_RUN = "true"
+GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_THINKING_LEVEL = ""
+# In-band "no successful run" alert. Can't be below the 30-min heartbeat
+# interval (+1 min) — the code clamps it. For faster detection use
+# HEALTHCHECK_URL (healthchecks.io), which costs no KV writes.
+STALE_ALERT_MINUTES = "35"
+SOURCE_FAILURE_ALERT_RUNS = "10"
+ALERT_REPEAT_MINUTES = "60"
+MAX_SCAN_POSTS = "100"
+# Free plan: 50 subrequests and 10 ms CPU per cron run. Sends beyond this
+# budget continue in the next run (5 min later). Raise on Workers Paid.
+MAX_SUBREQUESTS = "45"
+RUN_TIME_BUDGET_SECONDS = "40"
+
+[observability]
+enabled = true
