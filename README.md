@@ -36,8 +36,8 @@ it.
                     │   3. new posts after lastSeen      │ 10 failed runs → 📡 alert      │
                     │   4. analysis ← KV cache │ Gemini (translate + tags) │ free chain   │
                     │   5. order: in progress → 🔴 high → rest (each oldest first)        │
-                    │   6. for each subscriber without sent:<post>:<chat>:               │
-                    │        sendMessage → write sent:<post>:<chat> immediately          │
+                    │   6. per post: reserve batch in sent:<post> ("sending") → send →   │
+                    │        record outcomes in sent:<post>  (any KV write fails → STOP)│
                     │   7. cursor/heartbeat → KV meta, ping HEALTHCHECK_URL              │
                     │                                                                    │
  Telegram ─────────▶│ fetch() POST /telegram/<path>  (secret header, constant-time)     │
@@ -45,7 +45,7 @@ it.
                     └───────┬───────────────────────────────┬────────────────────────────┘
                             ▼                               ▼
                      Workers KV "STATE"              Telegram Bot API ── ADMIN_CHAT_ID alerts
-       meta · sub:<chat> · sent:<post>:<chat> · analysis:<post> · alert:<kind>
+       meta · sub:<chat> · sent:<post> · analysis:<post> · alert:<kind>
 
 GitHub Actions: CI only (tests, lint, secret scan) + optional deploy on push to main.
 ```
@@ -60,11 +60,23 @@ GitHub Actions: CI only (tests, lint, secret scan) + optional deploy on push to 
   If the RSS window doesn't reach it, it reads the first 512 KB of the 20 MB
   CNN archive. A full parse would exceed the Workers CPU limit. If `lastSeen`
   is nowhere to be found, only the newest post is sent, and you get an alert.
-- **Never twice.** Every send is recorded in `sent:<post>:<chat>` right after
-  it happens. A chat that has any record for a post never gets that post
-  again. A run that stops anywhere resumes exactly where it left off. The
-  analysis is cached in `analysis:<post>`, so a resumed post goes out with
-  the same text.
+- **Never twice.** Each post has a send log, `sent:<post>`, mapping each chat
+  to its outcome. Before sending, the run **reserves** the batch of chats
+  it's about to send to as `sending`. After sending, it records the outcomes.
+  - A chat with any entry never gets that post again.
+  - If the reservation can't be written, nothing is sent.
+  - If the outcomes can't be written, the reserved chats stay `sending` and
+    count as delivered: at most once, never twice.
+
+  A run that stops anywhere resumes exactly where it left off. The analysis
+  is cached in `analysis:<post>`, so a resumed post goes out with the same
+  text.
+- **Any KV write failure stops the run.** Examples: the free plan's 1,000
+  writes a day are used up, or there's a rate limit or an outage. The run
+  stops every further send and every further write immediately, and alerts
+  the admin (🛑). Later runs keep failing at the reservation step, so they
+  send nothing until writes work again. Then they continue where the log
+  says. Nothing is re-sent.
 - **Telegram errors:**
 
   | Telegram answer | Result for that chat |
@@ -116,18 +128,25 @@ and you get an alert.
 ## Monitoring
 
 Alerts go to `ADMIN_CHAT_ID`. Each kind is sent at most once per
-`ALERT_REPEAT_MINUTES` (60):
+`ALERT_REPEAT_MINUTES` (60); the KV alert, once per 12 h:
 
 | Alert | When |
 |---|---|
-| ⏰ No successful run | The previous successful run ended more than `STALE_ALERT_MINUTES` (15) ago |
+| 🛑 KV write failed | A KV write failed; all sends stopped (see [When to move to Workers Paid or D1](#when-to-move-to-workers-paid-or-d1)) |
+| ⏰ No successful run | The previous successful run ended more than `STALE_ALERT_MINUTES` (35, never below 31) ago |
 | 📡 Source down | No post source could be reached for `SOURCE_FAILURE_ALERT_RUNS` (10) runs in a row (≈ 50 min at `*/5`) |
 | ⚠️ Translation failed | Every provider failed for a post, so it went out in English |
 | ⚠️ Possible missed posts | `lastSeen` wasn't in the scanned window |
 
-The heartbeat is `meta.lastSuccess`, written at most every 10 minutes to stay
-inside the KV free plan's 1,000 writes a day. A Worker that doesn't run at
-all can't send alerts. For that case, set `HEALTHCHECK_URL` to a
+The heartbeat is `meta.lastSuccess`, written at most every **30 minutes**
+(48 writes a day). So the in-band ⏰ alert can't fire sooner than 31 minutes
+after the last success, or every healthy gap would look stale. The code
+enforces that minimum. Mutes are kept in KV. When KV can't record a mute
+(writes failing), the mute is kept in the running Worker's memory instead.
+That's best effort: a fresh Worker instance can repeat an alert once.
+
+A Worker that doesn't run at all can't send alerts. For that case, and for
+detection faster than 31 minutes, set `HEALTHCHECK_URL` to a
 [healthchecks.io](https://healthchecks.io) check (period 5 min, grace 10 min, Telegram
 integration), which the Worker pings after every successful run. Logs are in
 *Cloudflare dashboard → Workers → trump-telegram-bot → Logs*, or run
@@ -139,7 +158,7 @@ integration), which the Worker pings after every successful run. Logs are in
 |---|---|
 | `meta` | `lastSeen`, `sentAhead`, posts in progress, heartbeat, source-failure count, menu fingerprint |
 | `sub:<chatId>` | One key per subscriber; forum topic in metadata |
-| `sent:<postId>:<chatId>` | Send log: `ok` / `uncertain` / `gone` / `failed`; 30-day TTL |
+| `sent:<postId>` | Send log `{chatId: status}`: `sending` (reserved) / `ok` / `uncertain` / `gone` / `failed`; 30-day TTL |
 | `analysis:<postId>` | Cached translation + tags; 7-day TTL |
 | `alert:<kind>` | Exists while that alert is muted |
 
@@ -147,20 +166,45 @@ integration), which the Worker pings after every successful run. Logs are in
 appear in other Cloudflare locations. The design keeps that from causing
 duplicates:
 
-- each send has its own key, written immediately, with no read-modify-write;
-- the webhook and the cron never write the same key;
-- runs end within 40 s of a 5-minute interval.
+- only the cron writes `meta` and `sent:<post>`, and runs are 5 minutes
+  apart, far longer than KV's propagation delay, so a run reads what the
+  previous run wrote;
+- the webhook (adding subscribers) and the cron (removing dead chats) never
+  write the same key;
+- the reservation is written before any send.
 
-The remaining risk is narrow. A chat whose send failed temporarily in one
-location, then succeeded from another location, could see that post twice if
-a third run lands back in the first location within 60 s. If that ever
-matters, swapping `Store` for a Durable Object gives strong consistency; see
-[docs/CLOUDFLARE_MIGRATION.md](docs/CLOUDFLARE_MIGRATION.md).
+**Write budget.** These are KV writes; the free plan allows 1,000 a day, shared
+by every Worker on the account:
 
-**Free-plan budget:** about 144 heartbeat writes a day, plus one write per
-send, per analysed post and per finished post. That is roughly 600 writes a
-day with ~10 subscribers, under the 1,000 limit. With many more
-subscribers, or `MAX_SUBREQUESTS` above 45, move to Workers Paid.
+| What | Writes |
+|---|---|
+| Heartbeat | 48/day (every 30 min) |
+| Each new post | 4: reservation + outcomes + analysis cache + cursor. That's per run, and independent of the number of subscribers |
+| Subscribe / unsubscribe / dead chat | 1 each |
+| Alerts | 1 each (mute) |
+
+At ~30 posts a day that's about 170 writes, well under 1,000.
+
+### When to move to Workers Paid or D1
+
+**Workers Paid ($5/month)** includes 1 million KV writes a month (≈ 33,000 a
+day), 30 s of CPU per cron run instead of 10 ms, and 10,000 subrequests per
+run instead of 50. Move when any of these happens:
+
+- 🛑 KV-write alerts. The 1,000 writes a day are shared with your other
+  Workers, so they can run out even when this bot is quiet.
+- `Exceeded CPU` errors in the Worker logs (10 ms is tight for parsing a
+  100-post RSS feed).
+- A run can't reach all subscribers. One post takes 1 subrequest per
+  subscriber, and about 40 fit in a free run; the rest wait 5 minutes for
+  the next run. Past ~40 subscribers, raise `MAX_SUBREQUESTS` (Paid only).
+
+**D1 (SQLite)** is worth it if you need **zero** duplicate risk, or real
+queries. D1's free tier allows 100,000 row writes a day versus KV's 1,000, and
+its writes go to a single primary database, where `batch()` runs as a
+transaction. That means a send log row and a cursor update can commit
+together, instead of KV's eventual consistency. Only `src/store.ts` would
+change; the rest of the Worker uses it through the `Store` class.
 
 ## Security
 
@@ -314,7 +358,7 @@ Vars live in `wrangler.toml` under `[vars]`:
 | `DRY_RUN` | `"true"` | Previews to the admin only. Anything except `"false"` keeps it on |
 | `GEMINI_MODEL` | `gemini-3.8-flash` | Check *AI Studio → Rate limits* for your free tier |
 | `GEMINI_THINKING_LEVEL` | (model default) | `minimal`/`low`/`medium`/`high` |
-| `STALE_ALERT_MINUTES` | `15` | ⏰ threshold |
+| `STALE_ALERT_MINUTES` | `35` | ⏰ threshold (minimum 31: heartbeat interval + 1) |
 | `SOURCE_FAILURE_ALERT_RUNS` | `10` | 📡 threshold |
 | `ALERT_REPEAT_MINUTES` | `60` | Mute window per alert kind |
 | `MAX_SCAN_POSTS` | `100` | How far back a run looks for `lastSeen` |
@@ -325,11 +369,18 @@ Vars live in `wrangler.toml` under `[vars]`:
 
 Add the repository secrets `CLOUDFLARE_API_TOKEN` and
 `CLOUDFLARE_ACCOUNT_ID`. Create the token from the *Edit Cloudflare Workers*
-template, scoped to your account. After that, every push to `main` that
-touches the Worker runs the tests and deploys it
-([`deploy.yml`](.github/workflows/deploy.yml)). Under *Settings →
-Environments → production*, add yourself as a required reviewer to approve
-each deploy. Without the token, the workflow does nothing.
+template, scoped to your account. Without the token, the workflow does
+nothing.
+
+With the token, every push to `main` that touches the Worker goes through
+[`deploy.yml`](.github/workflows/deploy.yml):
+
+1. **check** (no approval): runs the tests and refuses a placeholder KV id.
+2. **deploy** waits in the **`production` environment** until a required
+   reviewer clicks **Review deployments → Approve and deploy** on the run.
+   That environment is set up with `aviniazov7` as required reviewer and
+   accepts only the `main` branch (*Settings → Environments → production*).
+   Nothing reaches Cloudflare without that click.
 
 ## Development
 
