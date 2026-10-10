@@ -1,6 +1,6 @@
 /**
  * Cloudflare Worker entry point.
- *   scheduled()  every minute: fetch, translate, tag and deliver new posts
+ *   scheduled()  every 5 minutes: fetch, translate, tag and deliver new posts
  *   fetch()      POST /telegram/<path>: Telegram webhook (see webhook.ts);
  *                everything else is 404
  */

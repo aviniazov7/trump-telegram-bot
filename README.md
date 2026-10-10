@@ -5,7 +5,7 @@
 
 Fetches Donald Trump's Truth Social posts, translates them to Hebrew, tags
 each one by its likely market impact, and broadcasts them to every Telegram
-subscriber. It runs as a **Cloudflare Worker**: a Cron Trigger every minute
+subscriber. It runs as a **Cloudflare Worker**: a Cron Trigger every 5 minutes
 handles posts, and a webhook handles bot commands.
 
 > **Migration status.** The Worker is new. Until it is verified, the original
@@ -17,8 +17,8 @@ handles posts, and a webhook handles bot commands.
 
 | | GitHub Actions cron | Cloudflare Cron Trigger |
 |---|---|---|
-| Scheduling | Best effort: `*/10` runs arrived **2.5–8 h** apart | Every minute, reliably |
-| Latency to subscribers | Hours | About a minute |
+| Scheduling | Best effort: `*/10` runs arrived **2.5–8 h** apart | Every 5 minutes, reliably |
+| Latency to subscribers | Hours | ≤ 5 minutes |
 | `/start` handling | Polled on the next run (hours) | Webhook: instant |
 | State | One JSON variable through the REST API, 48 KB cap, needs a PAT | Workers KV, no PAT |
 | Cost | Free | Free plan (limits below); $5/month Workers Paid for headroom |
@@ -30,7 +30,7 @@ it.
 
 ```
                     ┌──────────────────────── Cloudflare Worker ────────────────────────┐
- Cron "* * * * *" ─▶│ scheduled() → runCron                                              │
+ Cron "*/5 * * * *" ▶│ scheduled() → runCron                                              │
                     │   1. meta ← KV            heartbeat check → ⏰ alert if > 15 min    │
                     │   2. posts ← trumpstruth RSS (100) │ CNN archive prefix (fallback) │
                     │   3. new posts after lastSeen      │ 10 failed runs → 📡 alert      │
@@ -54,8 +54,8 @@ GitHub Actions: CI only (tests, lint, secret scan) + optional deploy on push to 
 
 - **Budgets.** Each run counts its subrequests (the free plan allows 50 per
   invocation) and stops starting new work after `RUN_TIME_BUDGET_SECONDS`
-  (40). Whatever is left continues in the next minute's run, so runs don't
-  overlap.
+  (40). Whatever is left continues in the next run, 5 minutes later, so runs
+  never overlap.
 - **No missed posts.** The run scans up to 100 recent posts for `lastSeen`.
   If the RSS window doesn't reach it, it reads the first 512 KB of the 20 MB
   CNN archive. A full parse would exceed the Workers CPU limit. If `lastSeen`
@@ -121,14 +121,14 @@ Alerts go to `ADMIN_CHAT_ID`. Each kind is sent at most once per
 | Alert | When |
 |---|---|
 | ⏰ No successful run | The previous successful run ended more than `STALE_ALERT_MINUTES` (15) ago |
-| 📡 Source down | No post source could be reached for `SOURCE_FAILURE_ALERT_RUNS` (10) runs in a row |
+| 📡 Source down | No post source could be reached for `SOURCE_FAILURE_ALERT_RUNS` (10) runs in a row (≈ 50 min at `*/5`) |
 | ⚠️ Translation failed | Every provider failed for a post, so it went out in English |
 | ⚠️ Possible missed posts | `lastSeen` wasn't in the scanned window |
 
 The heartbeat is `meta.lastSuccess`, written at most every 10 minutes to stay
 inside the KV free plan's 1,000 writes a day. A Worker that doesn't run at
 all can't send alerts. For that case, set `HEALTHCHECK_URL` to a
-[healthchecks.io](https://healthchecks.io) check (period 5 min, Telegram
+[healthchecks.io](https://healthchecks.io) check (period 5 min, grace 10 min, Telegram
 integration), which the Worker pings after every successful run. Logs are in
 *Cloudflare dashboard → Workers → trump-telegram-bot → Logs*, or run
 `npx wrangler tail`.
@@ -149,7 +149,7 @@ duplicates:
 
 - each send has its own key, written immediately, with no read-modify-write;
 - the webhook and the cron never write the same key;
-- runs end within 40 s of a 60 s interval.
+- runs end within 40 s of a 5-minute interval.
 
 The remaining risk is narrow. A chat whose send failed temporarily in one
 location, then succeeded from another location, could see that post twice if
@@ -217,12 +217,12 @@ npx wrangler secret put HEALTHCHECK_URL          # optional
 ### Verify the dry run (at least 24 h)
 
 ```bash
-npx wrangler tail                                # a "Run start [DRY RUN]" line every minute
+npx wrangler tail                                # a "Run start [DRY RUN]" line every 5 minutes
 ```
 
-- Every minute the logs show `Run start [DRY RUN]` followed by `Run end`.
+- Every 5 minutes the logs show `Run start [DRY RUN]` followed by `Run end`.
 - When Trump posts, you get a **🧪 DRY RUN** preview with the tag line, within
-  about a minute. The legacy bot's message usually arrives hours later.
+  5 minutes. The legacy bot's message usually arrives hours later.
   Compare the two.
 - There are no ⏰/📡 alerts, and no errors under *Workers → Logs*.
 
@@ -266,8 +266,8 @@ npx wrangler tail         # keep open while testing
    then the welcome, within seconds. `tail` shows `Unsubscribed chat#…` and
    `Subscribed chat#…`.
 2. A non-matching URL gives 404: `curl -s -o /dev/null -w '%{http_code}\n' "$WORKER_URL/"`.
-3. Each minute `tail` shows `Run start` without `[DRY RUN]`. The next post
-   reaches subscribers with the tag line, about a minute after it's
+3. Every 5 minutes `tail` shows `Run start` without `[DRY RUN]`. The next post
+   reaches subscribers with the tag line, within 5 minutes of being
    published.
 4. `npx wrangler kv key get meta --binding STATE --remote` shows `lastSeen`
    advancing.

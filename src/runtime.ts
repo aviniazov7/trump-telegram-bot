@@ -3,7 +3,7 @@ import { Logger } from "./log";
 
 /**
  * Per-invocation limits. Workers cap subrequests per invocation (50 on the
- * free plan) and a cron run should end well before the next minute's run
+ * free plan) and a cron run should end well before the next run (5 min)
  * starts, so every outbound fetch goes through here.
  */
 export class Budget {

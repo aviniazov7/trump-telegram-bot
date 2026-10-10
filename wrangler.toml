@@ -10,9 +10,9 @@ compatibility_date = "2026-09-25"
 workers_dev = true
 
 [triggers]
-# Every minute. Each run stops starting new work after RUN_TIME_BUDGET_SECONDS
-# so consecutive runs don't overlap.
-crons = ["* * * * *"]
+# Every 5 minutes. Each run stops starting new work after
+# RUN_TIME_BUDGET_SECONDS, far inside the interval, so runs never overlap.
+crons = ["*/5 * * * *"]
 
 [[kv_namespaces]]
 binding = "STATE"
@@ -35,7 +35,7 @@ SOURCE_FAILURE_ALERT_RUNS = "10"
 ALERT_REPEAT_MINUTES = "60"
 MAX_SCAN_POSTS = "100"
 # Free plan: 50 subrequests and 10 ms CPU per cron run. Sends beyond this
-# budget continue in the next minute's run. Raise on Workers Paid.
+# budget continue in the next run (5 min later). Raise on Workers Paid.
 MAX_SUBREQUESTS = "45"
 RUN_TIME_BUDGET_SECONDS = "40"
 
