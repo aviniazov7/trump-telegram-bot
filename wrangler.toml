@@ -16,9 +16,9 @@ crons = ["*/5 * * * *"]
 
 [[kv_namespaces]]
 binding = "STATE"
-# Not a secret: replace with the id printed by
+# Not a secret (it's useless without account credentials). Created with
 #   npx wrangler kv namespace create STATE
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "df295f75a67a4a54aa3a2dcb8b71490a"
 
 [vars]
 # Shadow mode: posts are processed but sent ONLY to ADMIN_CHAT_ID, as a
