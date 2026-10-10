@@ -137,12 +137,17 @@ class BotStateTests(unittest.TestCase):
         state = sample_state()
         state.in_flight_post, state.in_flight_chats = "p9", ["111"]
         state.menu_config = "abc123"
+        state.sent_ahead = ["p10", "p11"]
         self.assertEqual(BotState.from_json(state.to_json()), state)
         self.assertEqual(state.copy(), state)
 
     def test_optional_keys_omitted_when_unset(self):
         # Keeps idle state byte-identical to what earlier versions wrote.
         self.assertNotIn("in_flight", json.loads(sample_state().to_json()))
+
+    def test_rejects_bad_sent_ahead(self):
+        with self.assertRaises(StateError):
+            BotState.from_json('{"version": 1, "sent_ahead": "p1"}')
 
     def test_rejects_bad_in_flight(self):
         with self.assertRaises(StateError):

@@ -80,6 +80,38 @@ JSON counts as a failure, not a translation. If every provider fails, the post
 is still broadcast, but it is clearly marked as untranslated instead of
 showing English under a "translated to Hebrew" heading.
 
+## Market-impact tags
+
+The same Gemini call that translates a post also classifies it:
+
+- **Topics:** `tariffs`, `fed_rates`, `oil`, `crypto`, `china`, `stocks`, or
+  `other`. A post can have several.
+- **Impact:** `high` (a concrete new action, threat or deadline: new tariffs,
+  a demand on the Fed, oil-supply moves, crypto policy, a deal or rupture with
+  China, a named listed company), `medium` (market talk without a new action),
+  or `low`.
+
+The first line of every message shows the impact and the topics:
+
+```
+🔴 השפעה גבוהה על השווקים · #מכסים #סין      ← high
+🟠 השפעה בינונית על השווקים · #ריבית_הפד     ← medium
+⚪ השפעה נמוכה על השווקים · #כללי             ← low
+🏷️ #נפט                                       ← Gemini unavailable: keyword topics, no impact
+```
+
+**High-impact posts go first.** A run translates and classifies its whole
+backlog before sending anything. Then it sends, in this order: a post whose
+broadcast was interrupted, then every 🔴 post (oldest first), then the rest
+(oldest first). Because posts can now go out of order, state keeps
+`sent_ahead`, the posts already sent past `last_seen`. `last_seen` only moves
+once everything older has been sent as well, so an interrupted run never skips
+or repeats a post.
+
+When Gemini is unavailable, topics come from a keyword list
+(`_KEYWORD_CATEGORIES`). Keywords can't judge impact, so these posts never get
+a 🔴 and are sent in plain chronological order.
+
 ### Gemini setup
 
 1. Create a free key at <https://aistudio.google.com/apikey> (no credit card
@@ -130,6 +162,8 @@ The bot keeps a small amount of state between runs:
 - **in_flight** (only while a broadcast is interrupted): the post being sent and
   the chats that already have it
 - **menu_config**: fingerprint of the bot menu last applied to Telegram
+- **sent_ahead**: posts newer than `last_seen` that were already sent out of
+  order (high impact first)
 
 ### Why the state is not in git
 
@@ -157,9 +191,10 @@ GitHub Actions (cron, every 10 min, concurrency group "trump-bot")
           handle Telegram updates  (mutates state in memory)
        3. store.save() if changed  → PATCH actions/variables/BOT_STATE
        4. fetch ≤100 posts         ← trumpstruth.org RSS (CNN archive if last_seen not found)
-       5. for each new post, oldest first:
-            translate → send to every subscriber not in in_flight
-            store.save()           → PATCH (last_seen = this post)
+       5. translate + tag every new post   ← one Gemini call per post (free chain on failure)
+       6. send: in_flight post → 🔴 high impact → rest, each oldest first
+            send to every subscriber not in in_flight
+            store.save()           → PATCH (last_seen / sent_ahead)
 ```
 
 - `src/state.py` defines a `StateStore` interface with two backends that store
@@ -257,6 +292,8 @@ BOT-CONTROLS.sh                     gh-cli helper (status / run / logs)
 
 - **Schedule** — edit the `cron` expression in `trump-check.yml`.
 - **Message format** — edit `build_message()` in `src/main.py`.
+- **Tags** — `MARKET_CATEGORIES` (topics and Hebrew labels), `IMPACT_MARKERS`
+  and the classification rules in `GEMINI_SYSTEM_PROMPT`.
 - **Welcome text** — edit `send_welcome()` in `src/main.py`.
 
 ## Requirements

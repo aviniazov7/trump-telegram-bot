@@ -61,6 +61,10 @@ class BotState:
     # Fingerprint of the bot menu config last applied to Telegram, so the
     # menu is reset only when that config (or the bot token) changes.
     menu_config: str = ""
+    # Posts newer than last_seen that were already sent out of order (a
+    # high-impact post jumps the queue). last_seen can only move past a post
+    # once everything older is sent too, so these are skipped meanwhile.
+    sent_ahead: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:
         data: dict = {
@@ -75,6 +79,8 @@ class BotState:
             data["in_flight"] = {"post": self.in_flight_post, "chats": sorted(self.in_flight_chats)}
         if self.menu_config:
             data["menu_config"] = self.menu_config
+        if self.sent_ahead:
+            data["sent_ahead"] = list(self.sent_ahead)
         return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
     @classmethod
@@ -102,6 +108,10 @@ class BotState:
         except (TypeError, ValueError) as exc:
             raise StateError("State 'last_update_id' must be an integer") from exc
 
+        sent_ahead = data.get("sent_ahead") or []
+        if not isinstance(sent_ahead, list):
+            raise StateError("State 'sent_ahead' must be a list")
+
         in_flight = data.get("in_flight") or {}
         if not isinstance(in_flight, dict) or not isinstance(in_flight.get("chats", []), list):
             raise StateError("State 'in_flight' must be {post, chats: [...]}")
@@ -112,6 +122,7 @@ class BotState:
             in_flight_post=str(in_flight.get("post") or ""),
             in_flight_chats=[str(c) for c in in_flight.get("chats", [])],
             menu_config=str(data.get("menu_config") or ""),
+            sent_ahead=[str(i) for i in sent_ahead],
         )
 
     def copy(self) -> "BotState":
@@ -122,6 +133,7 @@ class BotState:
             in_flight_post=self.in_flight_post,
             in_flight_chats=list(self.in_flight_chats),
             menu_config=self.menu_config,
+            sent_ahead=list(self.sent_ahead),
         )
 
 

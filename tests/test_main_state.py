@@ -60,6 +60,7 @@ class MainTestCase(unittest.TestCase):
             mock.patch.object(main, "TELEGRAM_BOT_TOKEN", "t"),
             mock.patch.object(main, "TELEGRAM_CHAT_ID", ""),
             mock.patch.object(main, "DATA_DIR", self.data),
+            mock.patch.object(main, "GEMINI_API_KEY", ""),
             mock.patch.object(main, "store_from_env", return_value=self.store),
             mock.patch.object(main, "clear_bot_menu"),
             mock.patch.object(main, "send_welcome"),

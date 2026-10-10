@@ -117,6 +117,7 @@ class BroadcastTests(unittest.TestCase):
             mock.patch.object(main, "TELEGRAM_BOT_TOKEN", "t"),
             mock.patch.object(main, "TELEGRAM_CHAT_ID", ""),
             mock.patch.object(main, "DATA_DIR", self.data),
+            mock.patch.object(main, "GEMINI_API_KEY", ""),
             mock.patch.object(main, "store_from_env", return_value=self.store),
             mock.patch.object(main, "clear_bot_menu"),
             mock.patch.object(main, "get_telegram_updates", return_value=[]),
@@ -171,8 +172,8 @@ class BroadcastTests(unittest.TestCase):
 
     def test_budget_stop_mid_broadcast_resumes_next_run(self):
         self.store.save(BotState(subscribers={"a": None, "b": None}, last_seen="1"))
-        # Budget checks: before post 2, before chat a, then exceeded before chat b.
-        with mock.patch.object(main, "_budget_exceeded", side_effect=[False, False, False, True]):
+        # The budget runs out right after chat a got the post.
+        with mock.patch.object(main, "_budget_exceeded", side_effect=lambda: len(self.sends) >= 1):
             self.run_main(self.posts("2", "1"))
         self.assertEqual(self.sends, [("a", "number-2")])
         saved = self.store.load()

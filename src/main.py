@@ -583,15 +583,53 @@ Translation rules:
 - Stay politically neutral. You render his words; you neither endorse nor
   criticize them. Add no commentary, disclaimers, or quotation marks.
 
-Return JSON only, matching the response schema. "hebrew" is the translation.
+Market classification (judge the English original):
+- "categories": every topic that applies, from: tariffs (tariffs, trade
+  deals, import duties), fed_rates (the Federal Reserve, its chair, interest
+  rates), oil (oil, gas, OPEC, energy supply), crypto (cryptocurrencies,
+  stablecoins, digital assets), china (China, Xi, Chinese companies), stocks
+  (the stock market or specific listed companies). Use "other" only when none
+  of these applies.
+- "impact": how likely the post is to move financial markets in the coming
+  hours.
+  high   = a concrete new action, threat, or deadline with market consequences:
+           new, raised, paused, or removed tariffs; a direct demand on the Fed
+           over rates; sanctions or moves affecting oil supply; crypto policy;
+           a deal or rupture with China; a statement that targets a specific
+           listed company.
+  medium = market-related commentary without a concrete new action: praising
+           the stock market, criticizing the Fed in general terms, repeating
+           known trade positions.
+  low    = no plausible market effect: campaigning, endorsements, media or
+           personal attacks, greetings.
+
+Return JSON only, matching the response schema.
 """
+
+# Machine keys → Hebrew hashtag labels, in display order.
+MARKET_CATEGORIES: dict[str, str] = {
+    "tariffs": "מכסים",
+    "fed_rates": "ריבית_הפד",
+    "oil": "נפט",
+    "crypto": "קריפטו",
+    "china": "סין",
+    "stocks": "מניות",
+    "other": "כללי",
+}
+IMPACT_LEVELS = ("high", "medium", "low")
 
 GEMINI_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "OBJECT",
     "properties": {
         "hebrew": {"type": "STRING", "description": "The full Hebrew translation"},
+        "categories": {
+            "type": "ARRAY",
+            "items": {"type": "STRING", "enum": list(MARKET_CATEGORIES)},
+        },
+        "impact": {"type": "STRING", "enum": list(IMPACT_LEVELS)},
     },
-    "required": ["hebrew"],
+    "required": ["hebrew", "categories", "impact"],
+    "propertyOrdering": ["hebrew", "categories", "impact"],
 }
 
 
@@ -693,6 +731,100 @@ TRANSLATE_PROVIDERS: list[tuple[str, Any, int]] = [
     ("gemini", _translate_gemini, GEMINI_MAX_CHARS),
     *FREE_TRANSLATE_PROVIDERS,
 ]
+
+# ---------------------------------------------------------------------------
+# Market-impact tagging
+# ---------------------------------------------------------------------------
+
+_CATEGORY_ALIASES = {
+    "tariff": "tariffs", "trade": "tariffs",
+    "fed": "fed_rates", "rates": "fed_rates", "interest_rates": "fed_rates", "fed/rates": "fed_rates",
+    "energy": "oil", "stock": "stocks", "stock_market": "stocks",
+}
+
+# Used only when Gemini can't classify a post. It finds topics, but can't
+# judge impact, so a keyword match never earns a 🔴.
+_KEYWORD_CATEGORIES: dict[str, re.Pattern[str]] = {
+    "tariffs": re.compile(r"\btariffs?\b|\bduties\b|trade (?:deal|war|deficit)|reciprocal", re.I),
+    "fed_rates": re.compile(r"\bthe fed\b|federal reserve|\bpowell\b|interest rates?|rate cuts?", re.I),
+    "oil": re.compile(r"\boil\b|\bopec\b|\bcrude\b|gasoline|drill(?:ing)?\b|\bnatural gas\b", re.I),
+    "crypto": re.compile(r"crypto|bitcoin|\bbtc\b|stablecoin|digital assets?|blockchain", re.I),
+    "china": re.compile(r"\bchina\b|\bchinese\b|\bxi\b|beijing", re.I),
+    "stocks": re.compile(r"stock market|\bstocks?\b|\bdow\b|nasdaq|s&p|wall street|all[- ]time high", re.I),
+}
+
+
+def parse_market_tags(data: Any) -> tuple[list[str], str | None]:
+    """Validate Gemini's categories and impact.
+
+    Unknown categories are dropped, aliases mapped, duplicates removed and the
+    result put in display order; "other" is dropped when a real topic is
+    present. Returns ``([], None)``-ish values the caller can fall back from.
+    """
+    if not isinstance(data, dict):
+        return [], None
+    found: set[str] = set()
+    raw = data.get("categories")
+    if isinstance(raw, str):
+        raw = [raw]
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            key = item.strip().lower().replace(" ", "_").replace("-", "_")
+            key = _CATEGORY_ALIASES.get(key, key)
+            if key in MARKET_CATEGORIES:
+                found.add(key)
+    if len(found) > 1:
+        found.discard("other")
+    categories = [c for c in MARKET_CATEGORIES if c in found]
+
+    impact = data.get("impact")
+    impact = impact.strip().lower() if isinstance(impact, str) else None
+    return categories, impact if impact in IMPACT_LEVELS else None
+
+
+def keyword_categories(text: str) -> list[str]:
+    """Best-effort topics from keywords, for when Gemini is unavailable."""
+    found = [key for key, pattern in _KEYWORD_CATEGORIES.items() if pattern.search(text)]
+    return found or ["other"]
+
+
+@dataclass
+class PostAnalysis:
+    hebrew: str
+    translated: bool
+    categories: list[str]
+    impact: str | None    # None when Gemini couldn't classify the post
+    provider: str = ""
+
+
+def analyze_post(text: str) -> PostAnalysis:
+    """Translate a post and tag its market impact, with one Gemini call.
+
+    Falls back to the free translation chain plus keyword topics (no impact
+    level) when Gemini is not configured or fails.
+    """
+    if GEMINI_API_KEY and _needs_translation(text) and len(text) <= GEMINI_MAX_CHARS:
+        try:
+            data = _gemini_json(text)
+        except GeminiError as exc:
+            log.warning("Translation provider gemini failed: %s", exc)
+        else:
+            hebrew = data.get("hebrew")
+            hebrew = hebrew.strip() if isinstance(hebrew, str) else ""
+            if _looks_translated(text, hebrew):
+                categories, impact = parse_market_tags(data)
+                if not categories:
+                    categories, impact = keyword_categories(text), None
+                log.info("Translated and tagged post via gemini: %s, impact=%s",
+                         ",".join(categories), impact)
+                return PostAnalysis(hebrew, True, categories, impact, "gemini")
+            log.warning("Translation provider gemini returned %s",
+                        "no answer" if not hebrew else "untranslated text")
+
+    hebrew, translated = translate_to_hebrew(text, FREE_TRANSLATE_PROVIDERS)
+    return PostAnalysis(hebrew, translated, keyword_categories(text), None, "free" if translated else "")
 
 
 def _translate_with_provider(
@@ -946,12 +1078,41 @@ def _parse_iso(date_str: str) -> datetime:
     return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
 
 
-def build_message(post: dict[str, Any], hebrew: str, translated: bool = True) -> str:
+IMPACT_MARKERS = {
+    "high": "🔴 <b>השפעה גבוהה על השווקים</b>",
+    "medium": "🟠 השפעה בינונית על השווקים",
+    "low": "⚪ השפעה נמוכה על השווקים",
+}
+
+
+def build_tag_line(categories: list[str] | None, impact: str | None) -> str:
+    """The first line of a message: impact marker and topic hashtags.
+
+    Single line, so _split_for_telegram never cuts through its <b> tag.
+    """
+    labels = [MARKET_CATEGORIES[c] for c in (categories or []) if c in MARKET_CATEGORIES]
+    tags = " ".join(f"#{label}" for label in labels)
+    marker = IMPACT_MARKERS.get(impact or "")
+    if marker and tags:
+        return f"{marker} · {tags}"
+    if marker:
+        return marker
+    return f"🏷️ {tags}" if tags else ""
+
+
+def build_message(
+    post: dict[str, Any],
+    hebrew: str,
+    translated: bool = True,
+    categories: list[str] | None = None,
+    impact: str | None = None,
+) -> str:
     """Build the Telegram message in HTML format — English text + Hebrew translation.
 
     When ``translated`` is False the translation providers all failed, so the
     post goes out with a notice instead of the English original repeated under
-    a "תרגום לעברית" heading.
+    a "תרגום לעברית" heading. ``categories``/``impact`` add the market tag line
+    on top (see build_tag_line).
     """
     original = html.escape(post["text"])
     timestamp = format_timestamp(post["created_at"])
@@ -967,8 +1128,10 @@ def build_message(post: dict[str, Any], hebrew: str, translated: bool = True) ->
             "⚠️ <b>התרגום לעברית נכשל כרגע — הפוסט מוצג באנגלית בלבד.</b>\n"
         )
 
+    tag_line = build_tag_line(categories, impact)
     msg = (
-        "🇺🇸 <b>טראמפ — פוסט חדש</b>\n"
+        (f"{tag_line}\n" if tag_line else "")
+        + "🇺🇸 <b>טראמפ — פוסט חדש</b>\n"
         f"🕐 {timestamp}\n"
         "\n"
         f"{original}\n"
@@ -1383,6 +1546,48 @@ def broadcast_post(state: BotState, post: dict[str, Any], message: str) -> bool:
     return True
 
 
+def advance_cursor(state: BotState, chronological_ids: list[str], sent_id: str = "") -> None:
+    """Record ``sent_id`` as broadcast and move last_seen as far as it can go.
+
+    Posts can go out of order (high impact first), but last_seen means
+    "everything up to here is done", so it only moves past a post once all
+    older new posts are sent too. Posts sent ahead of it wait in
+    state.sent_ahead and are skipped until the cursor catches up.
+    """
+    done = set(state.sent_ahead)
+    if sent_id:
+        done.add(sent_id)
+    ids = chronological_ids
+    if state.last_seen in ids:
+        ids = ids[ids.index(state.last_seen) + 1:]
+    for post_id in ids:
+        if post_id not in done:
+            break
+        state.last_seen = post_id
+        done.discard(post_id)
+    # Keep only IDs still ahead of the cursor; anything else is stale.
+    state.sent_ahead = [i for i in chronological_ids if i in done]
+    if sent_id and state.in_flight_post == sent_id:
+        state.in_flight_post, state.in_flight_chats = "", []
+
+
+def send_order(prepared: list[tuple[dict[str, Any], str, PostAnalysis]], in_flight: str) -> list:
+    """Order prepared posts for sending.
+
+    1. A post whose broadcast was interrupted, so its progress isn't lost.
+    2. High-impact posts, oldest first — market-moving news can't wait
+       behind a backlog of campaign posts.
+    3. Everything else, oldest first.
+    """
+    def rank(item: tuple[dict[str, Any], str, PostAnalysis]) -> int:
+        post, _, analysis = item
+        if post["id"] == in_flight:
+            return 0
+        return 1 if analysis.impact == "high" else 2
+
+    return sorted(prepared, key=rank)  # stable: keeps chronological order
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -1461,34 +1666,50 @@ def main() -> None:
 
     log.info("Broadcasting %d new post(s) to %d subscriber(s)", len(new_posts), len(subscribers))
 
-    # Oldest first. State is saved after every post, so a run that dies or
-    # runs out of time never re-sends what it already finished.
-    latest_id = ""
+    chronological_ids = [p["id"] for p in new_posts]
+    advance_cursor(state, chronological_ids)
+    already_sent = set(state.sent_ahead)
+
+    # Translate and classify everything first, so high-impact posts can be
+    # sent ahead of the rest of a backlog.
+    prepared: list[tuple[dict[str, Any], str, PostAnalysis]] = []
+    for post in new_posts:
+        if post["id"] in already_sent:
+            continue
+        if _budget_exceeded():
+            log.warning("Budget exceeded while translating — sending what is ready")
+            break
+        log.info("Processing post %s", post["id"])
+        analysis = analyze_post(post["text"])
+        message = build_message(post, analysis.hebrew, analysis.translated,
+                                analysis.categories, analysis.impact)
+        prepared.append((post, message, analysis))
+
+    # State is saved after every post, so a run that dies or runs out of time
+    # never re-sends what it already finished.
+    sent = 0
     try:
-        for post in new_posts:
+        for post, message, analysis in send_order(prepared, state.in_flight_post):
             if _budget_exceeded():
                 log.warning("Budget exceeded — stopping at post %s to avoid overlapping next cron", post["id"])
                 break
-
-            log.info("Processing post %s", post["id"])
-            hebrew, translated = translate_to_hebrew(post["text"])
-            message = build_message(post, hebrew, translated)
-
+            if analysis.impact == "high":
+                log.info("Post %s is high-impact — sending first", post["id"])
             if not broadcast_post(state, post, message):
                 break
-            state.last_seen = post["id"]
-            state.in_flight_post, state.in_flight_chats = "", []
+            advance_cursor(state, chronological_ids, post["id"])
             persist()
-            latest_id = post["id"]
+            sent += 1
 
-            if len(new_posts) > 1:
+            if len(prepared) > 1:
                 time.sleep(1)
     finally:
         # Also covers an interrupted broadcast: its in-flight progress is
         # saved so the next run skips the chats that already have the post.
         persist()
 
-    log.info("Done — processed up to post %s", latest_id or "(none)")
+    log.info("Done — sent %d post(s), last_seen=%s, %d sent ahead",
+             sent, state.last_seen or "(none)", len(state.sent_ahead))
 
 
 if __name__ == "__main__":
