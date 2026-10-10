@@ -32,3 +32,4 @@ coverage/
 !.dev.vars.example
 .env
 .env.*
+dist/

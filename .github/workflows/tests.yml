@@ -11,48 +11,61 @@ permissions:
   contents: read
 
 jobs:
-  unittest:
+  worker:
+    name: Worker (lint, types, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Secret scan (every tracked file)
+        run: bash scripts/check-secrets.sh --all
+      - name: Lint + typecheck
+        run: npm run lint
+      - name: Tests with coverage
+        run: npm run coverage
+      - name: Bundle check (no Cloudflare account needed)
+        run: npx wrangler deploy --dry-run --outdir dist
+      - name: Build badge data
+        run: |
+          node -e '
+            const pct = require("./coverage/coverage-summary.json").total.lines.pct;
+            const color = pct >= 90 ? "brightgreen" : pct >= 80 ? "green" : pct >= 70 ? "yellow" : "red";
+            const badge = { schemaVersion: 1, label: "coverage", message: `${Math.floor(pct)}%`, color };
+            require("fs").writeFileSync("coverage-badge.json", JSON.stringify(badge));
+            console.log(badge);
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-badge
+          path: coverage-badge.json
+          retention-days: 7
+
+  legacy:
+    name: Legacy Python bot
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: legacy
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # The bot itself is stdlib-only; coverage is a test-time tool.
-      - name: Install test tools
-        working-directory: legacy
-        run: pip install -r requirements-dev.txt
-      - name: Run tests with coverage
-        working-directory: legacy
-        run: coverage run -m unittest discover -s tests -v
-      - name: Coverage report
-        working-directory: legacy
-        run: |
-          coverage report -m | tee -a "$GITHUB_STEP_SUMMARY"
-          coverage json -q -o coverage.json
-      - name: Build badge data
-        working-directory: legacy
-        run: |
-          python - <<'EOF'
-          import json
-          pct = json.load(open("coverage.json"))["totals"]["percent_covered"]
-          color = "brightgreen" if pct >= 90 else "green" if pct >= 80 else "yellow" if pct >= 70 else "red"
-          badge = {"schemaVersion": 1, "label": "coverage", "message": f"{pct:.0f}%", "color": color}
-          json.dump(badge, open("coverage-badge.json", "w"))
-          print(badge)
-          EOF
-      - uses: actions/upload-artifact@v4
-        with:
-          name: coverage-badge
-          path: legacy/coverage-badge.json
-          retention-days: 7
+      - run: pip install -r requirements-dev.txt
+      - run: coverage run -m unittest discover -s tests -v
+      - run: coverage report -m
 
   # Publishes coverage-badge.json to the orphan `badges` branch, which the
-  # README badge reads through shields.io. The branch holds a single commit
-  # that is force-replaced each time, so main's history stays clean.
+  # README badge reads through shields.io. One commit, force-replaced, so
+  # main's history stays clean.
   badge:
-    needs: unittest
+    needs: worker
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5

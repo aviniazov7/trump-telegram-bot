@@ -1,0 +1,61 @@
+name: Deploy Worker
+
+# Optional continuous deployment. Does nothing until you add the repository
+# secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID (see README → Deploy).
+# Runs in the `production` environment: add required reviewers there
+# (Settings → Environments → production) to approve every deploy by hand.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'wrangler.toml'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      HAS_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+    steps:
+      - name: Skip when Cloudflare isn't configured
+        if: env.HAS_TOKEN != 'true'
+        run: echo "::notice::CLOUDFLARE_API_TOKEN is not set — skipping deploy."
+      - uses: actions/checkout@v4
+        if: env.HAS_TOKEN == 'true'
+      - uses: actions/setup-node@v4
+        if: env.HAS_TOKEN == 'true'
+        with:
+          node-version: '22'
+          cache: npm
+      - if: env.HAS_TOKEN == 'true'
+        run: npm ci
+      - name: Refuse to deploy with a placeholder KV namespace id
+        if: env.HAS_TOKEN == 'true'
+        run: |
+          if grep -q 'REPLACE_WITH_KV_NAMESPACE_ID' wrangler.toml; then
+            echo "::error::Set the KV namespace id in wrangler.toml first (README → Setup)."
+            exit 1
+          fi
+      - name: Tests
+        if: env.HAS_TOKEN == 'true'
+        run: npm test
+      - name: Deploy
+        if: env.HAS_TOKEN == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.141.0'
+          command: deploy
