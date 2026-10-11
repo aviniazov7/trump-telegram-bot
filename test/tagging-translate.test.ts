@@ -91,9 +91,9 @@ describe("analyzePost", () => {
     expect((await analyzePost(ctx, ENGLISH)).hebrew).toBe(HEBREW);
   });
 
-  it("uses keyword topics (and no impact) when Gemini's tags are invalid", async () => {
+  it("uses keyword topics when Gemini's tags are invalid (tariffs → at least 🟠)", async () => {
     const ctx = testCtx({ [GEMINI]: answer({ hebrew: HEBREW, categories: ["weather"], impact: "high" }) });
-    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ categories: ["tariffs", "china"], impact: null });
+    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ categories: ["tariffs", "china"], impact: "medium" });
   });
 
   it.each([
@@ -104,14 +104,29 @@ describe("analyzePost", () => {
     ["a blocked prompt", () => json({ promptFeedback: { blockReason: "SAFETY" } })],
   ])("falls back to the free chain after %s", async (_name, gemini) => {
     const ctx = testCtx({ [GEMINI]: gemini, [GTX]: gtxOk });
-    expect(await analyzePost(ctx, ENGLISH)).toEqual({
+    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({
       hebrew: HEBREW,
       translated: true,
       categories: ["tariffs", "china"],
-      impact: null,
+      impact: "medium", // keyword topics + impact floor, even without Gemini
       provider: "free",
     });
-    expect(ctx.hosts()).toEqual([GEMINI, GTX]);
+    expect(ctx.hosts().filter((h) => h !== GEMINI)).toEqual([GTX]);
+  });
+
+  it("retries a Gemini 5xx once, and records why it gave up", async () => {
+    const ctx = testCtx({ [GEMINI]: fail503, [GTX]: gtxOk });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(ctx.hosts()).toEqual([GEMINI, GEMINI, GTX]);
+    expect(ctx.sleeps).toEqual([2000]);
+    expect(result.geminiError).toContain("HTTP 503");
+  });
+
+  it("recovers when the 5xx retry succeeds", async () => {
+    const ctx = testCtx({
+      [GEMINI]: (_c, n) => (n === 0 ? fail503() : json(geminiAnswer({ hebrew: HEBREW, categories: ["tariffs"], impact: "high" }))),
+    });
+    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ provider: "gemini", impact: "high" });
   });
 
   it("waits out a short Gemini 429 once", async () => {
