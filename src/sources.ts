@@ -140,45 +140,83 @@ async function readPrefix(res: Response, maxBytes: number): Promise<string> {
   return new TextDecoder().decode(buf);
 }
 
+/**
+ * trumpstruth.org serves its feed through a CDN cache that kept copies up to
+ * ~110 minutes old (cf-cache-status: HIT, age: 6558) — the real cause of
+ * 80–100 min delivery delays. A unique query string makes the CDN pass the
+ * request to the origin (cf-cache-status: DYNAMIC, age: 0).
+ */
+export function freshRssUrl(now: number): string {
+  return `${TRUMPSTRUTH_RSS}?_=${Math.floor(now / 1000)}`;
+}
+
+const NO_CACHE = { "Cache-Control": "no-cache", Pragma: "no-cache" };
+
 export async function fetchRss(ctx: Ctx): Promise<Post[]> {
-  const res = await ctx.http(TRUMPSTRUTH_RSS, { headers: { "User-Agent": USER_AGENT } });
+  const res = await ctx.http(freshRssUrl(ctx.now()), { headers: { "User-Agent": USER_AGENT, ...NO_CACHE } });
   if (!res.ok) throw new Error(`RSS HTTP ${res.status}`);
   return parseRss(await res.text(), ctx.cfg.maxScanPosts);
 }
 
-export async function fetchCnn(ctx: Ctx): Promise<Post[]> {
+/**
+ * Bytes of the CNN archive read every run as a second, independent source:
+ * enough for its newest ~30 posts, cheap enough for the free plan's CPU.
+ */
+export const CNN_FRESH_BYTES = 64 * 1024;
+
+export async function fetchCnn(ctx: Ctx, bytes = CNN_READ_BYTES): Promise<Post[]> {
   const res = await ctx.http(CNN_ARCHIVE_JSON, {
-    headers: { "User-Agent": USER_AGENT, Range: `bytes=0-${CNN_READ_BYTES - 1}` },
+    headers: { "User-Agent": USER_AGENT, Range: `bytes=0-${bytes - 1}`, ...NO_CACHE },
   });
   if (!res.ok) throw new Error(`CNN HTTP ${res.status}`);
-  return parseCnnArchive(await readPrefix(res, CNN_READ_BYTES), ctx.cfg.maxScanPosts);
+  return parseCnnArchive(await readPrefix(res, bytes), ctx.cfg.maxScanPosts);
+}
+
+/** Union of two newest-first lists by post ID; the first list wins on duplicates. */
+export function mergePosts(primary: Post[], secondary: Post[]): Post[] {
+  const seen = new Set(primary.map((p) => p.id));
+  return newestFirst([...primary, ...secondary.filter((p) => !seen.has(p.id))]);
 }
 
 /**
- * Fetch up to MAX_SCAN_POSTS recent posts, newest first. Uses the CNN archive
- * when the RSS fails, or when its window doesn't reach last_seen. Returns []
- * only when no source could be reached.
+ * Fetch recent posts, newest first, from both sources at once and merge them,
+ * so a post goes out as soon as EITHER source has it:
+ *   - trumpstruth.org RSS (cache-bypassed; up to MAX_SCAN_POSTS, ~a week)
+ *   - the newest ~30 posts of the CNN archive (updated every few minutes)
+ * If last_seen isn't in the merged window, a deeper slice of the CNN archive
+ * is read. Returns [] only when no source could be reached.
  */
 export async function fetchPosts(ctx: Ctx, lastSeen: string): Promise<Post[]> {
-  let posts: Post[] = [];
-  try {
-    posts = newestFirst(await fetchRss(ctx));
-  } catch (err) {
-    ctx.log.warn("trumpstruth.org RSS failed:", err);
-  }
+  const [rss, cnn] = await Promise.allSettled([
+    fetchRss(ctx),
+    ctx.budget.canFetch(2) ? fetchCnn(ctx, CNN_FRESH_BYTES) : Promise.resolve([]),
+  ]);
+  if (rss.status === "rejected") ctx.log.warn("trumpstruth.org RSS failed:", rss.reason);
+  if (cnn.status === "rejected") ctx.log.warn("CNN archive failed:", cnn.reason);
+  const rssPosts = rss.status === "fulfilled" ? newestFirst(rss.value) : [];
+  const cnnPosts = cnn.status === "fulfilled" ? newestFirst(cnn.value) : [];
+
+  // Which source is ahead tells us about source lag; worth a log line.
+  const rssIds = new Set(rssPosts.map((p) => p.id));
+  const newestRss = rssPosts[0]?.id ?? "";
+  const cnnOnly = cnnPosts.filter((p) => !rssIds.has(p.id) && (!newestRss || BigInt(p.id) > BigInt(newestRss)));
+  if (cnnOnly.length) ctx.log.info(`${cnnOnly.length} post(s) seen first in the CNN archive (RSS lagging)`);
+
+  const posts = mergePosts(rssPosts, cnnPosts);
   if (posts.length && (!lastSeen || contains(posts, lastSeen))) return posts;
-  if (posts.length) ctx.log.warn(`last_seen not in the RSS window of ${posts.length} posts — checking the CNN archive`);
+  if (posts.length) ctx.log.warn(`last_seen not in the ${posts.length} newest posts — reading deeper into the CNN archive`);
 
   let archive: Post[] = [];
   if (ctx.budget.canFetch()) {
     try {
       archive = newestFirst(await fetchCnn(ctx));
     } catch (err) {
-      ctx.log.warn("CNN archive fallback failed:", err);
+      ctx.log.warn("CNN archive deep scan failed:", err);
     }
   }
-  if (archive.length && (!posts.length || contains(archive, lastSeen))) return archive;
+  if (archive.length && contains(archive, lastSeen)) return mergePosts(posts, archive);
   if (posts.length) return posts;
+  if (archive.length) return archive;
   ctx.log.error("All post sources failed");
   return [];
 }

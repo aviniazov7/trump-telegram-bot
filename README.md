@@ -32,7 +32,7 @@ it.
                     ┌──────────────────────── Cloudflare Worker ────────────────────────┐
  Cron "*/5 * * * *" ▶│ scheduled() → runCron                                              │
                     │   1. meta ← KV            heartbeat check → ⏰ alert if > 15 min    │
-                    │   2. posts ← trumpstruth RSS (100) │ CNN archive prefix (fallback) │
+                    │   2. posts ← trumpstruth RSS (cache-bypassed) ∪ CNN newest ~30    │
                     │   3. new posts after lastSeen      │ 10 failed runs → 📡 alert      │
                     │   4. analysis ← KV cache │ Gemini (translate + tags) │ free chain   │
                     │   5. order: in progress → 🔴 high → rest (each oldest first)        │
@@ -56,10 +56,23 @@ GitHub Actions: CI only (tests, lint, secret scan) + optional deploy on push to 
   invocation) and stops starting new work after `RUN_TIME_BUDGET_SECONDS`
   (40). Whatever is left continues in the next run, 5 minutes later, so runs
   never overlap.
-- **No missed posts.** The run scans up to 100 recent posts for `lastSeen`.
-  If the RSS window doesn't reach it, it reads the first 512 KB of the 20 MB
-  CNN archive. A full parse would exceed the Workers CPU limit. If `lastSeen`
-  is nowhere to be found, only the newest post is sent, and you get an alert.
+- **Two sources every run.** Each run reads, in parallel, the trumpstruth.org
+  RSS feed (100 posts, about a week) and the newest ~30 posts of the CNN
+  archive (its first 64 KB), and merges them by post ID. A post goes out as
+  soon as **either** source has it.
+- **The RSS is fetched with a cache-busting query string.** The feed sits
+  behind a CDN that served copies up to **~110 minutes old**
+  (`cf-cache-status: HIT`, `age: 6558`), which caused 80–100 minute delays
+  in the dry run. The query string makes the CDN fetch a fresh copy from the
+  origin (`DYNAMIC`, `age: 0`).
+- **Why not Truth Social directly?** Its API
+  (`/api/v1/accounts/…/statuses`) and its RSS answer **403** with a bot
+  challenge, both from a laptop and from Cloudflare's network (tested
+  2026-10-11), so they can't be polled reliably.
+- **No missed posts.** If `lastSeen` isn't in the merged window, the run
+  reads the first 512 KB of the 20 MB CNN archive; a full parse would exceed
+  the Workers CPU limit. If `lastSeen` is nowhere to be found, only the newest
+  post is sent, and you get an alert.
 - **Never twice.** Each post has a send log, `sent:<post>`, mapping each chat
   to its outcome. Before sending, the run **reserves** the batch of chats
   it's about to send to as `sending`. After sending, it records the outcomes.
