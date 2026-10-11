@@ -70,6 +70,13 @@ class FetchPostsTests(unittest.TestCase):
         self.assertEqual([p["id"] for p in posts], ids)
         self.assertEqual(posts[0]["url"], "https://truthsocial.com/@realDonaldTrump/1000")
 
+    def test_rss_bypasses_the_cdn_cache(self):
+        with mock.patch.object(main, "http_get", return_value=rss(["1"])) as get:
+            main.fetch_posts_trumpstruth()
+        url = get.call_args.args[0]
+        self.assertRegex(url, r"^https://www\.trumpstruth\.org/feed\?_=\d+$")
+        self.assertEqual(get.call_args.kwargs["headers"], {"Cache-Control": "no-cache"})
+
     def test_rss_respects_limit(self):
         with mock.patch.object(main, "http_get", return_value=rss(["3", "2", "1"])):
             self.assertEqual(len(main.fetch_posts_trumpstruth(limit=2)), 2)
