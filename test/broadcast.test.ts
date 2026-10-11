@@ -108,8 +108,8 @@ describe("new posts and idempotent delivery", () => {
 
   it("resumes a partial send in the next run without repeating anyone", async () => {
     await seed("1", ["a", "b", "c"]);
-    // Budget for: RSS + Gemini + one send (+2 reserved).
-    const first = setup({ feed: ["2", "1"], cfg: { maxSubrequests: 5 } });
+    // Budget for: RSS + CNN + Gemini + one send (+2 reserved).
+    const first = setup({ feed: ["2", "1"], cfg: { maxSubrequests: 6 } });
     await first.run();
     expect(first.tg.postsTo("a")).toEqual(["2"]);
     expect(first.tg.sent).toHaveLength(1);
@@ -136,7 +136,7 @@ describe("new posts and idempotent delivery", () => {
     const { tg, ctx, run } = setup({ feed: ["2", "1"] });
     await run();
     expect(tg.sent).toEqual([]);
-    expect(ctx.hosts()).toEqual([RSS_HOST]);
+    expect(ctx.hosts().sort()).toEqual([CNN_HOST, RSS_HOST].sort());
   });
 
   it("delivers to the forum topic a group subscribed from", async () => {
@@ -211,8 +211,8 @@ describe("Telegram errors during a broadcast", () => {
 describe("high impact first", () => {
   it("sends a high-impact post ahead of an older backlog, without skipping or repeating", async () => {
     await seed("1", ["a"]);
-    // Room for RSS + 4 Gemini calls + one send.
-    const first = setup({ feed: ["5", "4", "3", "2", "1"], impacts: { "4": "high" }, cfg: { maxSubrequests: 8 } });
+    // Room for RSS + CNN + 4 Gemini calls + one send.
+    const first = setup({ feed: ["5", "4", "3", "2", "1"], impacts: { "4": "high" }, cfg: { maxSubrequests: 9 } });
     await first.run();
     expect(first.tg.postsTo("a")).toEqual(["4"]);
     expect(first.tg.sent[0]?.text.startsWith("🔴")).toBe(true);

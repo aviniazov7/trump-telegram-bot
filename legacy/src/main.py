@@ -234,7 +234,9 @@ def _is_meaningful_text(text: str) -> bool:
 def fetch_posts_trumpstruth(limit: int = MAX_SCAN_POSTS) -> list[dict[str, Any]]:
     """Fetch posts from trumpstruth.org RSS feed (primary source)."""
     log.info("Fetching posts from trumpstruth.org RSS feed")
-    raw = http_get(TRUMPSTRUTH_RSS)
+    # The feed sits behind a CDN cache that served copies up to ~110 min old;
+    # a unique query string makes it fetch a fresh copy from the origin.
+    raw = http_get(f"{TRUMPSTRUTH_RSS}?_={int(time.time())}", headers={"Cache-Control": "no-cache"})
     xml_text = raw.decode("utf-8")
 
     posts: list[dict[str, Any]] = []

@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { type Cursor, advanceCursor, filterNewPosts, sendOrder } from "../src/posts";
 import {
+  CNN_FRESH_BYTES,
+  CNN_READ_BYTES,
   type Post,
   fetchPosts,
+  freshRssUrl,
   leadingJsonObjects,
+  mergePosts,
   newestFirst,
   parseCnnArchive,
   parseRss,
@@ -132,16 +136,53 @@ describe("fetchPosts", () => {
   const cnn = (...list: string[]) => () =>
     new Response(JSON.stringify(list.map((id) => ({ id, content: `CNN post ${id}` }))), { status: 206 });
 
-  it("uses the RSS when it contains lastSeen", async () => {
-    const ctx = testCtx({ [RSS_HOST]: rss("3", "2") });
-    expect(ids(await fetchPosts(ctx, "2"))).toEqual(["3", "2"]);
-    expect(ctx.hosts()).toEqual([RSS_HOST]);
+  it("bypasses the RSS CDN cache with a unique query string", async () => {
+    const ctx = testCtx({ [RSS_HOST]: rss("3", "2") }, {}, { now: () => 1_791_695_630_123 });
+    await fetchPosts(ctx, "2");
+    const call = ctx.calls.find((c) => c.host === RSS_HOST);
+    expect(call?.url).toBe("https://www.trumpstruth.org/feed?_=1791695630");
+    expect(call?.url).toBe(freshRssUrl(1_791_695_630_123));
+    expect(call?.headers.get("Cache-Control")).toBe("no-cache");
   });
 
-  it("reads only a prefix of the CNN archive, with a Range header", async () => {
-    const ctx = testCtx({ [RSS_HOST]: rss("9", "8"), [CNN_HOST]: cnn("9", "8", "7", "6") });
+  it("reads both sources every run, the CNN one as a small prefix", async () => {
+    const ctx = testCtx({ [RSS_HOST]: rss("3", "2"), [CNN_HOST]: cnn("3", "2") });
+    expect(ids(await fetchPosts(ctx, "2"))).toEqual(["3", "2"]);
+    expect(ctx.hosts().sort()).toEqual([CNN_HOST, RSS_HOST].sort());
+    const cnnCall = ctx.calls.find((c) => c.host === CNN_HOST);
+    expect(cnnCall?.headers.get("Range")).toBe(`bytes=0-${CNN_FRESH_BYTES - 1}`);
+  });
+
+  it("delivers a post as soon as the CNN archive has it, even if the RSS lags", async () => {
+    const ctx = testCtx({ [RSS_HOST]: rss("3", "2"), [CNN_HOST]: cnn("5", "4", "3") });
+    expect(ids(await fetchPosts(ctx, "2"))).toEqual(["5", "4", "3", "2"]);
+    expect(ctx.log.lines.join("\n")).toContain("2 post(s) seen first in the CNN archive");
+  });
+
+  it("reads deeper into the archive when lastSeen isn't in either window", async () => {
+    const ctx = testCtx({
+      [RSS_HOST]: rss("9", "8"),
+      [CNN_HOST]: (_c, n) => (n === 0 ? cnn("9", "8")() : cnn("9", "8", "7", "6")()),
+    });
     expect(ids(await fetchPosts(ctx, "6"))).toEqual(["9", "8", "7", "6"]);
-    expect(ctx.calls[1]?.headers.get("Range")).toBe("bytes=0-524287");
+    const cnnCalls = ctx.calls.filter((c) => c.host === CNN_HOST);
+    expect(cnnCalls.map((c) => c.headers.get("Range"))).toEqual([
+      `bytes=0-${CNN_FRESH_BYTES - 1}`,
+      `bytes=0-${CNN_READ_BYTES - 1}`,
+    ]);
+  });
+
+  it("keeps the RSS when the CNN archive is down", async () => {
+    const ctx = testCtx({ [RSS_HOST]: rss("3", "2") });
+    expect(ids(await fetchPosts(ctx, "2"))).toEqual(["3", "2"]);
+  });
+
+  it("mergePosts keeps the first source's copy of a duplicate", () => {
+    const a = [{ ...post("2"), text: "from RSS" }];
+    const b = [{ ...post("3") }, { ...post("2"), text: "from CNN" }];
+    const merged = mergePosts(a, b);
+    expect(ids(merged)).toEqual(["3", "2"]);
+    expect(merged[1]?.text).toBe("from RSS");
   });
 
   it("keeps the RSS when the archive doesn't help", async () => {
