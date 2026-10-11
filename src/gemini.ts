@@ -26,27 +26,32 @@ Translation rules:
 Market classification (judge the English original):
 - "categories": every topic that applies, from: tariffs (tariffs, trade
   deals, import duties), fed_rates (the Federal Reserve, its chair, interest
-  rates), oil (oil, gas, OPEC, energy supply), crypto (cryptocurrencies,
-  stablecoins, digital assets), china (China, Xi, Chinese companies), stocks
-  (the stock market or specific listed companies). Use "other" only when none
-  of these applies.
+  rates), oil (oil, gas, OPEC, energy supply, energy infrastructure, energy
+  prices), geopolitics (wars, ceasefires, truces, peace deals, sanctions,
+  military action; e.g. Russia–Ukraine, Iran, Israel, the Middle East),
+  crypto (cryptocurrencies, stablecoins, digital assets), china (China, Xi,
+  Chinese companies), stocks (the stock market or specific listed companies).
+  Use "other" only when none of these applies.
 - "impact": how likely the post is to move financial markets in the coming
   hours.
   high   = a concrete new action, threat, or deadline with market consequences:
            new, raised, paused, or removed tariffs; a direct demand on the Fed
-           over rates; sanctions or moves affecting oil supply; crypto policy;
-           a deal or rupture with China; a statement that targets a specific
-           listed company.
+           over rates; a ceasefire, truce, peace deal, escalation, or military
+           action in a war; new or lifted sanctions; moves affecting oil or
+           energy supply; crypto policy; a deal or rupture with China; a
+           statement that targets a specific listed company.
   medium = market-related commentary without a concrete new action: praising
            the stock market, criticizing the Fed in general terms, repeating
-           known trade positions.
+           known trade or foreign-policy positions.
   low    = no plausible market effect: campaigning, endorsements, media or
            personal attacks, greetings.
+  A post about war, a ceasefire, energy, oil, sanctions, tariffs, interest
+  rates, or the Fed is NEVER low: it is at least medium.
 
 Return JSON only, matching the response schema.
 `;
 
-export const CATEGORY_KEYS = ["tariffs", "fed_rates", "oil", "crypto", "china", "stocks", "other"] as const;
+export const CATEGORY_KEYS = ["tariffs", "fed_rates", "oil", "geopolitics", "crypto", "china", "stocks", "other"] as const;
 export const IMPACT_LEVELS = ["high", "medium", "low"] as const;
 
 export const GEMINI_RESPONSE_SCHEMA = {
@@ -65,6 +70,8 @@ export const GEMINI_MAX_TOKENS = 8192;
 export const GEMINI_MAX_CHARS = 12_000;
 /** Wait out a free-tier 429 at most this long (the run has ~40 s). */
 export const GEMINI_MAX_RETRY_DELAY_MS = 10_000;
+/** Pause before retrying a 5xx ("model overloaded") once. */
+export const GEMINI_5XX_RETRY_MS = 2_000;
 const GEMINI_TIMEOUT_MS = 30_000;
 
 export class GeminiError extends Error {}
@@ -103,6 +110,13 @@ async function request(ctx: Ctx, payload: unknown): Promise<unknown> {
     if (res.status === 429 && attempt === 1 && delay !== null && delay <= GEMINI_MAX_RETRY_DELAY_MS && delay < ctx.budget.msLeft()) {
       ctx.log.warn(`Gemini rate-limited — waiting ${delay / 1000}s as asked`);
       await ctx.sleep(delay);
+      continue;
+    }
+    // 500/503 ("overloaded") are usually momentary: one retry is cheap,
+    // and losing Gemini also loses the impact level.
+    if (res.status >= 500 && attempt === 1 && GEMINI_5XX_RETRY_MS * 2 < ctx.budget.msLeft()) {
+      ctx.log.warn(`Gemini HTTP ${res.status} — retrying once`);
+      await ctx.sleep(GEMINI_5XX_RETRY_MS);
       continue;
     }
     throw new GeminiError(`HTTP ${res.status}: ${detail}`);

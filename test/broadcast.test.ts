@@ -148,6 +148,29 @@ describe("new posts and idempotent delivery", () => {
   });
 });
 
+describe("media-only posts", () => {
+  it("are delivered with a short line and never sent to Gemini", async () => {
+    await seed("1", ["a"]);
+    const tg = new FakeTelegram();
+    const video = '</p><p><a href="https://archive.example/v.mp4">View video</a>';
+    const ctx = testCtx(
+      {
+        [RSS_HOST]: () => new Response(rssFeed(["2", "1"], (id) => (id === "2" ? video : `Post number-${id}`))),
+        [TELEGRAM]: tg.handler,
+      },
+      { maxSubrequests: 200 },
+      { now: () => NOW },
+    );
+    await runCron(ctx, store);
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0]?.text).toContain("🎥 פוסט וידאו ללא טקסט");
+    expect(tg.sent[0]?.text).not.toContain("View video");
+    expect(ctx.hosts()).not.toContain(GEMINI);
+    expect(await store.getAnalysis("2")).toBeNull(); // nothing to cache
+    expect((await store.getMeta()).lastSeen).toBe("2");
+  });
+});
+
 describe("Telegram errors during a broadcast", () => {
   it("unsubscribes chats that blocked the bot and still delivers to the rest", async () => {
     await seed("1", ["a", "b"]);

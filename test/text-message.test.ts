@@ -84,7 +84,7 @@ describe("buildTagLine", () => {
   });
 
   it("shows only topics when impact is unknown", () => {
-    expect(buildTagLine(["oil", "crypto"], null)).toBe("🏷️ #נפט #קריפטו");
+    expect(buildTagLine(["oil", "crypto"], null)).toBe("🏷️ #נפט_ואנרגיה #קריפטו");
   });
 
   it("is empty without valid data", () => {

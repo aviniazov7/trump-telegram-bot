@@ -17,7 +17,7 @@ handles posts, and a webhook handles bot commands.
 
 | | GitHub Actions cron | Cloudflare Cron Trigger |
 |---|---|---|
-| Scheduling | Best effort: `*/10` runs arrived **2.5–8 h** apart | Every 5 minutes, reliably |
+| Scheduling | Best effort: `*/10` runs arrived **2.5–8 h** apart (Oct 11: 4 scheduled runs in 19 h, gaps up to 6 h 56 m, every one successful — GitHub simply didn't start the others) | Every 5 minutes, reliably |
 | Latency to subscribers | Hours | ≤ 5 minutes |
 | `/start` handling | Polled on the next run (hours) | Webhook: instant |
 | State | One JSON variable through the REST API, 48 KB cap, needs a PAT | Workers KV, no PAT |
@@ -121,8 +121,9 @@ broadcast-only and shows no command menu.
 
 One Gemini call per post (`GEMINI_API_KEY`, model `gemini-3.8-flash`)
 returns the Hebrew translation, the **topics** (`tariffs`, `fed_rates`,
-`oil`, `crypto`, `china`, `stocks`, `other`) and the **impact**
-(`high`/`medium`/`low`) as schema-checked JSON. The prompt asks for an
+`oil` (incl. energy), `geopolitics` (war, ceasefire, sanctions), `crypto`,
+`china`, `stocks`, `other`) and the **impact** (`high`/`medium`/`low`) as
+schema-checked JSON. The prompt asks for an
 accurate, complete and neutral translation. It keeps names in
 Israeli-media spelling, and numbers, tickers and URLs as written.
 
@@ -133,10 +134,32 @@ Israeli-media spelling, and numbers, tickers and URLs as written.
 🏷️ #נפט                                       ← Gemini unavailable: keyword topics, no impact
 ```
 
-If Gemini fails (errors, truncated or English answers), the keyless chain
-takes over: Google ×2, Lingva, MyMemory. Every answer must contain real
-Hebrew. If everything fails, the post is sent in English with a clear notice,
-and you get an alert.
+**Impact floor.** Topics are also found by keywords and merged with Gemini's,
+and a post about **tariffs, the Fed/rates, oil/energy or geopolitics is never
+below 🟠**, whatever Gemini answered and even when Gemini is down. Only
+Gemini can award 🔴. This came from the dry run, where "Effective
+immediately, there is an ENERGY CEASEFIRE in the War between Russia and
+Ukraine…" went out as `#כללי` with no impact: Gemini had failed for that post,
+and the keyword fallback didn't know "ceasefire" or "energy".
+
+If Gemini fails (5xx is retried once; errors, truncated or English answers),
+the keyless chain takes over: Google ×2, Lingva, MyMemory. Every answer must
+contain real Hebrew. The reason Gemini wasn't used is stored with the cached
+analysis (`analysis:<post>` → `geminiError`). If everything fails, the post
+is sent in English with a clear notice, and you get an alert.
+
+### Media and quote posts
+
+The archive marks attachments as "View image" / "View video" links and a
+quoted post as "Quoted <author>" plus a `<blockquote>`. The parser separates
+those from the post's own words:
+
+| Post | Message |
+|---|---|
+| Text (with or without media) | Text + Hebrew translation, as usual |
+| Only an image / a video | `🖼️ פוסט תמונה ללא טקסט` / `🎥 פוסט וידאו ללא טקסט` + link. No translation, no Gemini call |
+| Quote of a post that has text | The quoted text (`🔁 Quoting …`) + its translation |
+| Quote of a media-only post | e.g. `🔁 ציטוט של פוסט וידאו של Donald J. Trump` + link |
 
 ## Monitoring
 
