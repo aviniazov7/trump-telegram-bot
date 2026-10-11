@@ -12,7 +12,7 @@
  * run), and alerts the admin.
  */
 import { toHex } from "./log";
-import { buildMessage } from "./message";
+import { buildMessage, translatableText } from "./message";
 import { alertAdmin, checkHeartbeat, recordSourceFailure, recordSuccess } from "./monitor";
 import { advanceCursor, filterNewPosts, sendOrder } from "./posts";
 import type { Ctx } from "./runtime";
@@ -64,6 +64,9 @@ interface Prepared {
 }
 
 type DeliveryOutcome = "done" | "retry-later" | "out-of-budget";
+
+/** A post with no words needs no translation, tags or Gemini call. */
+const MEDIA_ONLY: PostAnalysis = { hebrew: "", translated: true, categories: [], impact: null, provider: "none" };
 
 /** In dry run every preview is logged under this pseudo-chat, never a real one. */
 const DRY_RUN_CHAT = "dry-run";
@@ -242,10 +245,11 @@ async function deliverNewPosts(
   const prepared: Prepared[] = [];
   let untranslated = 0;
   for (const post of todo) {
-    let analysis = await store.getAnalysis(post.id);
+    const text = translatableText(post);
+    let analysis = text ? await store.getAnalysis(post.id) : MEDIA_ONLY;
     if (!analysis) {
       if (ctx.budget.timeUp() || !ctx.budget.canFetch(1 + RESERVED_SUBREQUESTS)) break;
-      analysis = await analyzePost(ctx, post.text);
+      analysis = await analyzePost(ctx, text);
       if (analysis.translated) await store.putAnalysis(post.id, analysis);
       else untranslated += 1;
     }

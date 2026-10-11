@@ -5,11 +5,24 @@
 import type { Ctx } from "./runtime";
 import { isMeaningfulText, stripHtml } from "./text";
 
+export type MediaKind = "image" | "video";
+
+/** A post quoted inside another (a Truth Social "quote post"). */
+export interface Quote {
+  author: string;
+  text: string;
+  media: MediaKind[];
+}
+
 export interface Post {
   id: string;
+  /** The post's own words, without media placeholders or the quoted post. */
   text: string;
   createdAt: string;
   url: string;
+  /** Images/videos attached to the post itself. */
+  media?: MediaKind[];
+  quote?: Quote | null;
 }
 
 export const TRUMPSTRUTH_RSS = "https://www.trumpstruth.org/feed";
@@ -32,26 +45,70 @@ function xmlTag(item: string, tag: string): string {
   return cdata?.[1] ?? content;
 }
 
+// "RT: <url>" marks a re-post. In HTML the URL ends at the next tag; the
+// CNN archive glues it to the following text ("…/1174198068520301149 9%"),
+// so there only an exact Truth Social status URL (18-digit ID) is removed.
+const RT_HTML_RE = /RT:\s*https?:\/\/[^\s<]+/gi;
+const RT_TEXT_RE = /RT:\s*https?:\/\/truthsocial\.com\/(?:users\/[^/\s]+\/statuses|@[^/\s]+)\/\d{18}/gi;
+const MEDIA_LINK_RE = /<a\b[^>]*>\s*View (image|video|media)\s*<\/a>/gi;
+
+/** Split trumpstruth's post HTML into own text, media and the quoted post. */
+export function parseTruthHtml(html: string): { text: string; media: MediaKind[]; quote: Quote | null } {
+  let body = html.replace(RT_HTML_RE, "");
+  let quote: Quote | null = null;
+  const quoted = /<blockquote>([\s\S]*?)<\/blockquote>/i.exec(body);
+  const quotedBy = /<p>\s*Quoted\s*([\s\S]*?)<\/p>/i.exec(body);
+  if (quoted) {
+    const inner = parseTruthHtml(quoted[1] ?? "");
+    quote = { author: stripHtml(quotedBy?.[1] ?? ""), text: inner.text, media: [...inner.media, ...(inner.quote?.media ?? [])] };
+    body = body.replace(quoted[0], "");
+  }
+  if (quotedBy) body = body.replace(quotedBy[0], "");
+  const media: MediaKind[] = [];
+  body = body.replace(MEDIA_LINK_RE, (_m, kind: string) => {
+    media.push(kind.toLowerCase() === "video" ? "video" : "image");
+    return "";
+  });
+  return { text: stripHtml(body), media, quote };
+}
+
+/** Worth sending: own text, quoted text, or at least an image/video. */
+export function hasContent(post: Pick<Post, "text" | "media" | "quote">): boolean {
+  return (
+    isMeaningfulText(post.text) ||
+    Boolean(post.quote?.text) ||
+    Boolean(post.media?.length) ||
+    Boolean(post.quote?.media.length)
+  );
+}
+
 export function parseRss(xml: string, limit: number): Post[] {
   const posts: Post[] = [];
   for (const match of xml.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
     const item = match[1] ?? "";
-    const title = xmlTag(item, "title");
     const description = xmlTag(item, "description");
     const link = xmlTag(item, "link") || xmlTag(item, "guid");
-    const text = stripHtml(description || title);
-    if (!isMeaningfulText(text)) continue;
-    const originalId = xmlTag(item, "truth:originalId");
-    posts.push({
-      id: originalId || (link ? (link.replace(/\/+$/, "").split("/").pop() ?? "") : ""),
-      text,
+    // Titles of text-less posts are placeholders ("Video post from …"), so
+    // the title is only a fallback for an empty description.
+    const parsed = description
+      ? parseTruthHtml(description)
+      : { text: stripHtml(xmlTag(item, "title")), media: [], quote: null };
+    const post: Post = {
+      id: xmlTag(item, "truth:originalId") || (link ? (link.replace(/\/+$/, "").split("/").pop() ?? "") : ""),
+      text: isMeaningfulText(parsed.text) ? parsed.text : "",
       createdAt: xmlTag(item, "pubDate"),
       url: xmlTag(item, "truth:originalUrl") || link,
-    });
+      media: parsed.media,
+      quote: parsed.quote,
+    };
+    if (!hasContent(post)) continue;
+    posts.push(post);
     if (posts.length >= limit) break;
   }
   return posts;
 }
+
+const VIDEO_URL_RE = /\.(mp4|mov|m3u8|webm)(\?|$)/i;
 
 /**
  * Extract the leading top-level objects of a JSON array that may be cut off
@@ -96,16 +153,22 @@ export function parseCnnArchive(text: string, limit: number): Post[] {
   for (const raw of leadingJsonObjects(text, limit * 2)) {
     if (!raw || typeof raw !== "object") continue;
     const item = raw as Record<string, unknown>;
-    const body = String(item.content || item.text || "");
+    const body = String(item.content || item.text || "").replace(RT_TEXT_RE, "");
     const postText = stripHtml(body);
-    if (!isMeaningfulText(postText)) continue;
+    const media: MediaKind[] = (Array.isArray(item.media) ? item.media : [])
+      .filter((m): m is string => typeof m === "string")
+      .map((url) => (VIDEO_URL_RE.test(url) ? "video" : "image"));
     const id = String(item.id ?? "");
-    posts.push({
+    const post: Post = {
       id,
-      text: postText,
+      text: isMeaningfulText(postText) ? postText : "",
       createdAt: String(item.created_at ?? ""),
       url: id ? `${TRUTH_SOCIAL_PROFILE}/${id}` : "",
-    });
+      media,
+      quote: null,
+    };
+    if (!hasContent(post)) continue;
+    posts.push(post);
     if (posts.length >= limit) break;
   }
   return posts;
