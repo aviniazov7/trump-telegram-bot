@@ -75,7 +75,51 @@ export const GEMINI_5XX_RETRY_MS = 2_000;
 /** Time kept back from every Gemini call for sending the post afterwards. */
 export const GEMINI_TIME_RESERVE_MS = 8_000;
 
-export class GeminiError extends Error {}
+export class GeminiError extends Error {
+  /** Set when the model's daily (per-day) free-tier quota is used up. */
+  dailyQuota = false;
+}
+
+export interface QuotaInfo {
+  /** "day" = per-day quota (resets at midnight Pacific), "minute" = per-minute, else unknown. */
+  scope: "day" | "minute" | "unknown";
+  /** e.g. "GenerateRequestsPerDayPerProjectPerModel-FreeTier". */
+  quotaId: string;
+}
+
+/**
+ * Which quota a 429 hit. Google's body carries QuotaFailure details
+ * ("quotaId": "…PerDay…") and a message ("Quota exceeded for metric: …,
+ * limit: …"); the scope is read from either.
+ */
+export function parseQuotaInfo(body: string): QuotaInfo {
+  const quotaId = /"quotaId"\s*:\s*"([^"]+)"/.exec(body)?.[1] ?? /Quota exceeded for metric:\s*([^,\\"]+)/.exec(body)?.[1]?.trim() ?? "";
+  const hay = `${quotaId} ${body}`;
+  const scope = /per_?day|PerDay|requests per day|RPD/i.test(hay)
+    ? "day"
+    : /per_?minute|PerMinute|requests per minute|RPM|TPM/i.test(hay)
+      ? "minute"
+      : "unknown";
+  return { scope, quotaId };
+}
+
+const PACIFIC_CLOCK = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/Los_Angeles",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23",
+});
+
+/** Milliseconds until the Gemini API's daily quotas reset: midnight Pacific time. */
+export function msUntilQuotaReset(now: number): number {
+  const parts = Object.fromEntries(PACIFIC_CLOCK.formatToParts(new Date(now)).map((p) => [p.type, Number(p.value)]));
+  const elapsed = ((parts.hour ?? 0) * 3600 + (parts.minute ?? 0) * 60 + (parts.second ?? 0)) * 1000;
+  return 24 * 3600 * 1000 - elapsed;
+}
+
+/** Thinking settings are for full models; "lite" models are fast without them. */
+export const usesThinking = (model: string): boolean => !/lite/i.test(model);
 
 /** Seconds from a 429's RetryInfo detail ("retryDelay": "23s"), plus one. */
 export function geminiRetryDelayMs(body: string): number | null {
@@ -114,7 +158,16 @@ async function request(ctx: Ctx, model: string, payload: Record<string, unknown>
         throw new GeminiError("response is not JSON");
       }
     }
-    const detail = (await res.text()).slice(0, 300);
+    const fullBody = await res.text();
+    const detail = fullBody.slice(0, 300);
+    if (res.status === 429) {
+      const quota = parseQuotaInfo(fullBody);
+      if (quota.scope === "day") {
+        const err = new GeminiError(`HTTP 429: daily quota exhausted (${quota.quotaId || "per-day limit"})`);
+        err.dailyQuota = true;
+        throw err;
+      }
+    }
     const generationConfig = body.generationConfig as Record<string, unknown> | undefined;
     if (res.status === 400 && attempt === 1 && generationConfig?.thinkingConfig && THINKING_REJECTED_RE.test(detail)) {
       ctx.log.warn(`Gemini ${model} rejected the thinking setting — retrying without it`);
@@ -134,15 +187,18 @@ async function request(ctx: Ctx, model: string, payload: Record<string, unknown>
       await ctx.sleep(GEMINI_5XX_RETRY_MS);
       continue;
     }
-    throw new GeminiError(`HTTP ${res.status}: ${detail}`);
+    const quota = res.status === 429 ? parseQuotaInfo(fullBody) : null;
+    throw new GeminiError(
+      quota?.quotaId ? `HTTP 429: ${quota.scope} quota ${quota.quotaId}` : `HTTP ${res.status}: ${detail}`,
+    );
   }
   throw new GeminiError("gave up after a retry");
 }
 
 /**
  * Ask one Gemini model about one post; returns its parsed JSON answer or
- * throws GeminiError. The thinking level applies to the primary model only;
- * the fallback (a "lite" model) runs with its fast defaults.
+ * throws GeminiError. The thinking level applies to full models only; "lite"
+ * models run with their fast defaults.
  */
 export async function geminiJson(
   ctx: Ctx,
@@ -156,7 +212,7 @@ export async function geminiJson(
     responseMimeType: "application/json",
     responseSchema: GEMINI_RESPONSE_SCHEMA,
   };
-  if (ctx.cfg.geminiThinkingLevel && model === ctx.cfg.geminiModel) {
+  if (ctx.cfg.geminiThinkingLevel && usesThinking(model)) {
     generationConfig.thinkingConfig = { thinkingLevel: ctx.cfg.geminiThinkingLevel };
   }
   const result = (await request(ctx, model, {

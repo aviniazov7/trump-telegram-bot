@@ -41,9 +41,9 @@ export function loadConfig(env: Env): Config {
     // Anything but an explicit "false" keeps shadow mode on: failing safe
     // means previewing to the admin, never double-sending to subscribers.
     dryRun: str(env.DRY_RUN).toLowerCase() !== "false",
-    geminiModel: str(env.GEMINI_MODEL) || "gemini-3.8-flash",
+    geminiModel: str(env.GEMINI_MODEL) || "gemini-3.5-flash-lite",
     geminiThinkingLevel: str(env.GEMINI_THINKING_LEVEL).toLowerCase(),
-    geminiFallbackModel: env.GEMINI_FALLBACK_MODEL === undefined ? "gemini-3.5-flash-lite" : str(env.GEMINI_FALLBACK_MODEL),
+    geminiFallbackModel: env.GEMINI_FALLBACK_MODEL === undefined ? "gemini-3.8-flash" : str(env.GEMINI_FALLBACK_MODEL),
     geminiTimeoutMs: int(env.GEMINI_TIMEOUT_SECONDS, 12) * 1000,
     geminiRetryMs: int(env.GEMINI_RETRY_MINUTES, 15) * 60_000,
     staleAlertMinutes: int(env.STALE_ALERT_MINUTES, 35),
