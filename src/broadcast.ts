@@ -243,13 +243,16 @@ async function deliverNewPosts(
   // Translate and classify first (cached per post), so high-impact posts can
   // jump the queue and a resumed post is sent with identical text.
   const prepared: Prepared[] = [];
-  const gaveUp: { id: string; error: string }[] = [];
+  const gaveUp: { id: string; error: string; quota: boolean }[] = [];
   for (const post of todo) {
     const text = translatableText(post);
     let analysis = text ? await store.getAnalysis(post.id) : MEDIA_ONLY;
     if (!analysis) {
       if (ctx.budget.timeUp() || !ctx.budget.canFetch(1 + RESERVED_SUBREQUESTS)) break;
-      const fresh = await analyzePost(ctx, text);
+      const fresh = await analyzePost(ctx, text, {
+        exhausted: (model) => store.geminiQuotaExhausted(model),
+        markExhausted: (model, reason, seconds) => store.markGeminiQuotaExhausted(model, reason, seconds),
+      });
       if (fresh.outOfTime) break; // not a failure: try again next run
       if (fresh.translated) {
         // The fallback model saved it, but keep the primary's failure too.
@@ -260,7 +263,8 @@ async function deliverNewPosts(
         // Always keep the reason, also when we're about to give up.
         const record = await store.recordGeminiFailure(post.id, ctx.now(), fresh.geminiError ?? "unknown");
         const waited = ctx.now() - record.firstFailureAt;
-        if (ctx.cfg.geminiApiKey && waited < ctx.cfg.geminiRetryMs) {
+        // Waiting is pointless when every model is out of daily quota.
+        if (ctx.cfg.geminiApiKey && !fresh.quotaExhausted && waited < ctx.cfg.geminiRetryMs) {
           ctx.log.warn(
             `Post ${post.id}: no translation yet (${fresh.geminiError}) — retrying next run ` +
               `(${Math.floor(waited / 60_000)}/${ctx.cfg.geminiRetryMs / 60_000} min)`,
@@ -272,20 +276,32 @@ async function deliverNewPosts(
         // Frozen, so every chat gets the same English message.
         await store.putAnalysis(post.id, fresh);
         analysis = fresh;
-        gaveUp.push({ id: post.id, error: fresh.geminiError ?? "unknown" });
+        gaveUp.push({ id: post.id, error: fresh.geminiError ?? "unknown", quota: Boolean(fresh.quotaExhausted) });
       }
     }
     let message = buildMessage(post, analysis);
     if (ctx.cfg.dryRun) message = `🧪 <b>DRY RUN</b> — היה נשלח ל-${subscriberCount} מנויים:\n\n${message}`;
     prepared.push({ post, message, impact: analysis.impact });
   }
-  if (gaveUp.length) {
-    const [first] = gaveUp;
+  const quotaOut = gaveUp.filter((g) => g.quota);
+  if (quotaOut.length) {
+    await alertAdmin(
+      ctx,
+      store,
+      "gemini-quota",
+      `⛽ המכסה היומית החינמית של Gemini נגמרה בכל המודלים — ${quotaOut.length} פוסט(ים) נשלחים באנגלית.\n` +
+        "המכסה מתאפסת בחצות שעון החוף המערבי (10:00 שעון ישראל), ואז התרגום חוזר לבד.",
+      12 * 60,
+    );
+  }
+  const otherFailures = gaveUp.filter((g) => !g.quota);
+  if (otherFailures.length) {
+    const [first] = otherFailures;
     await alertAdmin(
       ctx,
       store,
       "translation",
-      `⚠️ Gemini נכשל במשך ${ctx.cfg.geminiRetryMs / 60_000} דק׳ ב-${gaveUp.length} פוסט(ים) — הם נשלחים באנגלית בלבד.\n` +
+      `⚠️ Gemini נכשל במשך ${ctx.cfg.geminiRetryMs / 60_000} דק׳ ב-${otherFailures.length} פוסט(ים) — הם נשלחים באנגלית בלבד.\n` +
         `סיבה אחרונה: <code>${htmlEscape(scrub(first?.error ?? "").slice(0, 300))}</code>\n` +
         `פרטים: <code>npm run gemini-errors</code> (מפתח gemini-error:${first?.id} ב-KV).`,
     );

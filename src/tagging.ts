@@ -1,5 +1,5 @@
 /** Market-impact tagging, and the per-post analysis that combines it with translation. */
-import { CATEGORY_KEYS, GEMINI_MAX_CHARS, GeminiError, IMPACT_LEVELS, geminiJson } from "./gemini";
+import { CATEGORY_KEYS, GEMINI_MAX_CHARS, GeminiError, IMPACT_LEVELS, geminiJson, msUntilQuotaReset } from "./gemini";
 import type { Ctx } from "./runtime";
 import { looksTranslated, needsTranslation } from "./translate";
 
@@ -121,7 +121,17 @@ export interface PostAnalysis {
   geminiError?: string;
   /** The run ran out of time before Gemini could be asked: not a failure. */
   outOfTime?: boolean;
+  /** Every model's daily quota is used up: retrying before the reset is pointless. */
+  quotaExhausted?: boolean;
 }
+
+/** Remembers which models are out of daily quota (backed by KV in the Worker). */
+export interface QuotaTracker {
+  exhausted(model: string): Promise<string | null>;
+  markExhausted(model: string, reason: string, seconds: number): Promise<void>;
+}
+
+const noQuotaTracking: QuotaTracker = { exhausted: async () => null, markExhausted: async () => {} };
 
 /**
  * Translate and tag a post with Gemini: the primary model first, then the
@@ -130,7 +140,7 @@ export interface PostAnalysis {
  * network — so a failure returns `translated: false` with the reasons, and the
  * caller decides whether to retry next run or send the English original.
  */
-export async function analyzePost(ctx: Ctx, text: string): Promise<PostAnalysis> {
+export async function analyzePost(ctx: Ctx, text: string, quota: QuotaTracker = noQuotaTracking): Promise<PostAnalysis> {
   const untranslated = (geminiError: string, extra: Partial<PostAnalysis> = {}): PostAnalysis => ({
     hebrew: text,
     translated: false,
@@ -145,7 +155,14 @@ export async function analyzePost(ctx: Ctx, text: string): Promise<PostAnalysis>
 
   const models = [...new Set([ctx.cfg.geminiModel, ctx.cfg.geminiFallbackModel].filter(Boolean))];
   const errors: string[] = [];
+  let outOfQuota = 0;
   for (const model of models) {
+    const exhausted = await quota.exhausted(model);
+    if (exhausted) {
+      outOfQuota += 1;
+      errors.push(`${model}: skipped — ${exhausted}`);
+      continue;
+    }
     try {
       const data = await geminiJson(ctx, text, model);
       const hebrew = typeof data.hebrew === "string" ? data.hebrew.trim() : "";
@@ -172,8 +189,14 @@ export async function analyzePost(ctx: Ctx, text: string): Promise<PostAnalysis>
         break;
       }
       errors.push(`${model}: ${err.message}`.slice(0, 300));
+      if (err.dailyQuota) {
+        outOfQuota += 1;
+        // Don't spend calls (and run time) on it again until the reset.
+        await quota.markExhausted(model, err.message, msUntilQuotaReset(ctx.now()) / 1000);
+        ctx.log.warn(`Gemini ${model}: daily quota used up — skipping it until the reset (midnight Pacific)`);
+      }
     }
     ctx.log.warn(`Gemini failed — ${errors.at(-1)}`);
   }
-  return untranslated(errors.join(" | "));
+  return untranslated(errors.join(" | "), outOfQuota === models.length ? { quotaExhausted: true } : {});
 }

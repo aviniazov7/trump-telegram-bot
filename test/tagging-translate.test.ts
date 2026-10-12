@@ -53,8 +53,8 @@ describe("keywordCategories", () => {
   });
 });
 
-const PRIMARY = "gemini-3.8-flash";
-const FALLBACK = "gemini-3.5-flash-lite";
+const PRIMARY = "gemini-3.5-flash-lite";
+const FALLBACK = "gemini-3.8-flash";
 const modelOf = (call: Call) => /models\/([^:]+):/.exec(call.url)?.[1];
 const answer = (data: unknown, finish?: string, thought?: string) => () => json(geminiAnswer(data, finish, thought));
 const good = answer({ hebrew: HEBREW, categories: ["tariffs", "china"], impact: "high" });
@@ -76,7 +76,7 @@ describe("analyzePost (Gemini only)", () => {
     expect(ctx.calls.map(modelOf)).toEqual([PRIMARY]);
   });
 
-  it("sends a well-formed request: key in a header, thinking level on the primary only, capped timeout", async () => {
+  it("sends a well-formed request: key in a header, thinking level on full (non-lite) models only", async () => {
     const ctx = testCtx({ [GEMINI]: byModel(fail503, good) }, { geminiThinkingLevel: "low" });
     await analyzePost(ctx, ENGLISH);
     const [primary, , fallback] = ctx.calls;
@@ -85,9 +85,10 @@ describe("analyzePost (Gemini only)", () => {
     expect(primary?.headers.get("x-goog-api-key")).toBe("test-gemini-key");
     const body = JSON.parse(primary?.body ?? "{}");
     expect(body.systemInstruction.parts[0].text).toContain("Hebrew");
-    expect(body.generationConfig).toMatchObject({ responseMimeType: "application/json", thinkingConfig: { thinkingLevel: "low" } });
+    expect(body.generationConfig).toMatchObject({ responseMimeType: "application/json" });
+    expect(body.generationConfig.thinkingConfig).toBeUndefined(); // lite
     expect(Object.keys(body.generationConfig.responseSchema.properties)).toEqual(["hebrew", "categories", "impact"]);
-    expect(JSON.parse(fallback?.body ?? "{}").generationConfig.thinkingConfig).toBeUndefined();
+    expect(JSON.parse(fallback?.body ?? "{}").generationConfig.thinkingConfig).toEqual({ thinkingLevel: "low" });
   });
 
   it("ignores thought parts", async () => {
@@ -140,10 +141,10 @@ describe("analyzePost (Gemini only)", () => {
             ? new Response('{"error":{"message":"thinking_level is not supported for this model"}}', { status: 400 })
             : good(),
       },
-      { geminiThinkingLevel: "low" },
+      { geminiThinkingLevel: "low", geminiModel: FALLBACK, geminiFallbackModel: "" },
     );
-    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ translated: true, model: PRIMARY });
-    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, PRIMARY]);
+    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ translated: true, model: FALLBACK });
+    expect(ctx.calls.map(modelOf)).toEqual([FALLBACK, FALLBACK]);
   });
 
   it("waits out a short 429 once", async () => {

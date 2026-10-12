@@ -12,6 +12,8 @@
  *                           30 days.
  *   analysis:<postId>       cached translation + tags, so a resumed post is
  *                           sent with the exact same text. Expires after 7 days.
+ *   gemini-quota:<model>    exists while that model's daily free quota is used
+ *                           up; expires at the quota reset (midnight Pacific).
  *   gemini-error:<postId>   every failed Gemini attempt for that post: when it
  *                           first failed and each attempt's reason, per model.
  *                           Expires after 7 days. Read with
@@ -181,6 +183,17 @@ export class Store {
   async putGeminiFailures(record: GeminiFailureRecord): Promise<void> {
     await this.write("gemini error", () =>
       this.kv.put(`gemini-error:${record.postId}`, JSON.stringify(record), { expirationTtl: GEMINI_ERROR_TTL_S }),
+    );
+  }
+
+  /** Why the model's daily quota is marked used up, or null. */
+  async geminiQuotaExhausted(model: string): Promise<string | null> {
+    return this.kv.get(`gemini-quota:${model}`);
+  }
+
+  async markGeminiQuotaExhausted(model: string, reason: string, seconds: number): Promise<void> {
+    await this.write("gemini quota", () =>
+      this.kv.put(`gemini-quota:${model}`, reason, { expirationTtl: Math.max(MIN_TTL_S, Math.ceil(seconds)) }),
     );
   }
 

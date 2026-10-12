@@ -25,12 +25,15 @@ id = "df295f75a67a4a54aa3a2dcb8b71490a"
 # preview, while the legacy GitHub Actions bot keeps serving subscribers.
 # Flip to "false" at cutover (see README → Cutover).
 DRY_RUN = "true"
-GEMINI_MODEL = "gemini-3.8-flash"
-# "low" keeps calls fast (thinking tokens add latency). If a model rejects
-# the setting, the call is retried once without it.
+# Primary: flash-lite. On Oct 12 gemini-3.8-flash's free daily quota ran out
+# (429 "per day") while flash-lite's separate quota was untouched. A model
+# whose daily quota is used up is skipped until the reset (midnight Pacific).
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+# Tried in the same run when the primary fails (and has quota left).
+GEMINI_FALLBACK_MODEL = "gemini-3.8-flash"
+# Applies to full models only ("lite" models are fast by default). If a model
+# rejects the setting, the call is retried once without it.
 GEMINI_THINKING_LEVEL = "low"
-# Tried in the same run when the primary model fails.
-GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 # Per call. On Oct 12 single calls took 30–40 s and ate whole runs.
 GEMINI_TIMEOUT_SECONDS = "12"
 # A post whose translation keeps failing is retried every run for this long,
