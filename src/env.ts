@@ -14,6 +14,9 @@ export interface Env {
   DRY_RUN?: string;
   GEMINI_MODEL?: string;
   GEMINI_THINKING_LEVEL?: string;
+  GEMINI_FALLBACK_MODEL?: string;
+  GEMINI_TIMEOUT_SECONDS?: string;
+  GEMINI_RETRY_MINUTES?: string;
   STALE_ALERT_MINUTES?: string;
   SOURCE_FAILURE_ALERT_RUNS?: string;
   ALERT_REPEAT_MINUTES?: string;

@@ -14,7 +14,8 @@
     "secrets:check": "bash scripts/check-secrets.sh",
     "webhook:set": "node scripts/telegram-webhook.mjs set",
     "webhook:info": "node scripts/telegram-webhook.mjs info",
-    "webhook:delete": "node scripts/telegram-webhook.mjs delete"
+    "webhook:delete": "node scripts/telegram-webhook.mjs delete",
+    "gemini-errors": "node scripts/gemini-errors.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",

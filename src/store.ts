@@ -12,6 +12,10 @@
  *                           30 days.
  *   analysis:<postId>       cached translation + tags, so a resumed post is
  *                           sent with the exact same text. Expires after 7 days.
+ *   gemini-error:<postId>   every failed Gemini attempt for that post: when it
+ *                           first failed and each attempt's reason, per model.
+ *                           Expires after 7 days. Read with
+ *                           `npm run gemini-errors`.
  *   alert:<kind>            exists while that alert is muted (TTL = repeat window)
  *
  * Why the send log is reserved before sending: a KV write can fail (the free
@@ -73,6 +77,18 @@ export interface Subscriber {
 const DAY_S = 24 * 60 * 60;
 export const SENT_TTL_S = 30 * DAY_S;
 export const ANALYSIS_TTL_S = 7 * DAY_S;
+export const GEMINI_ERROR_TTL_S = 7 * DAY_S;
+/** Attempts kept per post (newest last). */
+const GEMINI_ERROR_MAX_ATTEMPTS = 20;
+
+export interface GeminiFailureRecord {
+  postId: string;
+  /** First failed attempt (ms) — the retry window counts from here. */
+  firstFailureAt: number;
+  attempts: { at: number; error: string }[];
+  /** Set once the post went out in English. */
+  gaveUpAt?: number;
+}
 /** KV's minimum expirationTtl. */
 const MIN_TTL_S = 60;
 
@@ -147,6 +163,24 @@ export class Store {
   async putAnalysis(postId: string, analysis: PostAnalysis): Promise<void> {
     await this.write("analysis", () =>
       this.kv.put(`analysis:${postId}`, JSON.stringify(analysis), { expirationTtl: ANALYSIS_TTL_S }),
+    );
+  }
+
+  async getGeminiFailures(postId: string): Promise<GeminiFailureRecord | null> {
+    return this.kv.get<GeminiFailureRecord>(`gemini-error:${postId}`, "json");
+  }
+
+  /** Append one failed attempt (always saved, also when the post is later sent in English). */
+  async recordGeminiFailure(postId: string, at: number, error: string): Promise<GeminiFailureRecord> {
+    const record = (await this.getGeminiFailures(postId)) ?? { postId, firstFailureAt: at, attempts: [] };
+    record.attempts = [...record.attempts, { at, error }].slice(-GEMINI_ERROR_MAX_ATTEMPTS);
+    await this.putGeminiFailures(record);
+    return record;
+  }
+
+  async putGeminiFailures(record: GeminiFailureRecord): Promise<void> {
+    await this.write("gemini error", () =>
+      this.kv.put(`gemini-error:${record.postId}`, JSON.stringify(record), { expirationTtl: GEMINI_ERROR_TTL_S }),
     );
   }
 

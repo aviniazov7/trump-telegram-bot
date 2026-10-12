@@ -148,6 +148,98 @@ describe("new posts and idempotent delivery", () => {
   });
 });
 
+describe("Gemini failures", () => {
+  const MIN = 60_000;
+  const fail = () => new Response('{"error":{"code":503,"message":"The model is overloaded."}}', { status: 503 });
+  const translate = (call: { body: string }) => {
+    const text = JSON.parse(call.body).contents[0].parts[0].text as string;
+    const id = /number-(\w+)/.exec(text)?.[1] ?? "";
+    return json(geminiAnswer({ hebrew: `תרגום של פוסט number-${id}`, categories: ["other"], impact: "low" }));
+  };
+  const alerts = (tg: FakeTelegram) => tg.sent.filter((s) => s.chat === "999" && s.text.includes("Gemini נכשל"));
+  const runAt = async (minutes: number, gemini: Handler) => {
+    const s = setup({ feed: ["2", "1"], now: NOW + minutes * MIN, gemini });
+    await s.run();
+    return s;
+  };
+
+  it("retries every run for 15 minutes, then sends in English with one alert, saving every reason", async () => {
+    await seed("1", ["a"]);
+    for (const minute of [0, 5, 10]) {
+      const r = await runAt(minute, fail);
+      expect(r.tg.sent).toEqual([]); // held back, not sent in English yet
+    }
+    const last = await runAt(15, fail);
+    expect(last.tg.postsTo("a")).toEqual(["2"]);
+    expect(last.tg.sent.find((s) => s.chat === "a")?.text).toContain("התרגום לעברית נכשל");
+    expect(alerts(last.tg)).toHaveLength(1);
+    expect(alerts(last.tg)[0]?.text).toContain("overloaded");
+
+    const record = await store.getGeminiFailures("2");
+    expect(record?.firstFailureAt).toBe(NOW);
+    expect(record?.gaveUpAt).toBe(NOW + 15 * MIN);
+    expect(record?.attempts).toHaveLength(4);
+    expect(record?.attempts[0]?.error).toMatch(/gemini-3\.8-flash: HTTP 503.*\| gemini-3\.5-flash-lite: HTTP 503/);
+    expect((await store.getMeta()).lastSeen).toBe("2");
+  });
+
+  it("sends the Hebrew translation as soon as a retry succeeds", async () => {
+    await seed("1", ["a"]);
+    expect((await runAt(0, fail)).tg.sent).toEqual([]);
+    const ok = await runAt(5, translate);
+    expect(ok.tg.sent[0]?.text).toContain("תרגום של פוסט number-2");
+    expect(alerts(ok.tg)).toEqual([]);
+    expect((await store.getGeminiFailures("2"))?.attempts).toHaveLength(1); // the failure stays on record
+  });
+
+  it("lets newer posts go out while an older one waits for Gemini", async () => {
+    await seed("1", ["a"]);
+    const s = setup({
+      feed: ["3", "2", "1"],
+      gemini: (call) => (JSON.parse(call.body).contents[0].parts[0].text.includes("number-2") ? fail() : translate(call)),
+    });
+    await s.run();
+    expect(s.tg.postsTo("a")).toEqual(["3"]);
+    expect(await store.getMeta()).toMatchObject({ lastSeen: "1", sentAhead: ["3"] });
+  });
+
+  it("saves the primary model's failure when the fallback model saves the post", async () => {
+    await seed("1", ["a"]);
+    const s = setup({
+      feed: ["2", "1"],
+      gemini: (call) => (call.url.includes("gemini-3.8-flash") ? fail() : translate(call)),
+    });
+    await s.run();
+    expect(s.tg.postsTo("a")).toEqual(["2"]);
+    expect((await store.getAnalysis("2"))?.model).toBe("gemini-3.5-flash-lite");
+    expect((await store.getGeminiFailures("2"))?.attempts[0]?.error).toContain("gemini-3.8-flash: HTTP 503");
+  });
+
+  it("still sends the alert when Gemini used up the run's time (the Oct 12 bug)", async () => {
+    await seed("1", ["a"]);
+    // The post has been failing for 20 minutes, so this run gives up on it.
+    await store.putGeminiFailures({ postId: "2", firstFailureAt: NOW - 20 * MIN, attempts: [] });
+    let t = NOW;
+    const tg = new FakeTelegram();
+    const ctx = testCtx(
+      {
+        [RSS_HOST]: () => new Response(rssFeed(["2", "1"], (id) => `Post number-${id} here`)),
+        [TELEGRAM]: tg.handler,
+        [GEMINI]: () => {
+          t += 95_000; // a call that hangs past the 90 s run budget
+          return fail();
+        },
+      },
+      { maxSubrequests: 200 },
+      { now: () => t },
+    );
+    await runCron(ctx, store);
+    expect(ctx.budget.timeUp()).toBe(true);
+    expect(alerts(tg)).toHaveLength(1); // before the fix: dropped silently
+    expect(tg.postsTo("a")).toEqual([]); // no time left to deliver; next run will
+  });
+});
+
 describe("media-only posts", () => {
   it("are delivered with a short line and never sent to Gemini", async () => {
     await seed("1", ["a"]);
@@ -318,14 +410,6 @@ describe("monitoring", () => {
     // A working run resets the counter.
     await setup({ feed: ["1"] }).run();
     expect((await store.getMeta()).sourceFailures).toBe(0);
-  });
-
-  it("alerts when every translation provider fails, and sends the post in English", async () => {
-    await seed("1", ["a"]);
-    const { tg, run } = setup({ feed: ["2", "1"], gemini: () => new Response("down", { status: 503 }) });
-    await run();
-    expect(adminAlerts(tg)[0]?.text).toContain("כל ספקי התרגום נכשלו");
-    expect(tg.sent.find((s) => s.chat === "a")?.text).toContain("התרגום לעברית נכשל");
   });
 
   it("alerts when lastSeen fell out of the scanned window", async () => {

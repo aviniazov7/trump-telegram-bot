@@ -68,11 +68,12 @@ export const GEMINI_RESPONSE_SCHEMA = {
 export const GEMINI_MAX_TOKENS = 8192;
 /** A post goes to Gemini in one piece; Truth Social posts are far shorter. */
 export const GEMINI_MAX_CHARS = 12_000;
-/** Wait out a free-tier 429 at most this long (the run has ~40 s). */
+/** Wait out a free-tier 429 at most this long. */
 export const GEMINI_MAX_RETRY_DELAY_MS = 10_000;
 /** Pause before retrying a 5xx ("model overloaded") once. */
 export const GEMINI_5XX_RETRY_MS = 2_000;
-const GEMINI_TIMEOUT_MS = 30_000;
+/** Time kept back from every Gemini call for sending the post afterwards. */
+export const GEMINI_TIME_RESERVE_MS = 8_000;
 
 export class GeminiError extends Error {}
 
@@ -82,21 +83,29 @@ export function geminiRetryDelayMs(body: string): number | null {
   return m?.[1] ? (Number(m[1]) + 1) * 1000 : null;
 }
 
-async function request(ctx: Ctx, payload: unknown): Promise<unknown> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(ctx.cfg.geminiModel)}:generateContent`;
+/** A 400 that complains about thinking settings the model doesn't support. */
+const THINKING_REJECTED_RE = /thinking/i;
+
+async function request(ctx: Ctx, model: string, payload: Record<string, unknown>): Promise<unknown> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  let body = payload;
   for (let attempt = 1; attempt <= 2; attempt++) {
-    if (!ctx.budget.canFetch()) throw new GeminiError("run budget exhausted");
+    // Never let one call eat the run: cap it at GEMINI_TIMEOUT_SECONDS and
+    // keep GEMINI_TIME_RESERVE_MS for sending.
+    const timeoutMs = Math.min(ctx.cfg.geminiTimeoutMs, ctx.budget.msLeft() - GEMINI_TIME_RESERVE_MS);
+    if (timeoutMs < 2_000 || !ctx.budget.canFetch()) throw new GeminiError("no time left in this run");
     let res: Response;
     try {
       res = await ctx.http(url, {
         method: "POST",
         // The key travels in a header, never in the URL, so it can't reach logs.
         headers: { "Content-Type": "application/json", "x-goog-api-key": ctx.cfg.geminiApiKey },
-        body: JSON.stringify(payload),
-        timeoutMs: Math.min(GEMINI_TIMEOUT_MS, Math.max(1000, ctx.budget.msLeft())),
+        body: JSON.stringify(body),
+        timeoutMs,
       });
     } catch (err) {
-      throw new GeminiError(err instanceof Error ? `${err.name}: ${err.message}` : String(err));
+      const what = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      throw new GeminiError(err instanceof Error && err.name === "TimeoutError" ? `timeout after ${timeoutMs / 1000}s` : what);
     }
     if (res.ok) {
       try {
@@ -106,26 +115,40 @@ async function request(ctx: Ctx, payload: unknown): Promise<unknown> {
       }
     }
     const detail = (await res.text()).slice(0, 300);
+    const generationConfig = body.generationConfig as Record<string, unknown> | undefined;
+    if (res.status === 400 && attempt === 1 && generationConfig?.thinkingConfig && THINKING_REJECTED_RE.test(detail)) {
+      ctx.log.warn(`Gemini ${model} rejected the thinking setting — retrying without it`);
+      const { thinkingConfig: _dropped, ...rest } = generationConfig;
+      body = { ...body, generationConfig: rest };
+      continue;
+    }
     const delay = geminiRetryDelayMs(detail);
-    if (res.status === 429 && attempt === 1 && delay !== null && delay <= GEMINI_MAX_RETRY_DELAY_MS && delay < ctx.budget.msLeft()) {
+    if (res.status === 429 && attempt === 1 && delay !== null && delay <= GEMINI_MAX_RETRY_DELAY_MS && delay + 2_000 < ctx.budget.msLeft() - GEMINI_TIME_RESERVE_MS) {
       ctx.log.warn(`Gemini rate-limited — waiting ${delay / 1000}s as asked`);
       await ctx.sleep(delay);
       continue;
     }
-    // 500/503 ("overloaded") are usually momentary: one retry is cheap,
-    // and losing Gemini also loses the impact level.
-    if (res.status >= 500 && attempt === 1 && GEMINI_5XX_RETRY_MS * 2 < ctx.budget.msLeft()) {
+    // 500/503 ("overloaded") are usually momentary: one retry is cheap.
+    if (res.status >= 500 && attempt === 1 && GEMINI_5XX_RETRY_MS + 2_000 < ctx.budget.msLeft() - GEMINI_TIME_RESERVE_MS) {
       ctx.log.warn(`Gemini HTTP ${res.status} — retrying once`);
       await ctx.sleep(GEMINI_5XX_RETRY_MS);
       continue;
     }
     throw new GeminiError(`HTTP ${res.status}: ${detail}`);
   }
-  throw new GeminiError("rate-limited");
+  throw new GeminiError("gave up after a retry");
 }
 
-/** Ask Gemini about one post; returns its parsed JSON answer or throws GeminiError. */
-export async function geminiJson(ctx: Ctx, text: string): Promise<Record<string, unknown>> {
+/**
+ * Ask one Gemini model about one post; returns its parsed JSON answer or
+ * throws GeminiError. The thinking level applies to the primary model only;
+ * the fallback (a "lite" model) runs with its fast defaults.
+ */
+export async function geminiJson(
+  ctx: Ctx,
+  text: string,
+  model = ctx.cfg.geminiModel,
+): Promise<Record<string, unknown>> {
   if (!ctx.cfg.geminiApiKey) throw new GeminiError("GEMINI_API_KEY not set");
   const generationConfig: Record<string, unknown> = {
     temperature: 0.2,
@@ -133,8 +156,10 @@ export async function geminiJson(ctx: Ctx, text: string): Promise<Record<string,
     responseMimeType: "application/json",
     responseSchema: GEMINI_RESPONSE_SCHEMA,
   };
-  if (ctx.cfg.geminiThinkingLevel) generationConfig.thinkingConfig = { thinkingLevel: ctx.cfg.geminiThinkingLevel };
-  const result = (await request(ctx, {
+  if (ctx.cfg.geminiThinkingLevel && model === ctx.cfg.geminiModel) {
+    generationConfig.thinkingConfig = { thinkingLevel: ctx.cfg.geminiThinkingLevel };
+  }
+  const result = (await request(ctx, model, {
     systemInstruction: { parts: [{ text: GEMINI_SYSTEM_PROMPT }] },
     contents: [{ role: "user", parts: [{ text }] }],
     generationConfig,
