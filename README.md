@@ -8,10 +8,12 @@ each one by its likely market impact, and broadcasts them to every Telegram
 subscriber. It runs as a **Cloudflare Worker**: a Cron Trigger every 5 minutes
 handles posts, and a webhook handles bot commands.
 
-> **Migration status.** The Worker is new. Until it is verified, the original
-> Python bot in [`legacy/`](legacy/) keeps serving subscribers from GitHub
-> Actions, and the Worker runs in `DRY_RUN` mode, sending previews to the
-> admin only. See [Cutover](#cutover).
+> **Status: live on the Worker since 2026-10-12 22:39 (Israel time).** The
+> 8 subscribers and the cursor were imported from `BOT_STATE`, `DRY_RUN` is
+> `"false"`, and the GitHub Actions workflow `trump-check.yml` is **disabled**
+> but kept, along with [`legacy/`](legacy/), for a rollback. **The Telegram
+> webhook is not set yet**, so `/start`, `/stop` and `/trumphere` aren't
+> handled until it is (see [Cutover](#cutover), step 4).
 
 ## Why Cloudflare beats the Actions cron here
 
