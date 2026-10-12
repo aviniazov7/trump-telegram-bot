@@ -11,7 +11,7 @@
  * whose record can't be saved would otherwise be repeated by every later
  * run), and alerts the admin.
  */
-import { toHex } from "./log";
+import { scrub, toHex } from "./log";
 import { buildMessage, translatableText } from "./message";
 import { alertAdmin, checkHeartbeat, recordSourceFailure, recordSuccess } from "./monitor";
 import { advanceCursor, filterNewPosts, sendOrder } from "./posts";
@@ -20,7 +20,7 @@ import { type Post, contains, fetchPosts } from "./sources";
 import { KvWriteError, type Meta, type SendLog, type Store, type Subscriber } from "./store";
 import { type PostAnalysis, analyzePost } from "./tagging";
 import { sendMessage, telegramCall } from "./telegram";
-import { splitForTelegram } from "./text";
+import { htmlEscape, splitForTelegram } from "./text";
 
 /** Give up on chats still failing this long after a post was first attempted. */
 export const POST_RETRY_WINDOW_MS = 60 * 60 * 1000;
@@ -243,27 +243,51 @@ async function deliverNewPosts(
   // Translate and classify first (cached per post), so high-impact posts can
   // jump the queue and a resumed post is sent with identical text.
   const prepared: Prepared[] = [];
-  let untranslated = 0;
+  const gaveUp: { id: string; error: string }[] = [];
   for (const post of todo) {
     const text = translatableText(post);
     let analysis = text ? await store.getAnalysis(post.id) : MEDIA_ONLY;
     if (!analysis) {
       if (ctx.budget.timeUp() || !ctx.budget.canFetch(1 + RESERVED_SUBREQUESTS)) break;
-      analysis = await analyzePost(ctx, text);
-      if (analysis.translated) await store.putAnalysis(post.id, analysis);
-      else untranslated += 1;
+      const fresh = await analyzePost(ctx, text);
+      if (fresh.outOfTime) break; // not a failure: try again next run
+      if (fresh.translated) {
+        // The fallback model saved it, but keep the primary's failure too.
+        if (fresh.geminiError) await store.recordGeminiFailure(post.id, ctx.now(), fresh.geminiError);
+        await store.putAnalysis(post.id, fresh);
+        analysis = fresh;
+      } else {
+        // Always keep the reason, also when we're about to give up.
+        const record = await store.recordGeminiFailure(post.id, ctx.now(), fresh.geminiError ?? "unknown");
+        const waited = ctx.now() - record.firstFailureAt;
+        if (ctx.cfg.geminiApiKey && waited < ctx.cfg.geminiRetryMs) {
+          ctx.log.warn(
+            `Post ${post.id}: no translation yet (${fresh.geminiError}) — retrying next run ` +
+              `(${Math.floor(waited / 60_000)}/${ctx.cfg.geminiRetryMs / 60_000} min)`,
+          );
+          continue; // not sent this run; newer posts may go ahead (sentAhead)
+        }
+        ctx.log.error(`Post ${post.id}: still no translation after ${Math.floor(waited / 60_000)} min — sending in English`);
+        await store.putGeminiFailures({ ...record, gaveUpAt: ctx.now() });
+        // Frozen, so every chat gets the same English message.
+        await store.putAnalysis(post.id, fresh);
+        analysis = fresh;
+        gaveUp.push({ id: post.id, error: fresh.geminiError ?? "unknown" });
+      }
     }
     let message = buildMessage(post, analysis);
     if (ctx.cfg.dryRun) message = `🧪 <b>DRY RUN</b> — היה נשלח ל-${subscriberCount} מנויים:\n\n${message}`;
     prepared.push({ post, message, impact: analysis.impact });
   }
-  if (untranslated) {
+  if (gaveUp.length) {
+    const [first] = gaveUp;
     await alertAdmin(
       ctx,
       store,
       "translation",
-      `⚠️ כל ספקי התרגום נכשלו ב-${untranslated} פוסט(ים) — הם נשלחים באנגלית בלבד.\n` +
-        "בדוק את GEMINI_API_KEY ואת המכסה ב-AI Studio.",
+      `⚠️ Gemini נכשל במשך ${ctx.cfg.geminiRetryMs / 60_000} דק׳ ב-${gaveUp.length} פוסט(ים) — הם נשלחים באנגלית בלבד.\n` +
+        `סיבה אחרונה: <code>${htmlEscape(scrub(first?.error ?? "").slice(0, 300))}</code>\n` +
+        `פרטים: <code>npm run gemini-errors</code> (מפתח gemini-error:${first?.id} ב-KV).`,
     );
   }
 

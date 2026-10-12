@@ -79,11 +79,11 @@ export async function telegramCall(
   ctx: Ctx,
   method: string,
   payload: unknown,
-  { idempotent = false } = {},
+  { idempotent = false, urgent = false } = {},
 ): Promise<TgResponse> {
   let resp: TgResponse = { ok: false, errorCode: 0, description: "budget", retryAfter: 0, migrateTo: "", uncertain: false };
   for (let attempt = 1; attempt <= TELEGRAM_ATTEMPTS; attempt++) {
-    if (!ctx.budget.canFetch()) return resp;
+    if (!ctx.budget.canFetch(1, { urgent })) return resp;
     resp = await request(ctx, method, payload);
     if (resp.ok) return resp;
     const last = attempt === TELEGRAM_ATTEMPTS;
@@ -133,11 +133,14 @@ export interface SendOptions {
   replyMarkup?: unknown;
   /** Subrequests to leave unused for alerts after this send. */
   reserve?: number;
+  /** Admin alerts: may run past the run's time budget (see Budget.canFetch). */
+  urgent?: boolean;
 }
 
 export async function sendMessage(ctx: Ctx, chatId: string, text: string, opts: SendOptions = {}): Promise<SendResult> {
   const chunks = splitForTelegram(text);
-  if (!ctx.budget.canFetch(chunks.length + (opts.reserve ?? 0))) return { status: "retry", migratedTo: "" };
+  const urgent = opts.urgent ?? false;
+  if (!ctx.budget.canFetch(chunks.length + (opts.reserve ?? 0), { urgent })) return { status: "retry", migratedTo: "" };
 
   let target = chatId;
   let migratedTo = "";
@@ -151,14 +154,14 @@ export async function sendMessage(ctx: Ctx, chatId: string, text: string, opts: 
     if (opts.threadId) payload.message_thread_id = Number(opts.threadId);
     if (opts.replyMarkup && i === chunks.length - 1) payload.reply_markup = opts.replyMarkup;
 
-    let resp = await telegramCall(ctx, "sendMessage", payload);
+    let resp = await telegramCall(ctx, "sendMessage", payload, { urgent });
     if (!resp.ok && resp.migrateTo && !migratedTo) {
       // Group upgraded to a supergroup: Telegram did not deliver to the old
       // ID, so resend there once.
       ctx.log.info(`Chat ${await ctx.log.chat(target)} migrated to ${await ctx.log.chat(resp.migrateTo)}`);
       target = migratedTo = resp.migrateTo;
       payload.chat_id = target;
-      resp = await telegramCall(ctx, "sendMessage", payload);
+      resp = await telegramCall(ctx, "sendMessage", payload, { urgent });
     }
     if (resp.ok) continue;
 

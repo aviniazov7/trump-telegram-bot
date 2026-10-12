@@ -1,11 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { analyzePost, keywordCategories, parseMarketTags } from "../src/tagging";
-import { extractClients5Text, translateToHebrew } from "../src/translate";
-import { CLIENTS5, GEMINI, GTX, MYMEMORY, geminiAnswer, json, testCtx } from "./helpers";
+import { looksTranslated, needsTranslation } from "../src/translate";
+import { type Call, GEMINI, GTX, geminiAnswer, json, testCtx } from "./helpers";
 
 const ENGLISH = "I am raising Tariffs on China to 100%, effective November 1st!";
 const HEBREW = "אני מעלה את המכסים על סין ל-100%, החל מ-1 בנובמבר!";
-const gtxOk = () => json([[[HEBREW, ENGLISH]]]);
 const fail503 = () => new Response("unavailable", { status: 503 });
 
 describe("parseMarketTags", () => {
@@ -54,36 +53,41 @@ describe("keywordCategories", () => {
   });
 });
 
-describe("analyzePost", () => {
-  const answer = (data: unknown, finish?: string, thought?: string) => () => json(geminiAnswer(data, finish, thought));
+const PRIMARY = "gemini-3.8-flash";
+const FALLBACK = "gemini-3.5-flash-lite";
+const modelOf = (call: Call) => /models\/([^:]+):/.exec(call.url)?.[1];
+const answer = (data: unknown, finish?: string, thought?: string) => () => json(geminiAnswer(data, finish, thought));
+const good = answer({ hebrew: HEBREW, categories: ["tariffs", "china"], impact: "high" });
+/** Route Gemini calls per model. */
+const byModel = (primary: () => Response, fallback: () => Response) => (call: Call) =>
+  modelOf(call) === FALLBACK ? fallback() : primary();
 
-  it("translates and tags with one Gemini call", async () => {
-    const ctx = testCtx({ [GEMINI]: answer({ hebrew: HEBREW, categories: ["tariffs", "china"], impact: "high" }) });
+describe("analyzePost (Gemini only)", () => {
+  it("translates and tags with one call to the primary model", async () => {
+    const ctx = testCtx({ [GEMINI]: good });
     expect(await analyzePost(ctx, ENGLISH)).toEqual({
       hebrew: HEBREW,
       translated: true,
       categories: ["tariffs", "china"],
       impact: "high",
       provider: "gemini",
+      model: PRIMARY,
     });
-    expect(ctx.hosts()).toEqual([GEMINI]);
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY]);
   });
 
-  it("sends a well-formed request with the key in a header", async () => {
-    const ctx = testCtx({ [GEMINI]: answer({ hebrew: HEBREW, categories: [], impact: "low" }) }, { geminiThinkingLevel: "low" });
+  it("sends a well-formed request: key in a header, thinking level on the primary only, capped timeout", async () => {
+    const ctx = testCtx({ [GEMINI]: byModel(fail503, good) }, { geminiThinkingLevel: "low" });
     await analyzePost(ctx, ENGLISH);
-    const call = ctx.calls[0];
-    expect(call?.url).toContain("/models/gemini-3.8-flash:generateContent");
-    expect(call?.url).not.toContain("test-gemini-key");
-    expect(call?.headers.get("x-goog-api-key")).toBe("test-gemini-key");
-    const body = JSON.parse(call?.body ?? "{}");
+    const [primary, , fallback] = ctx.calls;
+    expect(primary?.url).toContain(`/models/${PRIMARY}:generateContent`);
+    expect(primary?.url).not.toContain("test-gemini-key");
+    expect(primary?.headers.get("x-goog-api-key")).toBe("test-gemini-key");
+    const body = JSON.parse(primary?.body ?? "{}");
     expect(body.systemInstruction.parts[0].text).toContain("Hebrew");
-    expect(body.contents[0].parts[0].text).toBe(ENGLISH);
-    expect(body.generationConfig).toMatchObject({
-      responseMimeType: "application/json",
-      thinkingConfig: { thinkingLevel: "low" },
-    });
+    expect(body.generationConfig).toMatchObject({ responseMimeType: "application/json", thinkingConfig: { thinkingLevel: "low" } });
     expect(Object.keys(body.generationConfig.responseSchema.properties)).toEqual(["hebrew", "categories", "impact"]);
+    expect(JSON.parse(fallback?.body ?? "{}").generationConfig.thinkingConfig).toBeUndefined();
   });
 
   it("ignores thought parts", async () => {
@@ -97,120 +101,96 @@ describe("analyzePost", () => {
   });
 
   it.each([
-    ["an HTTP error", fail503],
-    ["a truncated answer", answer({ hebrew: "המכסים" }, "MAX_TOKENS")],
-    ["an English echo", answer({ hebrew: ENGLISH, categories: [], impact: "low" })],
-    ["non-JSON text", answer("Sure! Here is the translation")],
-    ["a blocked prompt", () => json({ promptFeedback: { blockReason: "SAFETY" } })],
-  ])("falls back to the free chain after %s", async (_name, gemini) => {
-    const ctx = testCtx({ [GEMINI]: gemini, [GTX]: gtxOk });
-    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({
-      hebrew: HEBREW,
-      translated: true,
-      categories: ["tariffs", "china"],
-      impact: "medium", // keyword topics + impact floor, even without Gemini
-      provider: "free",
-    });
-    expect(ctx.hosts().filter((h) => h !== GEMINI)).toEqual([GTX]);
-  });
-
-  it("retries a Gemini 5xx once, and records why it gave up", async () => {
-    const ctx = testCtx({ [GEMINI]: fail503, [GTX]: gtxOk });
+    ["an HTTP error", fail503, "HTTP 503"],
+    ["a truncated answer", answer({ hebrew: "המכסים" }, "MAX_TOKENS"), "finishReason=MAX_TOKENS"],
+    ["an English echo", answer({ hebrew: ENGLISH, categories: [], impact: "low" }), "untranslated text"],
+    ["non-JSON text", answer("Sure! Here is the translation"), "answer is not JSON"],
+    ["a blocked prompt", () => json({ promptFeedback: { blockReason: "SAFETY" } }), "blockReason=SAFETY"],
+    ["a timeout", () => {
+      throw new DOMException("The operation timed out.", "TimeoutError");
+    }, "timeout after 12s"],
+  ])("falls back to the second model after %s, and reports why", async (_name, primary, reason) => {
+    const ctx = testCtx({ [GEMINI]: byModel(primary, good) });
     const result = await analyzePost(ctx, ENGLISH);
-    expect(ctx.hosts()).toEqual([GEMINI, GEMINI, GTX]);
-    expect(ctx.sleeps).toEqual([2000]);
-    expect(result.geminiError).toContain("HTTP 503");
+    expect(result).toMatchObject({ translated: true, provider: "gemini", model: FALLBACK, hebrew: HEBREW });
+    expect(result.geminiError).toContain(`${PRIMARY}: `);
+    expect(result.geminiError).toContain(reason);
   });
 
-  it("recovers when the 5xx retry succeeds", async () => {
-    const ctx = testCtx({
-      [GEMINI]: (_c, n) => (n === 0 ? fail503() : json(geminiAnswer({ hebrew: HEBREW, categories: ["tariffs"], impact: "high" }))),
-    });
-    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ provider: "gemini", impact: "high" });
+  it("returns untranslated, with both models' reasons, when both fail — no other translator is tried", async () => {
+    const ctx = testCtx({ [GEMINI]: fail503, [GTX]: () => json([[[HEBREW, ENGLISH]]]) });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result).toMatchObject({ hebrew: ENGLISH, translated: false, provider: "", categories: ["tariffs", "china"], impact: "medium" });
+    expect(result.geminiError).toMatch(new RegExp(`${PRIMARY}: HTTP 503.*\\| ${FALLBACK}: HTTP 503`));
+    expect(ctx.hosts()).not.toContain(GTX);
   });
 
-  it("waits out a short Gemini 429 once", async () => {
+  it("retries a 5xx once per model", async () => {
+    const ctx = testCtx({ [GEMINI]: fail503 });
+    await analyzePost(ctx, ENGLISH);
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, PRIMARY, FALLBACK, FALLBACK]);
+    expect(ctx.sleeps).toEqual([2000, 2000]);
+  });
+
+  it("retries without the thinking setting when a model rejects it", async () => {
+    const ctx = testCtx(
+      {
+        [GEMINI]: (call) =>
+          JSON.parse(call.body).generationConfig.thinkingConfig
+            ? new Response('{"error":{"message":"thinking_level is not supported for this model"}}', { status: 400 })
+            : good(),
+      },
+      { geminiThinkingLevel: "low" },
+    );
+    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ translated: true, model: PRIMARY });
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, PRIMARY]);
+  });
+
+  it("waits out a short 429 once", async () => {
     const ctx = testCtx({
-      [GEMINI]: (_c, n) =>
-        n === 0
-          ? new Response('{"error":{"details":[{"retryDelay":"4s"}]}}', { status: 429 })
-          : json(geminiAnswer({ hebrew: HEBREW, categories: ["oil"], impact: "low" })),
+      [GEMINI]: (_c, n) => (n === 0 ? new Response('{"error":{"details":[{"retryDelay":"4s"}]}}', { status: 429 }) : good()),
     });
-    expect((await analyzePost(ctx, ENGLISH)).provider).toBe("gemini");
+    expect((await analyzePost(ctx, ENGLISH)).model).toBe(PRIMARY);
     expect(ctx.sleeps).toEqual([5000]);
   });
 
-  it("doesn't wait out a long Gemini 429", async () => {
-    const ctx = testCtx({
-      [GEMINI]: () => new Response('{"retryDelay":"3600s"}', { status: 429 }),
-      [GTX]: gtxOk,
-    });
-    expect((await analyzePost(ctx, ENGLISH)).provider).toBe("free");
-    expect(ctx.sleeps).toEqual([]);
+  it("caps each call at GEMINI_TIMEOUT_SECONDS and keeps time back for sending", async () => {
+    let t = 0;
+    const ctx = testCtx({ [GEMINI]: good }, { geminiTimeoutMs: 12_000, runTimeBudgetMs: 90_000 }, { now: () => t });
+    t = 75_000; // 15 s left: 15 - 8 s reserve = 7 s for this call
+    const timeouts: number[] = [];
+    const http = ctx.http.bind(ctx);
+    ctx.http = (url, init) => {
+      timeouts.push(init?.timeoutMs ?? 0);
+      return http(url, init);
+    };
+    await analyzePost(ctx, ENGLISH);
+    expect(timeouts).toEqual([7_000]);
   });
 
-  it("skips Gemini without a key", async () => {
-    const ctx = testCtx({ [GTX]: gtxOk }, { geminiApiKey: "" });
-    expect((await analyzePost(ctx, ENGLISH)).provider).toBe("free");
-    expect(ctx.hosts()).toEqual([GTX]);
+  it("reports 'out of time' (not a failure) when the run has no time left for a call", async () => {
+    let t = 0;
+    const ctx = testCtx({ [GEMINI]: good }, { runTimeBudgetMs: 90_000 }, { now: () => t });
+    t = 85_000;
+    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ translated: false, outOfTime: true });
+    expect(ctx.calls).toEqual([]);
   });
 
-  it("reports when everything fails", async () => {
-    const ctx = testCtx({});
-    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ hebrew: ENGLISH, translated: false, provider: "" });
+  it("needs no Gemini for text without words, and fails cleanly without a key", async () => {
+    const ctx = testCtx({ [GEMINI]: good });
+    expect(await analyzePost(ctx, "🇺🇸🇺🇸 100%")).toMatchObject({ translated: true, provider: "none" });
+    const noKey = testCtx({ [GEMINI]: good }, { geminiApiKey: "" });
+    expect(await analyzePost(noKey, ENGLISH)).toMatchObject({ translated: false, geminiError: "GEMINI_API_KEY not set" });
+    expect([...ctx.calls, ...noKey.calls]).toEqual([]);
   });
 });
 
-describe("free translation chain", () => {
-  it("tries each provider in order until one returns Hebrew", async () => {
-    const ctx = testCtx({
-      [GTX]: fail503,
-      [CLIENTS5]: () => json({ sentences: [{ trans: "Not Hebrew at all, sorry" }] }),
-      [MYMEMORY]: () => json({ responseData: { translatedText: HEBREW } }),
-    });
-    expect(await translateToHebrew(ctx, ENGLISH)).toEqual({ text: HEBREW, translated: true, provider: "mymemory" });
-    expect(ctx.hosts()[0]).toBe(GTX);
-    expect(ctx.hosts()[1]).toBe(CLIENTS5);
-    expect(ctx.hosts().at(-1)).toBe(MYMEMORY);
-  });
-
-  it("uses a Lingva instance", async () => {
-    const ctx = testCtx({ "lingva.ml": () => json({ translation: HEBREW }) });
-    expect((await translateToHebrew(ctx, ENGLISH)).provider).toBe("lingva");
-  });
-
-  it("rejects MyMemory's quota notice", async () => {
-    const ctx = testCtx({
-      [MYMEMORY]: () => json({ responseData: { translatedText: "MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE TRANSLATIONS" } }),
-    });
-    expect((await translateToHebrew(ctx, ENGLISH)).translated).toBe(false);
-  });
-
-  it("rejects a provider that translates only some chunks", async () => {
-    const text = `${"First sentence about the economy today. ".repeat(70)}\n`.repeat(2);
-    const ctx = testCtx({
-      [GTX]: (_c, n) => json(n === 0 ? [[[HEBREW, "x"]]] : [[["English again and again", "x"]]]),
-    });
-    expect(await translateToHebrew(ctx, text)).toEqual({ text, translated: false, provider: "" });
-  });
-
-  it("stops when the subrequest budget runs out", async () => {
-    const ctx = testCtx({ [GTX]: fail503 }, { maxSubrequests: 1 });
-    expect((await translateToHebrew(ctx, ENGLISH)).translated).toBe(false);
-    expect(ctx.calls).toHaveLength(1);
-  });
-
-  it("needs no provider for text without words", async () => {
-    const ctx = testCtx({});
-    expect(await translateToHebrew(ctx, "   ")).toEqual({ text: "   ", translated: true, provider: "" });
-    expect(ctx.calls).toHaveLength(0);
-  });
-
-  it("reads every clients5 response shape", () => {
-    for (const shape of ["שלום", ["שלום"], [["שלום", "hello"]], { sentences: [{ trans: "שלום" }] }]) {
-      expect(extractClients5Text(shape)).toBe("שלום");
-    }
-    expect(extractClients5Text({ other: 1 })).toBeNull();
-    expect(extractClients5Text(5)).toBeNull();
+describe("translation checks", () => {
+  it("rejects empty and still-English answers, accepts short slogans", () => {
+    expect(looksTranslated(ENGLISH, "")).toBe(false);
+    expect(looksTranslated(ENGLISH, ENGLISH)).toBe(false);
+    expect(looksTranslated(ENGLISH, HEBREW)).toBe(true);
+    expect(looksTranslated("MAGA!", "MAGA!")).toBe(true);
+    expect(needsTranslation("https://x.com 🇺🇸")).toBe(false);
   });
 });

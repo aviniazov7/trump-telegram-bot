@@ -1,7 +1,7 @@
 /** Market-impact tagging, and the per-post analysis that combines it with translation. */
 import { CATEGORY_KEYS, GEMINI_MAX_CHARS, GeminiError, IMPACT_LEVELS, geminiJson } from "./gemini";
 import type { Ctx } from "./runtime";
-import { looksTranslated, needsTranslation, translateToHebrew } from "./translate";
+import { looksTranslated, needsTranslation } from "./translate";
 
 /** Machine keys → Hebrew hashtag labels, in display order. */
 export const MARKET_CATEGORIES: Record<string, string> = {
@@ -114,45 +114,66 @@ export interface PostAnalysis {
   translated: boolean;
   categories: string[];
   impact: Impact | null;
+  /** "gemini" (with `model`), "none" when nothing needed translating, "" when it failed. */
   provider: string;
-  /** Why Gemini wasn't used (kept in the KV cache for diagnosis). */
+  model?: string;
+  /** Why Gemini failed, per model (also saved under gemini-error:<post>). */
   geminiError?: string;
+  /** The run ran out of time before Gemini could be asked: not a failure. */
+  outOfTime?: boolean;
 }
 
 /**
- * Translate and tag a post with one Gemini call. Falls back to the free
- * translation chain plus keyword topics (no impact level) when Gemini isn't
- * configured or fails.
+ * Translate and tag a post with Gemini: the primary model first, then the
+ * fallback model (GEMINI_FALLBACK_MODEL) in the same run. There is no other
+ * translator in the Worker — the keyless ones are blocked from Cloudflare's
+ * network — so a failure returns `translated: false` with the reasons, and the
+ * caller decides whether to retry next run or send the English original.
  */
 export async function analyzePost(ctx: Ctx, text: string): Promise<PostAnalysis> {
-  let geminiError: string | undefined;
-  if (ctx.cfg.geminiApiKey && needsTranslation(text) && text.length <= GEMINI_MAX_CHARS) {
+  const untranslated = (geminiError: string, extra: Partial<PostAnalysis> = {}): PostAnalysis => ({
+    hebrew: text,
+    translated: false,
+    ...finalTags([], null, text),
+    provider: "",
+    geminiError,
+    ...extra,
+  });
+  if (!needsTranslation(text)) return { hebrew: text, translated: true, ...finalTags([], null, text), provider: "none" };
+  if (!ctx.cfg.geminiApiKey) return untranslated("GEMINI_API_KEY not set");
+  if (text.length > GEMINI_MAX_CHARS) return untranslated(`post longer than ${GEMINI_MAX_CHARS} chars`);
+
+  const models = [...new Set([ctx.cfg.geminiModel, ctx.cfg.geminiFallbackModel].filter(Boolean))];
+  const errors: string[] = [];
+  for (const model of models) {
     try {
-      const data = await geminiJson(ctx, text);
+      const data = await geminiJson(ctx, text, model);
       const hebrew = typeof data.hebrew === "string" ? data.hebrew.trim() : "";
       if (looksTranslated(text, hebrew)) {
         const parsed = parseMarketTags(data);
         // Invalid tags from Gemini: keep only what keywords can vouch for.
         const { categories, impact } = finalTags(parsed.categories, parsed.categories.length ? parsed.impact : null, text);
-        ctx.log.info(`Translated and tagged post via gemini: ${categories.join(",")}, impact=${impact}`);
-        return { hebrew, translated: true, categories, impact, provider: "gemini" };
+        ctx.log.info(`Translated and tagged post via ${model}: ${categories.join(",")}, impact=${impact}`);
+        return {
+          hebrew,
+          translated: true,
+          categories,
+          impact,
+          provider: "gemini",
+          model,
+          ...(errors.length ? { geminiError: errors.join(" | ") } : {}),
+        };
       }
-      geminiError = hebrew ? "untranslated text" : "no answer";
-      ctx.log.warn(`Translation provider gemini returned ${geminiError}`);
+      errors.push(`${model}: ${hebrew ? "untranslated text" : "no answer"}`);
     } catch (err) {
       if (!(err instanceof GeminiError)) throw err;
-      geminiError = err.message.slice(0, 200);
-      ctx.log.warn("Translation provider gemini failed:", err.message);
+      if (err.message === "no time left in this run") {
+        if (!errors.length) return untranslated(err.message, { outOfTime: true });
+        break;
+      }
+      errors.push(`${model}: ${err.message}`.slice(0, 300));
     }
+    ctx.log.warn(`Gemini failed — ${errors.at(-1)}`);
   }
-  const t = await translateToHebrew(ctx, text);
-  const { categories, impact } = finalTags([], null, text);
-  return {
-    hebrew: t.text,
-    translated: t.translated,
-    categories,
-    impact,
-    provider: t.translated ? "free" : "",
-    ...(geminiError ? { geminiError } : {}),
-  };
+  return untranslated(errors.join(" | "));
 }

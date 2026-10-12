@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 import { buildMessage } from "../src/message";
 import { analyzePost, finalTags, keywordCategories } from "../src/tagging";
-import { GEMINI, GTX, geminiAnswer, json, testCtx } from "./helpers";
+import { GEMINI, geminiAnswer, json, testCtx } from "./helpers";
 
 
 const CEASEFIRE =
@@ -16,13 +16,10 @@ describe("1. market-impact tagging: the ENERGY CEASEFIRE post", () => {
     expect(keywordCategories(CEASEFIRE)).toEqual(["oil", "geopolitics"]);
   });
 
-  it("gets 🟠 even when Gemini fails (this is what happened: free chain, #כללי, no impact)", async () => {
-    const ctx = testCtx({
-      [GEMINI]: () => new Response("overloaded", { status: 503 }),
-      [GTX]: () => json([[[CEASEFIRE_HE, CEASEFIRE]]]),
-    });
+  it("gets 🟠 even when Gemini fails (on Oct 11 it went out #כללי with no impact)", async () => {
+    const ctx = testCtx({ [GEMINI]: () => new Response("overloaded", { status: 503 }) });
     const a = await analyzePost(ctx, CEASEFIRE);
-    expect(a).toMatchObject({ provider: "free", categories: ["oil", "geopolitics"], impact: "medium" });
+    expect(a).toMatchObject({ translated: false, categories: ["oil", "geopolitics"], impact: "medium" });
     const msg = buildMessage({ id: "1", text: CEASEFIRE, createdAt: "", url: "" }, a);
     expect(msg.split("\n")[0]).toBe("🟠 השפעה בינונית על השווקים · #נפט_ואנרגיה #גאופוליטיקה");
   });
