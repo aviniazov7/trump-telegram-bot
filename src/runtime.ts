@@ -22,9 +22,13 @@ export class Budget {
     return this.used;
   }
 
-  /** Room for `n` more subrequests and some time left? */
-  canFetch(n = 1): boolean {
-    return this.used + n <= this.maxSubrequests && !this.timeUp();
+  /**
+   * Room for `n` more subrequests and some time left? `urgent` work (admin
+   * alerts) ignores the time budget — it's a soft limit we set ourselves,
+   * far below the platform's 15 min — but never the subrequest cap.
+   */
+  canFetch(n = 1, { urgent = false } = {}): boolean {
+    return this.used + n <= this.maxSubrequests && (urgent || !this.timeUp());
   }
 
   timeUp(): boolean {

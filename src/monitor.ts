@@ -56,8 +56,13 @@ export async function alertAdmin(
       ctx.log.info(`Alert '${kind}' already sent recently — not repeating it`);
       return false;
     }
-    const result = await sendMessage(ctx, admin, `🚨 <b>התראת בוט טראמפ</b>\n${text}`);
-    if (result.status !== "ok") return false;
+    // Urgent: alerts often fire exactly when a run is out of time (a slow
+    // Gemini ate it). Before this, such alerts were dropped silently.
+    const result = await sendMessage(ctx, admin, `🚨 <b>התראת בוט טראמפ</b>\n${text}`, { urgent: true });
+    if (result.status !== "ok") {
+      ctx.log.error(`Alert '${kind}' could not be sent to the admin: ${result.status}`);
+      return false;
+    }
     memoryMutes.set(kind, ctx.now());
     ctx.log.info(`Alert '${kind}' sent to admin`);
     try {
