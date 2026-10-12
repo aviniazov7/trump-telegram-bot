@@ -119,7 +119,7 @@ broadcast-only and shows no command menu.
 
 ## Translation and market tags
 
-One Gemini call per post (`GEMINI_API_KEY`, model `gemini-3.8-flash`)
+One Gemini call per post (`GEMINI_API_KEY`, model `gemini-3.5-flash-lite`)
 returns the Hebrew translation, the **topics** (`tariffs`, `fed_rates`,
 `oil` (incl. energy), `geopolitics` (war, ceasefire, sanctions), `crypto`,
 `china`, `stocks`, `other`) and the **impact** (`high`/`medium`/`low`) as
@@ -154,14 +154,26 @@ up whole runs. So:
    `GEMINI_TIMEOUT_SECONDS` (12), keeping 8 s of the run for sending. If a
    model rejects the thinking setting, the call is retried once without it.
    A 5xx is retried once.
-2. **Fallback model.** If the primary model (`gemini-3.8-flash`) fails, the
-   same run asks `GEMINI_FALLBACK_MODEL` (`gemini-3.5-flash-lite`).
-3. **Retry, then English.** If both fail, the post is **held back** and
+2. **Fallback model.** If the primary model (`gemini-3.5-flash-lite`) fails,
+   the same run asks `GEMINI_FALLBACK_MODEL` (`gemini-3.8-flash`). The thinking
+   level applies only to full (non-lite) models.
+3. **Daily free quota.** Each model has its own free daily quota, which
+   resets at midnight Pacific time (10:00 in Israel in summer time, 09:00 in
+   winter). On Oct 12, `gemini-3.8-flash` ran out (429, per-day) while
+   flash-lite was untouched, which is why flash-lite is now the primary. When
+   a 429 names a **per-day** quota, that model is marked in KV
+   (`gemini-quota:<model>`) until the reset and isn't called again, so no
+   calls or run time are wasted. If **every** model is out of quota, a post
+   goes out in English at once, because waiting can't help, and you get one ⛽
+   alert. Per-minute 429s are only waited out (`retryDelay`), never marked.
+   The legacy bot no longer gets `GEMINI_API_KEY`: it shared the quota and
+   used it up in its burst runs.
+4. **Retry, then English.** If both fail, the post is **held back** and
    retried in every run (every 5 minutes) for `GEMINI_RETRY_MINUTES` (15).
    Newer posts don't wait for it. Only after that window is the post sent in
    English, with a clear notice and the keyword-based tags (🟠 floor
    included). You then get a ⚠️ alert with the last reason.
-4. **Every reason is kept.** Each failed attempt (time + reason per model) is
+5. **Every reason is kept.** Each failed attempt (time + reason per model) is
    saved in KV under `gemini-error:<post>` for 7 days. That includes the cases
    where the fallback model then succeeded and where the post went out in
    English. To read them:
@@ -201,6 +213,7 @@ is why no ⚠️ alert arrived for that day's failures.
 | ⏰ No successful run | The previous successful run ended more than `STALE_ALERT_MINUTES` (35, never below 31) ago |
 | 📡 Source down | No post source could be reached for `SOURCE_FAILURE_ALERT_RUNS` (10) runs in a row (≈ 50 min at `*/5`) |
 | ⚠️ Translation failed | Gemini (both models) kept failing for `GEMINI_RETRY_MINUTES`, so a post went out in English. Includes the last reason |
+| ⛽ Gemini quota | Every model's free daily quota is used up; posts go out in English until the reset (once per 12 h) |
 | ⚠️ Possible missed posts | `lastSeen` wasn't in the scanned window |
 
 The heartbeat is `meta.lastSuccess`, written at most every **30 minutes**
@@ -226,6 +239,7 @@ integration), which the Worker pings after every successful run. Logs are in
 | `sent:<postId>` | Send log `{chatId: status}`: `sending` (reserved) / `ok` / `uncertain` / `gone` / `failed`; 30-day TTL |
 | `analysis:<postId>` | Cached translation + tags (and which model); 7-day TTL |
 | `gemini-error:<postId>` | Every failed Gemini attempt for that post (time, reason per model), first failure, when it gave up; 7-day TTL |
+| `gemini-quota:<model>` | Exists while that model's free daily quota is used up; expires at the reset (midnight Pacific) |
 | `alert:<kind>` | Exists while that alert is muted |
 
 **Consistency.** KV is eventually consistent: a write can take about 60 s to
@@ -423,9 +437,9 @@ Vars live in `wrangler.toml` under `[vars]`:
 | Var | Default | Meaning |
 |---|---|---|
 | `DRY_RUN` | `"true"` | Previews to the admin only. Anything except `"false"` keeps it on |
-| `GEMINI_MODEL` | `gemini-3.8-flash` | Check *AI Studio → Rate limits* for your free tier |
-| `GEMINI_THINKING_LEVEL` | `low` | `minimal`/`low`/`medium`/`high`. Primary model only |
-| `GEMINI_FALLBACK_MODEL` | `gemini-3.5-flash-lite` | Asked in the same run when the primary fails. `""` disables it |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Primary. Check *AI Studio → Rate limits* for your free tier |
+| `GEMINI_THINKING_LEVEL` | `low` | `minimal`/`low`/`medium`/`high`. Full (non-lite) models only |
+| `GEMINI_FALLBACK_MODEL` | `gemini-3.8-flash` | Asked in the same run when the primary fails. `""` disables it |
 | `GEMINI_TIMEOUT_SECONDS` | `12` | Per call |
 | `GEMINI_RETRY_MINUTES` | `15` | How long a failing post is retried before going out in English |
 | `STALE_ALERT_MINUTES` | `35` | ⏰ threshold (minimum 31: heartbeat interval + 1) |
