@@ -54,7 +54,7 @@ GitHub Actions: CI only (tests, lint, secret scan) + optional deploy on push to 
 
 - **Budgets.** Each run counts its subrequests (the free plan allows 50 per
   invocation) and stops starting new work after `RUN_TIME_BUDGET_SECONDS`
-  (40). Whatever is left continues in the next run, 5 minutes later, so runs
+  (90). Whatever is left continues in the next run, 5 minutes later, so runs
   never overlap.
 - **Two sources every run.** Each run reads, in parallel, the trumpstruth.org
   RSS feed (100 posts, about a week) and the newest ~30 posts of the CNN
@@ -142,11 +142,37 @@ immediately, there is an ENERGY CEASEFIRE in the War between Russia and
 Ukraine…" went out as `#כללי` with no impact: Gemini had failed for that post,
 and the keyword fallback didn't know "ceasefire" or "energy".
 
-If Gemini fails (5xx is retried once; errors, truncated or English answers),
-the keyless chain takes over: Google ×2, Lingva, MyMemory. Every answer must
-contain real Hebrew. The reason Gemini wasn't used is stored with the cached
-analysis (`analysis:<post>` → `geminiError`). If everything fails, the post
-is sent in English with a clear notice, and you get an alert.
+### When Gemini fails
+
+Gemini is the Worker's **only** translator. The keyless services the legacy
+bot uses are blocked from Cloudflare's network: tested on 2026-10-12, Google
+answered 429, Lingva 403/400 and MyMemory "quota used up", every time. On that
+day Gemini failed for 4 of 9 text posts, and single calls took 30–40 s, using
+up whole runs. So:
+
+1. **Fast calls.** `GEMINI_THINKING_LEVEL=low`, and each call is capped at
+   `GEMINI_TIMEOUT_SECONDS` (12), keeping 8 s of the run for sending. If a
+   model rejects the thinking setting, the call is retried once without it.
+   A 5xx is retried once.
+2. **Fallback model.** If the primary model (`gemini-3.8-flash`) fails, the
+   same run asks `GEMINI_FALLBACK_MODEL` (`gemini-3.5-flash-lite`).
+3. **Retry, then English.** If both fail, the post is **held back** and
+   retried in every run (every 5 minutes) for `GEMINI_RETRY_MINUTES` (15).
+   Newer posts don't wait for it. Only after that window is the post sent in
+   English, with a clear notice and the keyword-based tags (🟠 floor
+   included). You then get a ⚠️ alert with the last reason.
+4. **Every reason is kept.** Each failed attempt (time + reason per model) is
+   saved in KV under `gemini-error:<post>` for 7 days. That includes the cases
+   where the fallback model then succeeded and where the post went out in
+   English. To read them:
+
+   ```bash
+   npm run gemini-errors                 # all posts with failures, last 7 days
+   npm run gemini-errors -- <postId>     # one post
+   # or raw:
+   npx wrangler kv key list --binding STATE --remote --prefix gemini-error:
+   npx wrangler kv key get gemini-error:<postId> --binding STATE --remote
+   ```
 
 ### Media and quote posts
 
@@ -164,14 +190,17 @@ those from the post's own words:
 ## Monitoring
 
 Alerts go to `ADMIN_CHAT_ID`. Each kind is sent at most once per
-`ALERT_REPEAT_MINUTES` (60); the KV alert, once per 12 h:
+`ALERT_REPEAT_MINUTES` (60); the KV alert, once per 12 h. Alerts ignore the
+run's time budget (only the subrequest cap applies). Before Oct 12, an alert
+raised after a slow Gemini call had used up the run was dropped silently, which
+is why no ⚠️ alert arrived for that day's failures.
 
 | Alert | When |
 |---|---|
 | 🛑 KV write failed | A KV write failed; all sends stopped (see [When to move to Workers Paid or D1](#when-to-move-to-workers-paid-or-d1)) |
 | ⏰ No successful run | The previous successful run ended more than `STALE_ALERT_MINUTES` (35, never below 31) ago |
 | 📡 Source down | No post source could be reached for `SOURCE_FAILURE_ALERT_RUNS` (10) runs in a row (≈ 50 min at `*/5`) |
-| ⚠️ Translation failed | Every provider failed for a post, so it went out in English |
+| ⚠️ Translation failed | Gemini (both models) kept failing for `GEMINI_RETRY_MINUTES`, so a post went out in English. Includes the last reason |
 | ⚠️ Possible missed posts | `lastSeen` wasn't in the scanned window |
 
 The heartbeat is `meta.lastSuccess`, written at most every **30 minutes**
@@ -195,7 +224,8 @@ integration), which the Worker pings after every successful run. Logs are in
 | `meta` | `lastSeen`, `sentAhead`, posts in progress, heartbeat, source-failure count, menu fingerprint |
 | `sub:<chatId>` | One key per subscriber; forum topic in metadata |
 | `sent:<postId>` | Send log `{chatId: status}`: `sending` (reserved) / `ok` / `uncertain` / `gone` / `failed`; 30-day TTL |
-| `analysis:<postId>` | Cached translation + tags; 7-day TTL |
+| `analysis:<postId>` | Cached translation + tags (and which model); 7-day TTL |
+| `gemini-error:<postId>` | Every failed Gemini attempt for that post (time, reason per model), first failure, when it gave up; 7-day TTL |
 | `alert:<kind>` | Exists while that alert is muted |
 
 **Consistency.** KV is eventually consistent: a write can take about 60 s to
@@ -216,6 +246,7 @@ by every Worker on the account:
 |---|---|
 | Heartbeat | 48/day (every 30 min) |
 | Each new post | 4: reservation + outcomes + analysis cache + cursor. That's per run, and independent of the number of subscribers |
+| Each failed Gemini attempt | 1 (`gemini-error:<post>`), at most ~4 per post (one per run during the 15 min retry window) |
 | Subscribe / unsubscribe / dead chat | 1 each |
 | Alerts | 1 each (mute) |
 
@@ -393,13 +424,16 @@ Vars live in `wrangler.toml` under `[vars]`:
 |---|---|---|
 | `DRY_RUN` | `"true"` | Previews to the admin only. Anything except `"false"` keeps it on |
 | `GEMINI_MODEL` | `gemini-3.8-flash` | Check *AI Studio → Rate limits* for your free tier |
-| `GEMINI_THINKING_LEVEL` | (model default) | `minimal`/`low`/`medium`/`high` |
+| `GEMINI_THINKING_LEVEL` | `low` | `minimal`/`low`/`medium`/`high`. Primary model only |
+| `GEMINI_FALLBACK_MODEL` | `gemini-3.5-flash-lite` | Asked in the same run when the primary fails. `""` disables it |
+| `GEMINI_TIMEOUT_SECONDS` | `12` | Per call |
+| `GEMINI_RETRY_MINUTES` | `15` | How long a failing post is retried before going out in English |
 | `STALE_ALERT_MINUTES` | `35` | ⏰ threshold (minimum 31: heartbeat interval + 1) |
 | `SOURCE_FAILURE_ALERT_RUNS` | `10` | 📡 threshold |
 | `ALERT_REPEAT_MINUTES` | `60` | Mute window per alert kind |
 | `MAX_SCAN_POSTS` | `100` | How far back a run looks for `lastSeen` |
 | `MAX_SUBREQUESTS` | `45` | Per run. Free plan: 50. Raise on Workers Paid |
-| `RUN_TIME_BUDGET_SECONDS` | `40` | Stop starting new work after this |
+| `RUN_TIME_BUDGET_SECONDS` | `90` | Stop starting new work after this (runs are 5 min apart) |
 
 ### Optional: deploy from GitHub
 
