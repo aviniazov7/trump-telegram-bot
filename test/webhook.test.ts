@@ -1,12 +1,12 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index";
-import { Store } from "../src/store";
-import { type Update, handleWebhook, timingSafeEqual, webhookPath } from "../src/webhook";
-import { TELEGRAM, fakeFetch, json } from "./helpers";
+import { openStore } from "../src/store";
+import { handleWebhook, timingSafeEqual, type Update, webhookPath } from "../src/webhook";
+import { fakeFetch, json, TELEGRAM } from "./helpers";
 
 const SECRET = "test-webhook-secret-0123456789abcdef"; // test-only, from vitest.config.ts
-const store = new Store(env.STATE);
+const store = openStore(env);
 
 beforeEach(async () => {
   for (const { name } of (await env.STATE.list()).keys) await env.STATE.delete(name);
@@ -18,7 +18,8 @@ function telegram(opts: { adminIds?: number[]; username?: string } = {}) {
     [TELEGRAM]: (call) => {
       const method = call.url.split("/").pop();
       const body = JSON.parse(call.body || "{}");
-      if (method === "getMe") return json({ ok: true, result: { username: opts.username ?? "TrumpHebrewBot" } });
+      if (method === "getMe")
+        return json({ ok: true, result: { username: opts.username ?? "TrumpHebrewBot" } });
       if (method === "getChatMember") {
         const status = opts.adminIds?.includes(body.user_id) ? "administrator" : "member";
         return json({ ok: true, result: { status } });
@@ -30,7 +31,10 @@ function telegram(opts: { adminIds?: number[]; username?: string } = {}) {
   return { ...fake, sent };
 }
 
-async function post(update: unknown, opts: { secret?: string; path?: string; method?: string; tg?: ReturnType<typeof telegram> } = {}) {
+async function post(
+  update: unknown,
+  opts: { secret?: string; path?: string; method?: string; tg?: ReturnType<typeof telegram> } = {},
+) {
   const tg = opts.tg ?? telegram();
   const path = opts.path ?? (await webhookPath(SECRET));
   const request = new Request(`https://bot.example${path}`, {
@@ -42,7 +46,11 @@ async function post(update: unknown, opts: { secret?: string; path?: string; met
   return { res, tg };
 }
 
-const msg = (text: string, chat: { id: number; type: string }, extra: Record<string, unknown> = {}): Update => ({
+const msg = (
+  text: string,
+  chat: { id: number; type: string },
+  extra: Record<string, unknown> = {},
+): Update => ({
   update_id: 1,
   message: { text, chat, from: { id: 42 }, ...extra },
 });
@@ -118,7 +126,9 @@ describe("commands", () => {
   });
 
   it("/trumphere inside a forum topic pins broadcasts to that topic", async () => {
-    const { tg } = await post(msg("/trumphere@TrumpHebrewBot", group, { is_topic_message: true, message_thread_id: 77 }));
+    const { tg } = await post(
+      msg("/trumphere@TrumpHebrewBot", group, { is_topic_message: true, message_thread_id: 77 }),
+    );
     expect(await store.getSubscriber("-1009876543210")).toEqual({ chatId: "-1009876543210", threadId: "77" });
     expect(tg.sent[0]).toMatchObject({ thread: 77 });
     expect(tg.sent[0]?.text).toContain("בנושא הזה");
@@ -144,7 +154,12 @@ describe("commands", () => {
   });
 
   it("ignores everything else", async () => {
-    for (const update of [msg("hello", privateChat), msg("/stats", privateChat), { update_id: 3 }, { message: { chat: privateChat } }]) {
+    for (const update of [
+      msg("hello", privateChat),
+      msg("/stats", privateChat),
+      { update_id: 3 },
+      { message: { chat: privateChat } },
+    ]) {
       const { res, tg } = await post(update);
       expect(res.status).toBe(200);
       expect(tg.sent).toEqual([]);
@@ -154,7 +169,10 @@ describe("commands", () => {
 });
 
 describe("bot added to / removed from a chat", () => {
-  const membership = (status: string, chat = group) => ({ update_id: 9, my_chat_member: { chat, new_chat_member: { status } } });
+  const membership = (status: string, chat = group) => ({
+    update_id: 9,
+    my_chat_member: { chat, new_chat_member: { status } },
+  });
 
   it("subscribes and welcomes once when added", async () => {
     const first = await post(membership("administrator"));

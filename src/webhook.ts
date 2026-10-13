@@ -14,7 +14,7 @@ import { loadConfig } from "./config";
 import type { Env } from "./env";
 import { toHex } from "./log";
 import { type Ctx, type Fetcher, makeCtx } from "./runtime";
-import { Store } from "./store";
+import { openStore, type Store } from "./store";
 import { sendMessage, telegramCall } from "./telegram";
 
 export const MIN_SECRET_LENGTH = 32;
@@ -40,10 +40,16 @@ export function timingSafeEqual(a: string, b: string): boolean {
 
 const notFound = () => new Response("Not found", { status: 404 });
 
-export async function handleWebhook(request: Request, env: Env, opts: { fetch?: Fetcher } = {}): Promise<Response> {
+export async function handleWebhook(
+  request: Request,
+  env: Env,
+  opts: { fetch?: Fetcher } = {},
+): Promise<Response> {
   const cfg = loadConfig(env);
   if (cfg.webhookSecret.length < MIN_SECRET_LENGTH || !cfg.botToken) {
-    console.error("Webhook disabled: TELEGRAM_WEBHOOK_SECRET (>= 32 chars) and TELEGRAM_BOT_TOKEN must be set");
+    console.error(
+      "Webhook disabled: TELEGRAM_WEBHOOK_SECRET (>= 32 chars) and TELEGRAM_BOT_TOKEN must be set",
+    );
     return notFound();
   }
   const url = new URL(request.url);
@@ -66,7 +72,7 @@ export async function handleWebhook(request: Request, env: Env, opts: { fetch?: 
 
   const ctx = makeCtx({ ...cfg, runTimeBudgetMs: WEBHOOK_TIME_BUDGET_MS }, { fetch: opts.fetch });
   try {
-    await handleUpdate(ctx, new Store(env.STATE), update);
+    await handleUpdate(ctx, openStore(env), update);
   } catch (err) {
     // 500 makes Telegram redeliver the update later, so a KV hiccup doesn't
     // lose a /start.
@@ -112,8 +118,10 @@ const STOPPED = "🛑 הפסקתי לשלוח לכאן את הפוסטים של 
 const REMOVE_KEYBOARD = { remove_keyboard: true };
 
 async function welcome(ctx: Ctx, chatId: string, chatType: string, threadId: string | null): Promise<void> {
-  if (chatType === "private") await sendMessage(ctx, chatId, WELCOME_PRIVATE, { replyMarkup: REMOVE_KEYBOARD });
-  else if (GROUP_TYPES.has(chatType)) await sendMessage(ctx, chatId, threadId ? WELCOME_TOPIC : WELCOME_GROUP, { threadId });
+  if (chatType === "private")
+    await sendMessage(ctx, chatId, WELCOME_PRIVATE, { replyMarkup: REMOVE_KEYBOARD });
+  else if (GROUP_TYPES.has(chatType))
+    await sendMessage(ctx, chatId, threadId ? WELCOME_TOPIC : WELCOME_GROUP, { threadId });
 }
 
 /** The bot's @username, cached in KV (only needed for "/cmd@bot" in groups). */
@@ -129,7 +137,12 @@ async function botUsername(ctx: Ctx, store: Store): Promise<string> {
 
 async function isGroupAdmin(ctx: Ctx, chatId: string, userId: number | undefined): Promise<boolean> {
   if (userId === undefined) return false;
-  const r = await telegramCall(ctx, "getChatMember", { chat_id: chatId, user_id: userId }, { idempotent: true });
+  const r = await telegramCall(
+    ctx,
+    "getChatMember",
+    { chat_id: chatId, user_id: userId },
+    { idempotent: true },
+  );
   const status = (r.result as { status?: string } | undefined)?.status;
   return status === "creator" || status === "administrator";
 }
@@ -169,10 +182,16 @@ export async function handleUpdate(ctx: Ctx, store: Store, update: Update): Prom
   if (mention && mention !== (await botUsername(ctx, store))) return;
 
   // Only a real forum topic pins broadcasts; a reply thread is not one.
-  const threadId = message.is_topic_message && message.message_thread_id !== undefined ? String(message.message_thread_id) : null;
+  const threadId =
+    message.is_topic_message && message.message_thread_id !== undefined
+      ? String(message.message_thread_id)
+      : null;
 
   if (command === "stop") {
-    if (chatType !== "private" && !(GROUP_TYPES.has(chatType) && (await isGroupAdmin(ctx, chatId, message.from?.id)))) {
+    if (
+      chatType !== "private" &&
+      !(GROUP_TYPES.has(chatType) && (await isGroupAdmin(ctx, chatId, message.from?.id)))
+    ) {
       return;
     }
     await store.deleteSubscriber(chatId);

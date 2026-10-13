@@ -8,9 +8,9 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { runCron } from "../src/broadcast";
 import { msUntilQuotaReset, parseQuotaInfo } from "../src/gemini";
 import { resetMemoryMutes } from "../src/monitor";
-import { Store, emptyMeta } from "../src/store";
+import { emptyMeta, openStore } from "../src/store";
 import { analyzePost } from "../src/tagging";
-import { type Call, GEMINI, RSS_HOST, TELEGRAM, geminiAnswer, json, rssFeed, testCtx } from "./helpers";
+import { type Call, GEMINI, geminiAnswer, json, RSS_HOST, rssFeed, TELEGRAM, testCtx } from "./helpers";
 
 const LITE = "gemini-3.5-flash-lite";
 const FLASH = "gemini-3.8-flash";
@@ -52,9 +52,10 @@ const MINUTE_429 = JSON.stringify({
 const ok = () => json(geminiAnswer({ hebrew: HEBREW, categories: ["tariffs"], impact: "high" }));
 const daily = () => new Response(DAILY_429, { status: 429 });
 
-const store = new Store(env.STATE);
+const store = openStore(env);
 beforeEach(async () => {
   for (const { name } of (await env.STATE.list()).keys) await env.STATE.delete(name);
+  await env.COORDINATOR.getByName("cron").reset();
   resetMemoryMutes();
 });
 const tracker = {
@@ -64,8 +65,14 @@ const tracker = {
 
 describe("parseQuotaInfo", () => {
   it("tells a per-day quota from a per-minute one", () => {
-    expect(parseQuotaInfo(DAILY_429)).toEqual({ scope: "day", quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" });
-    expect(parseQuotaInfo(MINUTE_429)).toEqual({ scope: "minute", quotaId: "GenerateRequestsPerMinutePerProjectPerModel-FreeTier" });
+    expect(parseQuotaInfo(DAILY_429)).toEqual({
+      scope: "day",
+      quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+    });
+    expect(parseQuotaInfo(MINUTE_429)).toEqual({
+      scope: "minute",
+      quotaId: "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+    });
     expect(parseQuotaInfo('{"error":{"code":429}}').scope).toBe("unknown");
   });
 });
@@ -91,7 +98,9 @@ describe("daily quota tracking", () => {
     const first = testCtx({ [GEMINI]: (c) => (modelOf(c) === LITE ? daily() : ok()) }, {}, { now: () => at });
     const a = await analyzePost(first, ENGLISH, tracker);
     expect(a).toMatchObject({ translated: true, model: FLASH });
-    expect(a.geminiError).toContain("daily quota exhausted (GenerateRequestsPerDayPerProjectPerModel-FreeTier)");
+    expect(a.geminiError).toContain(
+      "daily quota exhausted (GenerateRequestsPerDayPerProjectPerModel-FreeTier)",
+    );
     expect(await store.geminiQuotaExhausted(LITE)).toContain("daily quota");
     // KV sets the expiry from the real clock: the TTL must be the time to the reset.
     const key = (await env.STATE.list({ prefix: "gemini-quota:" })).keys[0];

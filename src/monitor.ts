@@ -4,18 +4,14 @@ import { KvWriteError, type Meta, type Store } from "./store";
 import { sendMessage } from "./telegram";
 
 /**
- * Refresh the stored heartbeat at most this often. Each refresh is a KV write
- * (free plan: 1,000 writes/day per account), so 30 min → 48 writes/day.
- */
-export const HEARTBEAT_WRITE_MS = 30 * 60 * 1000;
-
-/**
- * The in-band "no successful run" alert can't fire sooner than the heartbeat
- * is refreshed, or every healthy run would look stale. Faster detection is
- * HEALTHCHECK_URL's job (it costs no KV writes).
+ * How long since the last *successful* run before the in-band alert.
+ * The heartbeat is the end of that run, written every time, so this is a
+ * real gap. Writing it only every 30 minutes made the next cron (5 min
+ * later, a few seconds past the threshold) look like a 35-minute outage.
+ * Faster detection is HEALTHCHECK_URL's job.
  */
 export function staleThresholdMs(staleAlertMinutes: number): number {
-  return Math.max(staleAlertMinutes * 60_000, HEARTBEAT_WRITE_MS + 60_000);
+  return staleAlertMinutes * 60_000;
 }
 
 /**
@@ -94,16 +90,25 @@ const ISRAEL_SHORT = new Intl.DateTimeFormat("en-GB", {
 });
 
 /**
- * Alert when the previous successful run is older than STALE_ALERT_MINUTES
- * (but never sooner than the heartbeat interval allows; see staleThresholdMs).
+ * Alert when the previous successful run is older than STALE_ALERT_MINUTES.
  * Fires at the start of the first run after an outage; a Worker that isn't
  * running at all can't report anything — HEALTHCHECK_URL covers that.
+ *
+ * The Durable Object copy wins over `meta.lastSuccess` when it is newer, so
+ * a stale KV read (or a lost meta write) can't page for a run that succeeded.
  */
 export async function checkHeartbeat(ctx: Ctx, store: Store, meta: Meta): Promise<void> {
-  if (!meta.lastSuccess) return;
-  const gap = ctx.now() - meta.lastSuccess;
+  let beat = 0;
+  try {
+    beat = await store.heartbeat();
+  } catch (err) {
+    ctx.log.warn("Heartbeat read failed:", err);
+  }
+  const last = Math.max(meta.lastSuccess, beat);
+  if (!last) return;
+  const gap = ctx.now() - last;
   if (gap <= staleThresholdMs(ctx.cfg.staleAlertMinutes)) return;
-  const since = ISRAEL_SHORT.format(new Date(meta.lastSuccess)).replace(",", "");
+  const since = ISRAEL_SHORT.format(new Date(last)).replace(",", "");
   ctx.log.warn(`No successful run for ${Math.round(gap / 1000)}s`);
   await alertAdmin(
     ctx,
@@ -130,9 +135,14 @@ export async function recordSourceFailure(ctx: Ctx, store: Store, meta: Meta): P
 }
 
 /** Mark the run successful: refresh the heartbeat and ping HEALTHCHECK_URL. */
-export async function recordSuccess(ctx: Ctx, meta: Meta): Promise<void> {
+export async function recordSuccess(ctx: Ctx, store: Store, meta: Meta): Promise<void> {
   meta.sourceFailures = 0;
-  if (ctx.now() - meta.lastSuccess >= HEARTBEAT_WRITE_MS) meta.lastSuccess = ctx.now();
+  meta.lastSuccess = ctx.now();
+  try {
+    await store.markHeartbeat(ctx.now());
+  } catch (err) {
+    ctx.log.warn("Heartbeat write failed:", err);
+  }
   if (ctx.cfg.healthcheckUrl && ctx.budget.canFetch()) {
     try {
       await ctx.http(ctx.cfg.healthcheckUrl, { timeoutMs: 5000 });

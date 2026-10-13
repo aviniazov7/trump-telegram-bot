@@ -1,24 +1,27 @@
 /**
  * The cron run: fetch → analyze → deliver, resumable and idempotent.
  *
- * Delivery of each post is tracked in its send log (store.ts). A run reserves
- * the chats it is about to send to BEFORE sending, then records the
- * outcomes, so a run that stops anywhere — out of subrequests, out of time,
- * killed, or because KV stopped accepting writes — never repeats a send. The
- * next run picks up exactly where it left off.
+ * Delivery of each post is claimed in the Coordinator Durable Object BEFORE
+ * sending, then the outcomes are recorded. A run that stops anywhere — out
+ * of subrequests, out of time, killed, or because KV stopped accepting
+ * writes — never repeats a send. Overlapping cron invocations take a lease
+ * on that same object and the loser leaves the tick alone. The next run
+ * picks up exactly where the winner left off.
  *
  * Any failed KV write stops all further sends in the run at once (a send
  * whose record can't be saved would otherwise be repeated by every later
  * run), and alerts the admin.
  */
+
+import { RUN_LEASE_MS } from "./coordinator";
 import { scrub, toHex } from "./log";
 import { buildMessage, translatableText } from "./message";
 import { alertAdmin, checkHeartbeat, recordSourceFailure, recordSuccess } from "./monitor";
 import { advanceCursor, filterNewPosts, sendOrder } from "./posts";
 import type { Ctx } from "./runtime";
-import { type Post, contains, fetchPosts } from "./sources";
-import { KvWriteError, type Meta, type SendLog, type Store, type Subscriber } from "./store";
-import { type PostAnalysis, analyzePost } from "./tagging";
+import { contains, fetchPosts, type Post, pureRepostIds } from "./sources";
+import { KvWriteError, type Meta, type Store, type Subscriber } from "./store";
+import { analyzePost, type PostAnalysis } from "./tagging";
 import { sendMessage, telegramCall } from "./telegram";
 import { htmlEscape, splitForTelegram } from "./text";
 
@@ -26,8 +29,6 @@ import { htmlEscape, splitForTelegram } from "./text";
 export const POST_RETRY_WINDOW_MS = 60 * 60 * 1000;
 /** Subrequests kept back for alerts and the healthcheck ping. */
 const RESERVED_SUBREQUESTS = 2;
-/** KV allows one write per second to the same key; reservation → result. */
-export const SAME_KEY_WRITE_GAP_MS = 1100;
 /** How long a KV-failure alert stays muted (the free-plan quota resets daily). */
 const KV_ALERT_MUTE_MINUTES = 12 * 60;
 
@@ -39,9 +40,13 @@ export const BOT_MENU_CONFIG: [string, unknown][] = [
 
 /** Fingerprint of the menu config, keyed with the bot token (a new bot → new fingerprint). */
 export async function menuFingerprint(botToken: string, config = BOT_MENU_CONFIG): Promise<string> {
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(botToken), { name: "HMAC", hash: "SHA-256" }, false, [
-    "sign",
-  ]);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(botToken),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
   const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(JSON.stringify(config)));
   return toHex(sig).slice(0, 16);
 }
@@ -66,7 +71,13 @@ interface Prepared {
 type DeliveryOutcome = "done" | "retry-later" | "out-of-budget";
 
 /** A post with no words needs no translation, tags or Gemini call. */
-const MEDIA_ONLY: PostAnalysis = { hebrew: "", translated: true, categories: [], impact: null, provider: "none" };
+const MEDIA_ONLY: PostAnalysis = {
+  hebrew: "",
+  translated: true,
+  categories: [],
+  impact: null,
+  provider: "none",
+};
 
 /** In dry run every preview is logged under this pseudo-chat, never a real one. */
 const DRY_RUN_CHAT = "dry-run";
@@ -77,38 +88,52 @@ interface Target extends Subscriber {
 }
 
 /**
- * Deliver one post to every target that has no entry in its send log.
+ * Deliver one post to every target that has no claim yet.
  *
- *   1. Reserve: write the batch as "sending". If this fails, nothing is sent.
+ *   1. Claim, in the Durable Object: the chats this run may send to. A chat
+ *      already claimed (by this run or another) is skipped. If the claim
+ *      throws, nothing is sent.
  *   2. Send, collecting outcomes in memory.
- *   3. Record: write the outcomes. "retry" entries are dropped so the next
- *      run tries those chats again. If this write fails, the reserved chats
- *      stay "sending" and are treated as delivered — never sent twice.
+ *   3. Record the outcomes. "retry" and chats never attempted are released
+ *      so the next run can take them. If the KV mirror write fails, the
+ *      object still holds the claim — at most once, never twice.
  *
- * Two KV writes per post per run, however many subscribers there are.
+ * One KV write per post per run (the mirror), however many subscribers.
  */
-async function deliverPost(ctx: Ctx, store: Store, item: Prepared, targets: Target[]): Promise<DeliveryOutcome> {
+async function deliverPost(
+  ctx: Ctx,
+  store: Store,
+  item: Prepared,
+  targets: Target[],
+): Promise<DeliveryOutcome> {
   const id = item.post.id;
-  const log: SendLog = await store.getSendLog(id);
-  const todo = targets.filter((t) => !log[t.logKey]);
-  if (!todo.length) return "done";
-
   const perSend = splitForTelegram(item.message).length;
-  const room = Math.floor((ctx.budget.maxSubrequests - ctx.budget.subrequestsUsed - RESERVED_SUBREQUESTS) / perSend);
+  const room = Math.floor(
+    (ctx.budget.maxSubrequests - ctx.budget.subrequestsUsed - RESERVED_SUBREQUESTS) / perSend,
+  );
   if (room <= 0 || ctx.budget.timeUp()) return "out-of-budget";
+
+  const claimed = new Set(
+    await store.claimSends(
+      id,
+      targets.map((t) => t.logKey),
+      ctx.now(),
+    ),
+  );
+  const todo = targets.filter((t) => claimed.has(t.logKey));
+  if (!todo.length) return "done";
   const batch = todo.slice(0, room);
 
-  for (const t of batch) log[t.logKey] = "sending";
-  const reservedAt = ctx.now();
-  await store.putSendLog(id, log); // throws KvWriteError → nothing sent
+  const updates: Record<string, string | null> = {};
+  for (const target of todo.slice(room)) updates[target.logKey] = null;
 
   let retryLater = false;
   let stopped = false;
   let kvError: KvWriteError | null = null;
   for (const target of batch) {
     if (stopped || ctx.budget.timeUp()) {
-      // Reserved but not attempted: release it for the next run.
-      delete log[target.logKey];
+      // Claimed but not attempted: release it for the next run.
+      updates[target.logKey] = null;
       stopped = true;
       continue;
     }
@@ -117,20 +142,22 @@ async function deliverPost(ctx: Ctx, store: Store, item: Prepared, targets: Targ
       reserve: RESERVED_SUBREQUESTS,
     });
     if (result.status === "retry") {
-      delete log[target.logKey]; // definitely not delivered
+      updates[target.logKey] = null; // definitely not delivered
       retryLater = true;
     } else {
-      log[target.logKey] = result.status;
+      updates[target.logKey] = result.status;
     }
     try {
       if (!ctx.cfg.dryRun && result.migratedTo) {
-        log[result.migratedTo] = result.status;
+        updates[result.migratedTo] = result.status;
         await store.deleteSubscriber(target.chatId);
         await store.putSubscriber(result.migratedTo, target.threadId);
       }
       if (!ctx.cfg.dryRun && result.status === "gone") {
         await store.deleteSubscriber(target.chatId);
-        ctx.log.info(`Unsubscribed ${await ctx.log.chat(target.chatId)}: blocked the bot or no longer exists`);
+        ctx.log.info(
+          `Unsubscribed ${await ctx.log.chat(target.chatId)}: blocked the bot or no longer exists`,
+        );
       }
     } catch (err) {
       if (!(err instanceof KvWriteError)) throw err;
@@ -142,9 +169,7 @@ async function deliverPost(ctx: Ctx, store: Store, item: Prepared, targets: Targ
     await ctx.sleep(40);
   }
 
-  const wait = SAME_KEY_WRITE_GAP_MS - (ctx.now() - reservedAt);
-  if (wait > 0) await ctx.sleep(wait);
-  await store.putSendLog(id, log); // throws KvWriteError → reservation stands
+  await store.recordSends(id, updates, ctx.now()); // KV mirror throws KvWriteError; the claim stands
   if (kvError) throw kvError;
 
   if (stopped || batch.length < todo.length) return "out-of-budget";
@@ -152,16 +177,38 @@ async function deliverPost(ctx: Ctx, store: Store, item: Prepared, targets: Targ
 }
 
 /** Who receives posts this run. In dry run: only the admin, as a preview. */
-async function deliveryTargets(ctx: Ctx, store: Store): Promise<{ targets: Target[]; subscriberCount: number }> {
+async function deliveryTargets(
+  ctx: Ctx,
+  store: Store,
+): Promise<{ targets: Target[]; subscriberCount: number }> {
   const subscribers = await store.listSubscribers();
   if (!ctx.cfg.dryRun) {
-    return { targets: subscribers.map((s) => ({ ...s, logKey: s.chatId })), subscriberCount: subscribers.length };
+    return {
+      targets: subscribers.map((s) => ({ ...s, logKey: s.chatId })),
+      subscriberCount: subscribers.length,
+    };
   }
-  const targets = ctx.cfg.adminChatId ? [{ chatId: ctx.cfg.adminChatId, threadId: null, logKey: DRY_RUN_CHAT }] : [];
+  const targets = ctx.cfg.adminChatId
+    ? [{ chatId: ctx.cfg.adminChatId, threadId: null, logKey: DRY_RUN_CHAT }]
+    : [];
   return { targets, subscriberCount: subscribers.length };
 }
 
-export async function runCron(ctx: Ctx, store: Store): Promise<void> {
+export async function runCron(ctx: Ctx, store: Store): Promise<"ok" | "busy"> {
+  const token = await store.tryAcquire(ctx.now(), RUN_LEASE_MS);
+  if (!token) {
+    ctx.log.info("Another run holds the lease — skipping this tick");
+    return "busy";
+  }
+  try {
+    await runCronBody(ctx, store);
+    return "ok";
+  } finally {
+    await store.release(token);
+  }
+}
+
+async function runCronBody(ctx: Ctx, store: Store): Promise<void> {
   const meta = await store.getMeta();
   let saved = JSON.stringify(meta);
   /** Write meta only if it changed since the last write. */
@@ -206,6 +253,14 @@ async function runSteps(ctx: Ctx, store: Store, meta: Meta, persist: () => Promi
   }
 
   const fresh = filterNewPosts(posts, meta.lastSeen);
+  // A wordless RT of a status already in this window is the same post again
+  // (Truth Social archives the original and the boost under two ids). Mark
+  // it done so the cursor can pass it, and don't deliver it.
+  const reposts = new Set(pureRepostIds(posts));
+  const skipping = fresh.filter((p) => reposts.has(p.id));
+  if (skipping.length)
+    ctx.log.info(`Skipping ${skipping.length} pure re-post(s) already covered by the original`);
+  for (const post of skipping) if (!meta.sentAhead.includes(post.id)) meta.sentAhead.push(post.id);
   const chronological = fresh.map((p) => p.id);
   advanceCursor(meta, chronological);
   // Forget progress on posts that are no longer pending (stale entries).
@@ -213,7 +268,7 @@ async function runSteps(ctx: Ctx, store: Store, meta: Meta, persist: () => Promi
 
   const todo = fresh.filter((p) => !meta.sentAhead.includes(p.id));
   if (todo.length) await deliverNewPosts(ctx, store, meta, todo, chronological, persist);
-  await recordSuccess(ctx, meta);
+  await recordSuccess(ctx, store, meta);
 }
 
 async function haltOnKvFailure(ctx: Ctx, store: Store, err: KvWriteError): Promise<void> {
@@ -238,7 +293,9 @@ async function deliverNewPosts(
   persist: () => Promise<void>,
 ) {
   const { targets, subscriberCount } = await deliveryTargets(ctx, store);
-  ctx.log.info(`${todo.length} new post(s) for ${subscriberCount} subscriber(s)${ctx.cfg.dryRun ? " [DRY RUN]" : ""}`);
+  ctx.log.info(
+    `${todo.length} new post(s) for ${subscriberCount} subscriber(s)${ctx.cfg.dryRun ? " [DRY RUN]" : ""}`,
+  );
 
   // Translate and classify first (cached per post), so high-impact posts can
   // jump the queue and a resumed post is sent with identical text.
@@ -271,12 +328,18 @@ async function deliverNewPosts(
           );
           continue; // not sent this run; newer posts may go ahead (sentAhead)
         }
-        ctx.log.error(`Post ${post.id}: still no translation after ${Math.floor(waited / 60_000)} min — sending in English`);
+        ctx.log.error(
+          `Post ${post.id}: still no translation after ${Math.floor(waited / 60_000)} min — sending in English`,
+        );
         await store.putGeminiFailures({ ...record, gaveUpAt: ctx.now() });
         // Frozen, so every chat gets the same English message.
         await store.putAnalysis(post.id, fresh);
         analysis = fresh;
-        gaveUp.push({ id: post.id, error: fresh.geminiError ?? "unknown", quota: Boolean(fresh.quotaExhausted) });
+        gaveUp.push({
+          id: post.id,
+          error: fresh.geminiError ?? "unknown",
+          quota: Boolean(fresh.quotaExhausted),
+        });
       }
     }
     let message = buildMessage(post, analysis);

@@ -1,3 +1,0 @@
-# Test-time tools only. The bot itself needs nothing beyond the standard
-# library (see requirements.txt).
-coverage==7.6.1

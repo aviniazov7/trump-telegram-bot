@@ -66,7 +66,7 @@ for f in $files; do
   # Supergroup/channel chat IDs (-100 + 10 digits). Tests use obviously fake
   # ones, and docs use placeholders, so only code and config are checked.
   case "$f" in
-    test/*|legacy/tests/*|*.md) ;;
+    test/*|*.md) ;;
     *) grep -Eq -- '-100[0-9]{10}' <<<"$text" && report "$f" "Telegram group/channel chat ID" ;;
   esac
   if [[ -s "$chat_ids_file" ]] && grep -Fqx -f <(grep -Eo -- '-?[0-9]+' "$chat_ids_file") <(grep -Eo -- '-?[0-9]{5,}' <<<"$text"); then
