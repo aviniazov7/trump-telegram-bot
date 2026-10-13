@@ -8,8 +8,10 @@ import { runCron } from "./broadcast";
 import { loadConfig } from "./config";
 import type { Env } from "./env";
 import { makeCtx } from "./runtime";
-import { Store } from "./store";
+import { openStore } from "./store";
 import { handleWebhook } from "./webhook";
+
+export { Coordinator } from "./coordinator";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -17,7 +19,7 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 
-  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+  async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     const cfg = loadConfig(env);
     if (!cfg.botToken) {
       console.error("TELEGRAM_BOT_TOKEN is not set — run `wrangler secret put TELEGRAM_BOT_TOKEN`");
@@ -25,7 +27,9 @@ export default {
     }
     const ctx = makeCtx(cfg);
     ctx.log.info(`Run start${cfg.dryRun ? " [DRY RUN]" : ""}`);
-    await runCron(ctx, new Store(env.STATE));
+    const outcome = await runCron(ctx, openStore(env));
+    // A duplicate dispatch should not be retried; the run that holds the lease is doing the work.
+    if (outcome === "busy") controller.noRetry();
     ctx.log.info(`Run end — ${ctx.budget.subrequestsUsed} subrequest(s)`);
   },
 } satisfies ExportedHandler<Env>;

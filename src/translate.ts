@@ -6,7 +6,6 @@
  * Cloudflare's network on 2026-10-12, Google's endpoints answered 429,
  * Lingva 403/400 and MyMemory "quota used up" — every time. Gemini (primary
  * and fallback model) is the only translator; see tagging.ts → analyzePost.
- * The legacy Python bot still has the keyless chain.
  */
 
 const HEBREW_RE = /[\u0590-\u05FF]/;

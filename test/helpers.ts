@@ -49,6 +49,7 @@ export const timeout = (): never => {
 export function testConfig(overrides: Partial<Config> = {}, env: Partial<Env> = {}): Config {
   const base = loadConfig({
     STATE: undefined as unknown as KVNamespace,
+    COORDINATOR: undefined as unknown as Env["COORDINATOR"],
     TELEGRAM_BOT_TOKEN: "test-bot-token",
     TELEGRAM_WEBHOOK_SECRET: "test-webhook-secret-0123456789abcdef",
     GEMINI_API_KEY: "test-gemini-key",

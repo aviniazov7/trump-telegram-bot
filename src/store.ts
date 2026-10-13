@@ -5,11 +5,12 @@
  *   meta                    cursor (lastSeen, sentAhead), posts in progress,
  *                           heartbeat, source-failure counter, menu fingerprint
  *   sub:<chatId>            one key per subscriber; forum topic in metadata
- *   sent:<postId>           send log for that post: { chatId: status }.
- *                           Written twice per post per run — the batch is
- *                           reserved ("sending") BEFORE anything is sent,
- *                           then the outcomes are recorded. Expires after
- *                           30 days.
+ *   sent:<postId>           mirror of the send claim in the Coordinator
+ *                           Durable Object: { chatId: status }. The object
+ *                           is what makes a send exactly-once; this key is
+ *                           written once per post per run for operators and
+ *                           for a deploy that still has claims only in KV.
+ *                           Expires after 30 days.
  *   analysis:<postId>       cached translation + tags, so a resumed post is
  *                           sent with the exact same text. Expires after 7 days.
  *   gemini-quota:<model>    exists while that model's daily free quota is used
@@ -20,12 +21,12 @@
  *                           `npm run gemini-errors`.
  *   alert:<kind>            exists while that alert is muted (TTL = repeat window)
  *
- * Why the send log is reserved before sending: a KV write can fail (the free
- * plan allows 1,000 writes a day per account). If the record were written
- * only after a send, a failed write would leave no trace and the next run
- * would send the post again. With the reservation, a failed reservation
- * means nothing is sent, and a failed final write leaves the chats marked
- * "sending", which counts as delivered — at most once, never twice.
+ * Why claims live in the Durable Object: KV is eventually consistent and
+ * cannot compare-and-swap. Two overlapping runs can both read an empty
+ * `sent:<post>` and both deliver. The object reserves each chat before the
+ * send. A failed reservation sends nothing. A failed mirror write leaves
+ * the object holding "sending" or the final status, which counts as
+ * delivered — at most once, never twice. The KV key is a mirror of that.
  *
  * Subscribers are one key each: the webhook (adding) and the cron (removing
  * dead chats) never write the same key, so neither overwrites the other.
@@ -33,6 +34,8 @@
  * Every write goes through write(): any failure becomes a KvWriteError, which
  * stops the run's sends immediately (see broadcast.ts).
  */
+import { RUN_LOCK_NAME, type RunLock } from "./coordinator";
+import type { Env } from "./env";
 import type { Cursor } from "./posts";
 import type { PostAnalysis } from "./tagging";
 import type { SendStatus } from "./telegram";
@@ -94,11 +97,50 @@ export interface GeminiFailureRecord {
 /** KV's minimum expirationTtl. */
 const MIN_TTL_S = 60;
 
+export function openStore(env: Env, kv: KVNamespace = env.STATE): Store {
+  return new Store(kv, env.COORDINATOR.getByName(RUN_LOCK_NAME));
+}
+
 export class Store {
   /** KV writes made through this Store (for logs and tests). */
   writes = 0;
 
-  constructor(private readonly kv: KVNamespace) {}
+  constructor(
+    private readonly kv: KVNamespace,
+    private readonly lock: RunLock,
+  ) {}
+
+  tryAcquire(now: number, ttlMs: number): Promise<string | null> {
+    return this.lock.tryAcquire(now, ttlMs);
+  }
+
+  release(token: string): Promise<void> {
+    return this.lock.release(token);
+  }
+
+  heartbeat(): Promise<number> {
+    return this.lock.heartbeat();
+  }
+
+  markHeartbeat(now: number): Promise<void> {
+    return this.lock.markHeartbeat(now);
+  }
+
+  /**
+   * Chats this run may send this post to. KV's mirror counts as already
+   * sent (so existing claims survive the move to the Durable Object) and
+   * is imported into the object on first claim.
+   */
+  async claimSends(postId: string, chatIds: string[], now: number): Promise<string[]> {
+    const prior = await this.getSendLog(postId);
+    return this.lock.claim(postId, chatIds, prior, now);
+  }
+
+  /** Record outcomes in the object, then mirror the full log to KV. */
+  async recordSends(postId: string, updates: Record<string, string | null>, now: number): Promise<void> {
+    await this.lock.record(postId, updates, now);
+    await this.putSendLog(postId, (await this.lock.getLog(postId)) as SendLog);
+  }
 
   private async write(what: string, op: () => Promise<void>): Promise<void> {
     try {
@@ -141,7 +183,9 @@ export class Store {
 
   async putSubscriber(chatId: string, threadId: string | null): Promise<void> {
     // Thread in metadata, so listSubscribers needs no per-key reads.
-    await this.write("subscriber", () => this.kv.put(`sub:${chatId}`, "1", { metadata: { thread: threadId } }));
+    await this.write("subscriber", () =>
+      this.kv.put(`sub:${chatId}`, "1", { metadata: { thread: threadId } }),
+    );
   }
 
   async deleteSubscriber(chatId: string): Promise<void> {
@@ -182,7 +226,9 @@ export class Store {
 
   async putGeminiFailures(record: GeminiFailureRecord): Promise<void> {
     await this.write("gemini error", () =>
-      this.kv.put(`gemini-error:${record.postId}`, JSON.stringify(record), { expirationTtl: GEMINI_ERROR_TTL_S }),
+      this.kv.put(`gemini-error:${record.postId}`, JSON.stringify(record), {
+        expirationTtl: GEMINI_ERROR_TTL_S,
+      }),
     );
   }
 
@@ -193,7 +239,9 @@ export class Store {
 
   async markGeminiQuotaExhausted(model: string, reason: string, seconds: number): Promise<void> {
     await this.write("gemini quota", () =>
-      this.kv.put(`gemini-quota:${model}`, reason, { expirationTtl: Math.max(MIN_TTL_S, Math.ceil(seconds)) }),
+      this.kv.put(`gemini-quota:${model}`, reason, {
+        expirationTtl: Math.max(MIN_TTL_S, Math.ceil(seconds)),
+      }),
     );
   }
 

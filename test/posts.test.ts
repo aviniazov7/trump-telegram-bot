@@ -1,16 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { type Cursor, advanceCursor, filterNewPosts, sendOrder } from "../src/posts";
+import { advanceCursor, type Cursor, filterNewPosts, sendOrder } from "../src/posts";
 import {
   CNN_FRESH_BYTES,
   CNN_READ_BYTES,
-  type Post,
   fetchPosts,
   freshRssUrl,
   leadingJsonObjects,
   mergePosts,
   newestFirst,
+  type Post,
   parseCnnArchive,
   parseRss,
+  pureRepostIds,
 } from "../src/sources";
 import { CNN_HOST, RSS_HOST, rssFeed, testCtx } from "./helpers";
 
@@ -122,19 +123,64 @@ describe("sources", () => {
     ]);
     const posts = parseCnnArchive(text, 100);
     expect(ids(posts)).toEqual(["3", "1"]);
-    expect(posts[0]).toMatchObject({ text: "Big news & more", url: "https://truthsocial.com/@realDonaldTrump/3" });
+    expect(posts[0]).toMatchObject({
+      text: "Big news & more",
+      url: "https://truthsocial.com/@realDonaldTrump/3",
+    });
+  });
+
+  it("treats a wordless RT as a re-post of that status, and keeps one that adds words", () => {
+    const video = "117433335383227958";
+    const repost = "117433336229580757";
+    const quote =
+      `<p><span><br />RT: https://truthsocial.com/users/realDonaldTrump/statuses/${video}</span></p>` +
+      '<p><a href="https://archive.example/b.jpg">View image</a></p>' +
+      '<blockquote><p></p><p><a href="https://archive.example/a.mp4">View video</a></p></blockquote>';
+    const commentary = `<p>Look at this<br />RT: https://truthsocial.com/users/realDonaldTrump/statuses/${video}</p>`;
+    const xml = (id: string, description: string) =>
+      `<rss><channel><item><title>x</title><description><![CDATA[${description}]]></description>` +
+      `<pubDate>Tue, 13 Oct 2026 11:21:00 +0000</pubDate><truth:originalId>${id}</truth:originalId>` +
+      `<truth:originalUrl>https://truthsocial.com/@realDonaldTrump/${id}</truth:originalUrl></item>` +
+      `<item><title>Video</title><description><![CDATA[<p></p><p><a href="https://archive.example/a.mp4">View video</a></p>]]></description>` +
+      `<pubDate>Tue, 13 Oct 2026 11:21:00 +0000</pubDate><truth:originalId>${video}</truth:originalId>` +
+      `<truth:originalUrl>https://truthsocial.com/@realDonaldTrump/${video}</truth:originalUrl></item></channel></rss>`;
+
+    const bare = parseRss(xml(repost, quote), 10);
+    expect(bare.find((p) => p.id === repost)?.repostOf).toBe(video);
+    expect(pureRepostIds(bare)).toEqual([repost]);
+
+    const withWords = parseRss(xml("117433336229580758", commentary), 10);
+    expect(withWords.find((p) => p.id === "117433336229580758")?.text).toContain("Look at this");
+    expect(pureRepostIds(withWords)).toEqual([]);
+
+    const alone = parseRss(
+      `<rss><channel><item><title>Quote</title><description><![CDATA[${quote}]]></description>` +
+        `<truth:originalId>${repost}</truth:originalId><truth:originalUrl>https://truthsocial.com/@realDonaldTrump/${repost}</truth:originalUrl>` +
+        `</item></channel></rss>`,
+      10,
+    );
+    expect(pureRepostIds(alone)).toEqual([]);
   });
 
   it("sorts newest first by numeric snowflake ID", () => {
-    expect(ids(newestFirst(feed("2", "117418148236895862", "10")))).toEqual(["117418148236895862", "10", "2"]);
+    expect(ids(newestFirst(feed("2", "117418148236895862", "10")))).toEqual([
+      "117418148236895862",
+      "10",
+      "2",
+    ]);
     expect(ids(newestFirst(feed("b", "a")))).toEqual(["b", "a"]);
   });
 });
 
 describe("fetchPosts", () => {
-  const rss = (...list: string[]) => () => new Response(rssFeed(list));
-  const cnn = (...list: string[]) => () =>
-    new Response(JSON.stringify(list.map((id) => ({ id, content: `CNN post ${id}` }))), { status: 206 });
+  const rss =
+    (...list: string[]) =>
+    () =>
+      new Response(rssFeed(list));
+  const cnn =
+    (...list: string[]) =>
+    () =>
+      new Response(JSON.stringify(list.map((id) => ({ id, content: `CNN post ${id}` }))), { status: 206 });
 
   it("bypasses the RSS CDN cache with a unique query string", async () => {
     const ctx = testCtx({ [RSS_HOST]: rss("3", "2") }, {}, { now: () => 1_791_695_630_123 });

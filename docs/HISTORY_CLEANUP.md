@@ -3,6 +3,11 @@
 **Status: not run.** This is a step-by-step guide for the repository owner.
 Nothing here has been run against GitHub.
 
+**Update 2026-10-13:** `trump-check.yml`, `legacy/`, and `BOT-CONTROLS.sh` have
+been removed. Steps below that pause or re-enable that workflow are historical.
+The live bot is the Cloudflare Worker cron; pausing it means deploying with
+`crons = []`.
+
 ## Audit: what is exposed right now (2026-10-10)
 
 A read-only mirror clone of `github.com/aviniazov7/trump-telegram-bot`

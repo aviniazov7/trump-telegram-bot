@@ -1,7 +1,14 @@
+import type { Coordinator } from "./coordinator";
+
 /** Bindings, secrets and vars available to the Worker. */
 export interface Env {
   /** KV namespace holding all bot state (see src/store.ts). */
   STATE: KVNamespace;
+  /**
+   * One Durable Object. Serializes cron runs and holds the send claims,
+   * so overlapping invocations can't deliver the same post twice.
+   */
+  COORDINATOR: DurableObjectNamespace<Coordinator>;
 
   // Secrets — set with `wrangler secret put`, never in wrangler.toml.
   TELEGRAM_BOT_TOKEN: string;

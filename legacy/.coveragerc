@@ -1,8 +1,0 @@
-[run]
-source = src
-branch = false
-
-[report]
-# CI fails if coverage drops below this.
-fail_under = 90
-show_missing = true

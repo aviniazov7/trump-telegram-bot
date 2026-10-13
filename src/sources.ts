@@ -23,6 +23,12 @@ export interface Post {
   /** Images/videos attached to the post itself. */
   media?: MediaKind[];
   quote?: Quote | null;
+  /**
+   * Status id this item re-posts, when the feed marks it `RT: <status url>`.
+   * A wordless re-post of a status already in the same window is not a new
+   * post — Truth Social archives the original and the boost as two ids.
+   */
+  repostOf?: string | null;
 }
 
 export const TRUMPSTRUTH_RSS = "https://www.trumpstruth.org/feed";
@@ -50,6 +56,25 @@ function xmlTag(item: string, tag: string): string {
 // so there only an exact Truth Social status URL (18-digit ID) is removed.
 const RT_HTML_RE = /RT:\s*https?:\/\/[^\s<]+/gi;
 const RT_TEXT_RE = /RT:\s*https?:\/\/truthsocial\.com\/(?:users\/[^/\s]+\/statuses|@[^/\s]+)\/\d{18}/gi;
+const RT_STATUS_RE =
+  /RT:\s*https?:\/\/truthsocial\.com\/(?:users\/[^/\s<"']+\/statuses|@[^/\s<"']+)\/(\d{18})/i;
+
+/** Truth Social status id a feed item is re-posting, or null. */
+export function repostTarget(raw: string): string | null {
+  return RT_STATUS_RE.exec(raw)?.[1] ?? null;
+}
+
+/**
+ * Ids of wordless re-posts whose original status is in `posts`.
+ * The caller marks them done without sending: subscribers already get the
+ * original, and the boost is the same video/quote a minute later.
+ */
+export function pureRepostIds(posts: Post[]): string[] {
+  const ids = new Set(posts.map((p) => p.id));
+  return posts
+    .filter((p) => p.repostOf && p.repostOf !== p.id && ids.has(p.repostOf) && !isMeaningfulText(p.text))
+    .map((p) => p.id);
+}
 const MEDIA_LINK_RE = /<a\b[^>]*>\s*View (image|video|media)\s*<\/a>/gi;
 
 /** Split trumpstruth's post HTML into own text, media and the quoted post. */
@@ -60,7 +85,11 @@ export function parseTruthHtml(html: string): { text: string; media: MediaKind[]
   const quotedBy = /<p>\s*Quoted\s*([\s\S]*?)<\/p>/i.exec(body);
   if (quoted) {
     const inner = parseTruthHtml(quoted[1] ?? "");
-    quote = { author: stripHtml(quotedBy?.[1] ?? ""), text: inner.text, media: [...inner.media, ...(inner.quote?.media ?? [])] };
+    quote = {
+      author: stripHtml(quotedBy?.[1] ?? ""),
+      text: inner.text,
+      media: [...inner.media, ...(inner.quote?.media ?? [])],
+    };
     body = body.replace(quoted[0], "");
   }
   if (quotedBy) body = body.replace(quotedBy[0], "");
@@ -87,12 +116,13 @@ export function parseRss(xml: string, limit: number): Post[] {
   for (const match of xml.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
     const item = match[1] ?? "";
     const description = xmlTag(item, "description");
+    const title = xmlTag(item, "title");
     const link = xmlTag(item, "link") || xmlTag(item, "guid");
     // Titles of text-less posts are placeholders ("Video post from …"), so
     // the title is only a fallback for an empty description.
     const parsed = description
       ? parseTruthHtml(description)
-      : { text: stripHtml(xmlTag(item, "title")), media: [], quote: null };
+      : { text: stripHtml(title), media: [], quote: null };
     const post: Post = {
       id: xmlTag(item, "truth:originalId") || (link ? (link.replace(/\/+$/, "").split("/").pop() ?? "") : ""),
       text: isMeaningfulText(parsed.text) ? parsed.text : "",
@@ -100,6 +130,7 @@ export function parseRss(xml: string, limit: number): Post[] {
       url: xmlTag(item, "truth:originalUrl") || link,
       media: parsed.media,
       quote: parsed.quote,
+      repostOf: repostTarget(description) || repostTarget(title),
     };
     if (!hasContent(post)) continue;
     posts.push(post);
@@ -153,7 +184,8 @@ export function parseCnnArchive(text: string, limit: number): Post[] {
   for (const raw of leadingJsonObjects(text, limit * 2)) {
     if (!raw || typeof raw !== "object") continue;
     const item = raw as Record<string, unknown>;
-    const body = String(item.content || item.text || "").replace(RT_TEXT_RE, "");
+    const rawBody = String(item.content || item.text || "");
+    const body = rawBody.replace(RT_TEXT_RE, "");
     const postText = stripHtml(body);
     const media: MediaKind[] = (Array.isArray(item.media) ? item.media : [])
       .filter((m): m is string => typeof m === "string")
@@ -166,6 +198,7 @@ export function parseCnnArchive(text: string, limit: number): Post[] {
       url: id ? `${TRUTH_SOCIAL_PROFILE}/${id}` : "",
       media,
       quote: null,
+      repostOf: repostTarget(rawBody),
     };
     if (!hasContent(post)) continue;
     posts.push(post);
@@ -262,12 +295,15 @@ export async function fetchPosts(ctx: Ctx, lastSeen: string): Promise<Post[]> {
   // Which source is ahead tells us about source lag; worth a log line.
   const rssIds = new Set(rssPosts.map((p) => p.id));
   const newestRss = rssPosts[0]?.id ?? "";
-  const cnnOnly = cnnPosts.filter((p) => !rssIds.has(p.id) && (!newestRss || BigInt(p.id) > BigInt(newestRss)));
+  const cnnOnly = cnnPosts.filter(
+    (p) => !rssIds.has(p.id) && (!newestRss || BigInt(p.id) > BigInt(newestRss)),
+  );
   if (cnnOnly.length) ctx.log.info(`${cnnOnly.length} post(s) seen first in the CNN archive (RSS lagging)`);
 
   const posts = mergePosts(rssPosts, cnnPosts);
   if (posts.length && (!lastSeen || contains(posts, lastSeen))) return posts;
-  if (posts.length) ctx.log.warn(`last_seen not in the ${posts.length} newest posts — reading deeper into the CNN archive`);
+  if (posts.length)
+    ctx.log.warn(`last_seen not in the ${posts.length} newest posts — reading deeper into the CNN archive`);
 
   let archive: Post[] = [];
   if (ctx.budget.canFetch()) {

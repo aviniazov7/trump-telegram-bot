@@ -11,7 +11,8 @@ workers_dev = true
 
 [triggers]
 # Every 5 minutes. Each run stops starting new work after
-# RUN_TIME_BUDGET_SECONDS, far inside the interval, so runs never overlap.
+# RUN_TIME_BUDGET_SECONDS. Cloudflare can still dispatch a second invocation
+# (duplicate or retry); Coordinator is the single-flight lease.
 crons = ["*/5 * * * *"]
 
 [[kv_namespaces]]
@@ -19,6 +20,14 @@ binding = "STATE"
 # Not a secret (it's useless without account credentials). Created with
 #   npx wrangler kv namespace create STATE
 id = "df295f75a67a4a54aa3a2dcb8b71490a"
+
+[[durable_objects.bindings]]
+name = "COORDINATOR"
+class_name = "Coordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Coordinator"]
 
 [vars]
 # Live since the cutover on 2026-10-12: posts go to every subscriber.
@@ -38,8 +47,8 @@ GEMINI_TIMEOUT_SECONDS = "12"
 # A post whose translation keeps failing is retried every run for this long,
 # then sent in English (with an alert).
 GEMINI_RETRY_MINUTES = "15"
-# In-band "no successful run" alert. Can't be below the 30-min heartbeat
-# interval (+1 min) — the code clamps it. For faster detection use
+# In-band "no successful run" alert, measured from the end of the last
+# successful run (recorded every run). For faster detection use
 # HEALTHCHECK_URL (healthchecks.io), which costs no KV writes.
 STALE_ALERT_MINUTES = "35"
 SOURCE_FAILURE_ALERT_RUNS = "10"
@@ -48,7 +57,8 @@ MAX_SCAN_POSTS = "100"
 # Free plan: 50 subrequests and 10 ms CPU per cron run. Sends beyond this
 # budget continue in the next run (5 min later). Raise on Workers Paid.
 MAX_SUBREQUESTS = "45"
-# Runs are 5 min apart, so 90 s can never overlap the next run.
+# Soft stop for starting new work. The Durable Object lease, not this budget,
+# is what keeps overlapping invocations from delivering twice.
 RUN_TIME_BUDGET_SECONDS = "90"
 
 [observability]

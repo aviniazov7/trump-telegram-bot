@@ -1,12 +1,10 @@
 # Proposal: move scheduling to a Cloudflare Worker
 
-**Status: implemented** on the `cloudflare-worker` branch. The README
-describes the result (setup, cutover, rollback). The owner chose Workers KV
-over the Durable Object recommended below, and the Worker contains the
-duplicate-send risk with a per-send key (`sent:<post>:<chat>`), with no
-read-modify-write and no overlapping runs. `Store` (src/store.ts) is the only
-place to change if a Durable Object is ever needed. The rest of this document
-is the original proposal, kept for its reasoning.
+**Status: implemented**, then cut over on 2026-10-12. On 2026-10-13 the
+GitHub Actions workflow and `legacy/` were deleted, and a Durable Object
+(`Coordinator`) took the single-flight lease and the send claims — the
+duplicate-send risk called out below. The README describes the live bot.
+The rest of this document is the original proposal, kept for its reasoning.
 
 ## Why
 
