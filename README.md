@@ -16,11 +16,14 @@ Every five minutes a Cloudflare Worker reads new posts, translates them into Heb
 
 A message leads with an impact line and Hebrew topic tags (tariffs, the Fed, oil and energy, geopolitics, crypto, China, stocks), then the original text, the translation, and a link to the post. High-impact posts go out ahead of the backlog. The cron has been in production since 12 October 2026.
 
-<!--
-Screenshot placeholder. Save a redacted broadcast (tag line, Hebrew translation, source link) and uncomment:
+<table>
+  <tr>
+    <td><img src="docs/images/screenshot-market-impact.jpg" alt="Telegram message tagged medium market impact, with oil and geopolitics hashtags" width="300"></td>
+    <td><img src="docs/images/screenshot-translation.jpg" alt="Telegram message with the English post and its Hebrew translation" width="300"></td>
+  </tr>
+</table>
 
-![Example Hebrew broadcast in Telegram](docs/images/broadcast.png)
--->
+Medium market impact on a Navy and Houthis post (oil and geopolitics), and a Hebrew translation of an Alaska rally post.
 
 ## Architecture
 
