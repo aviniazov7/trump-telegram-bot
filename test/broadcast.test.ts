@@ -922,6 +922,8 @@ describe("KV write failures", () => {
       getLog: (postId) => real.getLog(postId),
       heartbeat: () => real.heartbeat(),
       markHeartbeat: (now) => real.markHeartbeat(now),
+      claimUpdate: (updateId, now) => real.claimUpdate(updateId, now),
+      releaseUpdate: (updateId) => real.releaseUpdate(updateId),
       reset: () => real.reset(),
     };
     const { tg, ctx } = setup({ feed: ["2", "1"] });

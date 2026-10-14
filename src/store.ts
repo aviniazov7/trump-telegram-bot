@@ -121,6 +121,19 @@ export class Store {
     return this.lock.tryAcquire(now, ttlMs);
   }
 
+  /**
+   * First delivery of this Telegram update_id wins for the dedupe window.
+   * Stored in the Coordinator, not KV: two overlapping webhook attempts can
+   * both read "not seen" from KV and both send.
+   */
+  claimUpdate(updateId: number, now: number): Promise<boolean> {
+    return this.lock.claimUpdate(updateId, now);
+  }
+
+  releaseUpdate(updateId: number): Promise<void> {
+    return this.lock.releaseUpdate(updateId);
+  }
+
   release(token: string): Promise<void> {
     return this.lock.release(token);
   }
