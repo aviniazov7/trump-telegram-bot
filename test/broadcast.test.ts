@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { menuFingerprint, POST_RETRY_WINDOW_MS, runCron } from "../src/broadcast";
 import type { Config } from "../src/config";
 import type { RunLock } from "../src/coordinator";
+import type { WorkersAiClient } from "../src/runtime";
 import { resetMemoryMutes } from "../src/monitor";
 import { emptyMeta, openStore, Store } from "../src/store";
 import {
@@ -63,6 +64,7 @@ function setup(opts: {
   cfg?: Partial<Config>;
   now?: number;
   gemini?: Handler;
+  ai?: WorkersAiClient;
 }) {
   const tg = new FakeTelegram();
   const gemini: Handler =
@@ -85,7 +87,7 @@ function setup(opts: {
       [GEMINI]: gemini,
     },
     { maxSubrequests: 200, ...opts.cfg },
-    { now: () => opts.now ?? NOW },
+    { now: () => opts.now ?? NOW, ai: opts.ai },
   );
   return { tg, ctx, run: () => runCron(ctx, store) };
 }
@@ -455,6 +457,159 @@ describe("caption-less videos", () => {
     );
     expect(tg.sent.filter((s) => s.chat === "a")).toEqual([]);
     expect((await store.getMeta()).lastSeen).toBe("3");
+  });
+});
+
+const BOOST_FILE = "https://archive.example/boost.mp4";
+
+/** The live "RT @user / Reposted Name" boost, whose blockquote is `quoteHtml`. */
+function boostItem(id: string, originalId: string, quoteHtml: string, when: string): string {
+  return `<item><title><![CDATA[RT @realDonaldTrump]]></title>
+    <description><![CDATA[<p>RT <span class="h-card"><a href="https://truthsocial.com/@realDonaldTrump">@realDonaldTrump</a></span></p>
+    <p>Reposted <a href="https://www.trumpstruth.org/statuses/42328">Donald J. Trump</a></p>
+    <blockquote>${quoteHtml}</blockquote>]]></description>
+    <pubDate>${when}</pubDate>
+    <truth:originalId>${id}</truth:originalId>
+    <truth:originalUrl>https://truthsocial.com/@realDonaldTrump/${id}</truth:originalUrl>
+    <archive:reference originalId="${originalId}"></archive:reference></item>`;
+}
+
+describe("content-less reposts", () => {
+  const original = "100";
+  const videoQuote = `<p></p><p><a href="${BOOST_FILE}">View video</a></p>`;
+
+  async function deliverBoost(gemini: Handler) {
+    await seed("1", ["a"]);
+    const xml = videoRss([
+      boostItem("200", original, videoQuote, "Wed, 14 Oct 2026 05:57:22 +0000"),
+      videoItem(original, "Wed, 14 Oct 2026 04:15:05 +0000", BOOST_FILE),
+      textItem("1", "Older post"),
+    ]);
+    const tg = new FakeTelegram();
+    const ctx = testCtx(
+      {
+        [RSS_HOST]: () => new Response(xml),
+        [TELEGRAM]: tg.handler,
+        [CNN_HOST]: () => new Response("[]"),
+        [GEMINI]: gemini,
+      },
+      { maxSubrequests: 200 },
+      { now: () => NOW },
+    );
+    await runCron(ctx, store);
+    return { tg, ctx };
+  }
+
+  it("does not translate or send a boost whose only words are RT @user / Reposted name", async () => {
+    const { tg, ctx } = await deliverBoost(() =>
+      json(geminiAnswer({ hebrew: "שיתף מחדש את דונלד ג'יי. טראמפ", categories: ["other"], impact: "low" })),
+    );
+    expect(tg.sent.filter((s) => s.chat === "a" || s.chat === "999")).toEqual([]);
+    expect(ctx.hosts()).not.toContain(GEMINI);
+    expect((await store.getMeta()).lastSeen).toBe("200");
+  });
+
+  it("does not send that boost when Gemini would have failed the translation", async () => {
+    const { tg, ctx } = await deliverBoost(() => new Response("overloaded", { status: 503 }));
+    expect(tg.sent.filter((s) => s.chat === "a" || s.chat === "999")).toEqual([]);
+    expect(ctx.hosts()).not.toContain(GEMINI);
+    expect(tg.sent.some((s) => s.text.includes("התרגום לעברית נכשל"))).toBe(false);
+  });
+
+  it("translates quoted words when the original post is not in the window", async () => {
+    await seed("1", ["a"]);
+    const xml = videoRss([
+      boostItem("201", "999", "<p>The Democrats are destroying our country.</p>", "Wed, 14 Oct 2026 06:19:28 +0000"),
+      textItem("1", "Older post"),
+    ]);
+    const tg = new FakeTelegram();
+    const ctx = testCtx(
+      {
+        [RSS_HOST]: () => new Response(xml),
+        [TELEGRAM]: tg.handler,
+        [CNN_HOST]: () => new Response("[]"),
+        [GEMINI]: (call) => {
+          const text = JSON.parse(call.body).contents[0].parts[0].text as string;
+          expect(text).toContain("The Democrats are destroying our country.");
+          expect(text).not.toContain("Reposted");
+          return json(geminiAnswer({ hebrew: "הדמוקרטים הורסים את המדינה שלנו.", categories: ["other"], impact: "low" }));
+        },
+      },
+      { maxSubrequests: 200 },
+      { now: () => NOW },
+    );
+    await runCron(ctx, store);
+    const text = tg.sent.find((s) => s.chat === "a")?.text ?? "";
+    expect(text).toContain("The Democrats are destroying our country.");
+    expect(text).toContain("הדמוקרטים הורסים את המדינה שלנו.");
+    expect(text).not.toContain("Reposted");
+    expect(text).not.toContain("התרגום לעברית נכשל");
+  });
+});
+
+describe("Workers AI fallback", () => {
+  const ENGLISH = "I am raising Tariffs on China to 100%, effective November 1st!";
+  const HEBREW = "אני מעלה את המכסים על סין ל-100%!";
+  const echo = () => json(geminiAnswer({ hebrew: ENGLISH, categories: [], impact: "low" }));
+  const daily = () =>
+    new Response(
+      JSON.stringify({
+        error: {
+          code: 429,
+          message: "Quota exceeded for metric: generate_content_free_tier_requests, limit: 20",
+          details: [{ violations: [{ quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }] }],
+        },
+      }),
+      { status: 429 },
+    );
+
+  function aiOf(content: string) {
+    let calls = 0;
+    const ai: WorkersAiClient = {
+      async run() {
+        calls += 1;
+        return { choices: [{ finish_reason: "stop", message: { content } }] };
+      },
+    };
+    return { ai, count: () => calls };
+  }
+
+  it("sends Hebrew from Workers AI when Gemini echoes, with no failure warning", async () => {
+    await seed("1", ["a"]);
+    const workers = aiOf(HEBREW);
+    const { tg, run } = setup({ feed: ["2", "1"], gemini: echo, ai: workers.ai });
+    await run();
+    const text = tg.sent.find((s) => s.chat === "a")?.text ?? "";
+    expect(text).toContain(HEBREW);
+    expect(text).not.toContain("התרגום לעברית נכשל");
+    expect(tg.sent.filter((s) => s.chat === "999")).toEqual([]);
+    expect(workers.count()).toBe(1);
+    expect(await store.getAnalysis("2")).toMatchObject({ provider: "workers-ai", translated: true });
+  });
+
+  it("sends Hebrew from Workers AI when Gemini's daily quota is used up", async () => {
+    await seed("1", ["a"]);
+    const workers = aiOf(HEBREW);
+    const { tg, run } = setup({ feed: ["2", "1"], gemini: daily, ai: workers.ai });
+    await run();
+    expect(tg.sent.find((s) => s.chat === "a")?.text).toContain(HEBREW);
+    expect(tg.sent.some((s) => s.text.includes("התרגום לעברית נכשל"))).toBe(false);
+    expect(tg.sent.some((s) => s.text.includes("המכסה היומית"))).toBe(false);
+    expect(workers.count()).toBe(1);
+  });
+
+  it("shows the failure warning only when Gemini and Workers AI both echo", async () => {
+    await seed("1", ["a"]);
+    const workers = aiOf("Post number-2 here");
+    const { tg, run } = setup({ feed: ["2", "1"], gemini: echo, ai: workers.ai });
+    await run();
+    const text = tg.sent.find((s) => s.chat === "a")?.text ?? "";
+    expect(text).toContain("התרגום לעברית נכשל");
+    const alert = tg.sent.find((s) => s.chat === "999");
+    expect(alert?.text).toContain("Workers AI");
+    expect(alert?.text).toContain("untranslated text");
+    expect(workers.count()).toBe(1);
+    expect((await store.getMeta()).lastSeen).toBe("2");
   });
 });
 

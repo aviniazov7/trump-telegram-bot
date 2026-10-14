@@ -10,6 +10,7 @@ import type { Env } from "./env";
 import { makeCtx } from "./runtime";
 import { openStore } from "./store";
 import { handleWebhook } from "./webhook";
+import { bindWorkersAi } from "./workers-ai";
 
 export { Coordinator } from "./coordinator";
 
@@ -25,7 +26,7 @@ export default {
       console.error("TELEGRAM_BOT_TOKEN is not set — run `wrangler secret put TELEGRAM_BOT_TOKEN`");
       return;
     }
-    const ctx = makeCtx(cfg);
+    const ctx = makeCtx(cfg, { ai: env.AI ? bindWorkersAi(env.AI) : undefined });
     ctx.log.info(`Run start${cfg.dryRun ? " [DRY RUN]" : ""}`);
     const outcome = await runCron(ctx, openStore(env));
     // A duplicate dispatch should not be retried; the run that holds the lease is doing the work.

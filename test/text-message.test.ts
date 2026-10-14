@@ -41,6 +41,18 @@ describe("html helpers", () => {
     expect(isMeaningfulText("MAKE AMERICA GREAT AGAIN!")).toBe(true);
     expect(isMeaningfulText("Greenland has enormous oil")).toBe(true);
   });
+
+  it("treats an RT @handle / Reposted name boost as empty, and keeps real commentary", () => {
+    const live =
+      '<p>RT <span class="h-card"><a href="https://truthsocial.com/@realDonaldTrump">@realDonaldTrump</a></span></p>' +
+      '<p>Reposted <a href="https://www.trumpstruth.org/statuses/42328">Donald J. Trump</a></p>';
+    expect(stripHtml(live)).toBe("");
+    expect(isMeaningfulText("RT @realDonaldTrump")).toBe(false);
+    expect(isMeaningfulText("Reposted Donald J. Trump")).toBe(false);
+    expect(isMeaningfulText("RT @realDonaldTrump\nReposted Donald J. Trump")).toBe(false);
+    expect(stripHtml(`<p>Look at this</p>${live}`)).toBe("Look at this");
+    expect(isMeaningfulText("Look at this\nRT @realDonaldTrump\nReposted Donald J. Trump")).toBe(true);
+  });
 });
 
 describe("buildMessage", () => {

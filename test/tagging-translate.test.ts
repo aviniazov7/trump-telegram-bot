@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import type { WorkersAiChatInput } from "../src/runtime";
 import { analyzePost, keywordCategories, parseMarketTags } from "../src/tagging";
 import { looksTranslated, needsTranslation } from "../src/translate";
+import { bindWorkersAi, extractWorkersAiText } from "../src/workers-ai";
 import { type Call, GEMINI, GTX, geminiAnswer, json, testCtx } from "./helpers";
 
 const ENGLISH = "I am raising Tariffs on China to 100%, effective November 1st!";
@@ -62,7 +64,25 @@ const good = answer({ hebrew: HEBREW, categories: ["tariffs", "china"], impact: 
 const byModel = (primary: () => Response, fallback: () => Response) => (call: Call) =>
   modelOf(call) === FALLBACK ? fallback() : primary();
 
-describe("analyzePost (Gemini only)", () => {
+const aiReply = (content: string, finish = "stop") => ({
+  choices: [{ finish_reason: finish, message: { content, reasoning_content: "thinking in English" } }],
+});
+
+function fakeAi(reply: (text: string) => unknown) {
+  const prompts: WorkersAiChatInput[] = [];
+  return {
+    prompts,
+    ai: {
+      async run(_model: string, input: WorkersAiChatInput) {
+        prompts.push(input);
+        const text = input.messages.find((message) => message.role === "user")?.content ?? "";
+        return reply(text);
+      },
+    },
+  };
+}
+
+describe("analyzePost", () => {
   it("translates and tags with one call to the primary model", async () => {
     const ctx = testCtx({ [GEMINI]: good });
     expect(await analyzePost(ctx, ENGLISH)).toEqual({
@@ -118,12 +138,94 @@ describe("analyzePost (Gemini only)", () => {
     expect(result.geminiError).toContain(reason);
   });
 
-  it("returns untranslated, with both models' reasons, when both fail — no other translator is tried", async () => {
+  it("returns untranslated, with both models' reasons, when both fail and Workers AI is not configured", async () => {
     const ctx = testCtx({ [GEMINI]: fail503, [GTX]: () => json([[[HEBREW, ENGLISH]]]) });
     const result = await analyzePost(ctx, ENGLISH);
     expect(result).toMatchObject({ hebrew: ENGLISH, translated: false, provider: "", categories: ["tariffs", "china"], impact: "medium" });
     expect(result.geminiError).toMatch(new RegExp(`${PRIMARY}: HTTP 503.*\\| ${FALLBACK}: HTTP 503`));
+    expect(result.deterministic).toBeUndefined();
     expect(ctx.hosts()).not.toContain(GTX);
+    expect(ctx.ai).toBeUndefined();
+  });
+
+  it("does not call Workers AI when Gemini succeeds", async () => {
+    const workers = fakeAi(() => aiReply(HEBREW));
+    const ctx = testCtx({ [GEMINI]: good }, {}, { ai: workers.ai });
+    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ translated: true, provider: "gemini", model: PRIMARY });
+    expect(workers.prompts).toEqual([]);
+  });
+
+  it("uses Workers AI after an English echo, and does not ask the echoing model again", async () => {
+    const echo = answer({ hebrew: ENGLISH, categories: [], impact: "low" });
+    const workers = fakeAi(() => aiReply(HEBREW));
+    const ctx = testCtx({ [GEMINI]: byModel(echo, echo) }, {}, { ai: workers.ai });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result).toMatchObject({ translated: true, provider: "workers-ai", model: "@cf/zai-org/glm-4.7-flash", hebrew: HEBREW });
+    expect(result.geminiError).toContain("untranslated text");
+    expect(workers.prompts).toHaveLength(1);
+    expect(workers.prompts[0]?.chat_template_kwargs).toEqual({ enable_thinking: false });
+    expect(workers.prompts[0]?.max_completion_tokens).toBeLessThanOrEqual(2048);
+
+    const again = testCtx({ [GEMINI]: byModel(echo, echo) }, {}, { ai: fakeAi(() => aiReply(HEBREW)).ai });
+    const skipped = await analyzePost(again, ENGLISH, undefined, result.geminiError);
+    expect(skipped.provider).toBe("workers-ai");
+    expect(again.calls).toEqual([]);
+  });
+
+  it("uses Workers AI when every Gemini model is out of daily quota", async () => {
+    const daily = () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            code: 429,
+            message: "Quota exceeded for metric: generate_content_free_tier_requests, limit: 20",
+            details: [{ violations: [{ quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }] }],
+          },
+        }),
+        { status: 429 },
+      );
+    const workers = fakeAi(() => aiReply(HEBREW));
+    const ctx = testCtx({ [GEMINI]: daily }, {}, { ai: workers.ai });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result).toMatchObject({ translated: true, provider: "workers-ai", hebrew: HEBREW });
+    expect(result.quotaExhausted).toBeUndefined();
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, FALLBACK]);
+    expect(workers.prompts).toHaveLength(1);
+  });
+
+  it("stays untranslated, and says so once, when Gemini and Workers AI both echo", async () => {
+    const echo = answer({ hebrew: ENGLISH, categories: [], impact: "low" });
+    const workers = fakeAi(() => aiReply(ENGLISH));
+    const ctx = testCtx({ [GEMINI]: byModel(echo, echo) }, {}, { ai: workers.ai });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result).toMatchObject({ translated: false, provider: "", hebrew: ENGLISH, deterministic: true });
+    expect(result.geminiError).toContain("workers-ai: untranslated text");
+    const retry = testCtx({ [GEMINI]: byModel(echo, echo) }, {}, { ai: fakeAi(() => aiReply(HEBREW)).ai });
+    const second = await analyzePost(retry, ENGLISH, undefined, result.geminiError);
+    expect(second.deterministic).toBe(true);
+    expect(retry.calls).toEqual([]);
+    expect(second.geminiError).toContain("workers-ai: skipped — earlier untranslated text");
+  });
+
+  it("records a Workers AI transport failure without treating it as an echo", async () => {
+    const workers = fakeAi(() => {
+      throw new Error("inference failed");
+    });
+    const ctx = testCtx({ [GEMINI]: fail503 }, {}, { ai: workers.ai });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result.translated).toBe(false);
+    expect(result.deterministic).toBeUndefined();
+    expect(result.geminiError).toContain("workers-ai: inference failed");
+  });
+
+  it("does not spend a call on boost labels", async () => {
+    const workers = fakeAi(() => aiReply(HEBREW));
+    const ctx = testCtx({ [GEMINI]: good }, {}, { ai: workers.ai });
+    for (const text of ["RT @realDonaldTrump", "Reposted Donald J. Trump"]) {
+      expect(await analyzePost(ctx, text)).toMatchObject({ provider: "none", translated: true });
+    }
+    expect(ctx.calls).toEqual([]);
+    expect(workers.prompts).toEqual([]);
   });
 
   it("retries a 5xx once per model", async () => {
@@ -187,11 +289,48 @@ describe("analyzePost (Gemini only)", () => {
 });
 
 describe("translation checks", () => {
-  it("rejects empty and still-English answers, accepts short slogans", () => {
+  it("rejects empty and still-English answers, accepts short slogans and kept names", () => {
     expect(looksTranslated(ENGLISH, "")).toBe(false);
     expect(looksTranslated(ENGLISH, ENGLISH)).toBe(false);
     expect(looksTranslated(ENGLISH, HEBREW)).toBe(true);
+    expect(looksTranslated(ENGLISH, `${HEBREW} @realDonaldTrump Donald Trump`)).toBe(true);
     expect(looksTranslated("MAGA!", "MAGA!")).toBe(true);
+    expect(looksTranslated("RT @realDonaldTrump", "RT @realDonaldTrump")).toBe(true);
+    expect(looksTranslated("Reposted Donald J. Trump", "Reposted Donald J. Trump")).toBe(false);
     expect(needsTranslation("https://x.com 🇺🇸")).toBe(false);
+    expect(needsTranslation("RT @realDonaldTrump")).toBe(false);
+  });
+});
+
+describe("Workers AI answers", () => {
+  it("reads the chat content and ignores reasoning, fences, and truncation", () => {
+    expect(extractWorkersAiText(aiReply(HEBREW)).text).toBe(HEBREW);
+    expect(extractWorkersAiText({ response: `"${HEBREW}"` }).text).toBe(HEBREW);
+    expect(extractWorkersAiText({ result: { response: `\`\`\`\n${HEBREW}\n\`\`\`` } }).text).toBe(HEBREW);
+    expect(extractWorkersAiText({ choices: [{ finish_reason: "stop", message: { content: `{"hebrew":"${HEBREW}"}` } }] }).text).toBe(HEBREW);
+    expect(extractWorkersAiText(aiReply(HEBREW, "length"))).toEqual({ text: HEBREW, truncated: true });
+    expect(
+      extractWorkersAiText({
+        choices: [{ finish_reason: "stop", message: { content: [{ type: "reasoning", text: ENGLISH }, { type: "text", text: HEBREW }] } }],
+      }).text,
+    ).toBe(HEBREW);
+    expect(extractWorkersAiText(null)).toEqual({ text: "", truncated: false });
+  });
+
+  it("forwards a chat request through the binding", async () => {
+    const seen: { model: string; input: Record<string, unknown> }[] = [];
+    const ai = {
+      run: async (model: string, input: Record<string, unknown>) => {
+        seen.push({ model, input });
+        return aiReply(HEBREW);
+      },
+    } as unknown as Ai;
+    const client = bindWorkersAi(ai);
+    await client.run("@cf/zai-org/glm-4.7-flash", {
+      messages: [{ role: "user", content: ENGLISH }],
+      chat_template_kwargs: { enable_thinking: false },
+    });
+    expect(seen[0]?.model).toBe("@cf/zai-org/glm-4.7-flash");
+    expect(seen[0]?.input.chat_template_kwargs).toEqual({ enable_thinking: false });
   });
 });

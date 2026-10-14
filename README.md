@@ -35,7 +35,7 @@ it.
                     │   1. lease ← Durable Object; heartbeat check → ⏰ if really stale │
                     │   2. posts ← trumpstruth RSS (cache-bypassed) ∪ CNN newest ~30    │
                     │   3. new posts after lastSeen      │ 10 failed runs → 📡 alert      │
-                    │   4. analysis ← KV cache │ Gemini (translate + tags) │ free chain   │
+                    │   4. analysis ← KV cache │ Gemini, then Workers AI if it fails │
                     │   5. order: in progress → 🔴 high → rest (each oldest first)        │
                     │   6. per post: claim chats in the Durable Object → send → record  │
                     │        outcomes (KV `sent:<post>` is a mirror; KV failure → STOP)│
@@ -156,11 +156,11 @@ and the keyword fallback didn't know "ceasefire" or "energy".
 
 ### When Gemini fails
 
-Gemini is the Worker's **only** translator. The keyless services the old bot
-used are blocked from Cloudflare's network: tested on 2026-10-12, Google
-answered 429, Lingva 403/400 and MyMemory "quota used up", every time. On that
-day Gemini failed for 4 of 9 text posts, and single calls took 30–40 s, using
-up whole runs. So:
+Gemini is the primary translator. The keyless services the old bot used are
+blocked from Cloudflare's network: tested on 2026-10-12, Google answered 429,
+Lingva 403/400 and MyMemory "quota used up", every time. On that day Gemini
+failed for 4 of 9 text posts, and single calls took 30–40 s, using up whole
+runs. So:
 
 1. **Fast calls.** `GEMINI_THINKING_LEVEL=low`, and each call is capped at
    `GEMINI_TIMEOUT_SECONDS` (12), keeping 8 s of the run for sending. If a
@@ -175,15 +175,26 @@ up whole runs. So:
    flash-lite was untouched, which is why flash-lite is now the primary. When
    a 429 names a **per-day** quota, that model is marked in KV
    (`gemini-quota:<model>`) until the reset and isn't called again, so no
-   calls or run time are wasted. If **every** model is out of quota, a post
-   goes out in English at once, because waiting can't help, and you get one ⛽
-   alert. Per-minute 429s are only waited out (`retryDelay`), never marked.
-4. **Retry, then English.** If both fail, the post is **held back** and
-   retried in every run (every 5 minutes) for `GEMINI_RETRY_MINUTES` (15).
-   Newer posts don't wait for it. Only after that window is the post sent in
-   English, with a clear notice and the keyword-based tags (🟠 floor
-   included). You then get a ⚠️ alert with the last reason.
-5. **Every reason is kept.** Each failed attempt (time + reason per model) is
+   calls or run time are wasted. If **every** Gemini model is out of quota
+   and Workers AI is not configured, a post goes out in English at once,
+   because waiting can't help, and you get one ⛽ alert. With Workers AI
+   configured, the same run tries that instead. Per-minute 429s are only
+   waited out (`retryDelay`), never marked.
+4. **Workers AI, once.** If both Gemini models fail (daily 429, any other
+   error, or an answer that is still English), the same run asks Workers AI
+   through the `AI` binding. The model is `@cf/zai-org/glm-4.7-flash`
+   (`WORKERS_AI_MODEL`), a multilingual instruct model that is still on the
+   Workers Free plan. Reasoning is turned off and the completion is capped,
+   so a fallback stays inside the 10,000 neurons/day included on that plan.
+   Paid-only models are not used. Tags then come from keywords. The log line
+   says `workers-ai` or `gemini` and the model id. `""` disables this step.
+5. **Retry, then English.** A 429 or a 5xx is retried every run for
+   `GEMINI_RETRY_MINUTES` (15). A model that already returned an English echo
+   for that post is not called again. If Workers AI also echoes, the post is
+   sent in English on that run — waiting cannot help. Newer posts don't wait.
+   The English message carries a notice, and the keyword tags (🟠 floor
+   included). You get a ⚠️ alert only when Gemini and Workers AI both failed.
+6. **Every reason is kept.** Each failed attempt (time + reason per model) is
    saved in KV under `gemini-error:<post>` for 7 days. That includes the cases
    where the fallback model then succeeded and where the post went out in
    English. To read them:
@@ -208,6 +219,7 @@ those from the post's own words:
 | Video/image whose RSS title or `media:description` is a real caption | That caption + Hebrew translation. Placeholder titles (`Video post from …`) are not captions |
 | One image or video and no words anywhere | Skipped. Nothing is sent |
 | Several caption-less posts ready together | One digest: `🇺🇸 טראמפ — N סרטונים` and a link per post. No Gemini call |
+| `RT @user` / `Reposted <name>` and nothing else | Skipped, or folded into the caption-less digest. No Gemini and no Workers AI call. If the quoted post has real words the original doesn't already carry, those words are what gets translated |
 | Quote of a post that has text | The quoted text (`🔁 Quoting …`) + its translation, unless this status is a re-post of one already in the window |
 | Quote of a media-only post already in the window | Skipped (same video again) |
 
@@ -224,8 +236,8 @@ is why no ⚠️ alert arrived for that day's failures.
 | 🛑 KV write failed | A KV write failed; all sends stopped (see [When to move to Workers Paid or D1](#when-to-move-to-workers-paid-or-d1)) |
 | ⏰ No successful run | The previous successful run ended more than `STALE_ALERT_MINUTES` (35) ago |
 | 📡 Source down | No post source could be reached for `SOURCE_FAILURE_ALERT_RUNS` (10) runs in a row (≈ 50 min at `*/5`) |
-| ⚠️ Translation failed | Gemini (both models) kept failing for `GEMINI_RETRY_MINUTES`, so a post went out in English. Includes the last reason |
-| ⛽ Gemini quota | Every model's free daily quota is used up; posts go out in English until the reset (once per 12 h) |
+| ⚠️ Translation failed | Gemini and Workers AI both failed, so a post went out in English. Includes the last reason. An echo does not wait out `GEMINI_RETRY_MINUTES`; a 429 or a 5xx does |
+| ⛽ Gemini quota | Every Gemini model's free daily quota is used up and Workers AI is not configured; posts go out in English until the reset (once per 12 h) |
 | ⚠️ Possible missed posts | `lastSeen` wasn't in the scanned window |
 
 The heartbeat is the end of the last successful run. It is written on every
@@ -438,6 +450,7 @@ Vars live in `wrangler.toml` under `[vars]`:
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Primary. Check *AI Studio → Rate limits* for your free tier |
 | `GEMINI_THINKING_LEVEL` | `low` | `minimal`/`low`/`medium`/`high`. Full (non-lite) models only |
 | `GEMINI_FALLBACK_MODEL` | `gemini-3.8-flash` | Asked in the same run when the primary fails. `""` disables it |
+| `WORKERS_AI_MODEL` | `@cf/zai-org/glm-4.7-flash` | Workers AI fallback after Gemini fails. Free-plan multilingual model. `""` disables it |
 | `GEMINI_TIMEOUT_SECONDS` | `12` | Per call |
 | `GEMINI_RETRY_MINUTES` | `15` | How long a failing post is retried before going out in English |
 | `STALE_ALERT_MINUTES` | `35` | ⏰ threshold, measured from the last successful run |
@@ -483,7 +496,7 @@ injected `fetch`.
 | `broadcast.test.ts` | Idempotent and resumable sending, Telegram error handling, high impact first, dry run, monitoring, menu |
 | `telegram.test.ts` | Retry rules, 429, uncertain sends, gone chats, migration, no secrets in logs |
 | `webhook.test.ts` | Webhook auth (path, header, method, fail-closed), commands, membership updates |
-| `tagging-translate.test.ts` | Tag parser, keyword fallback, Gemini request/response handling, free chain fallback |
+| `tagging-translate.test.ts` | Tag parser, keyword fallback, Gemini request/response handling, Workers AI fallback |
 | `text-message.test.ts` | Message building, tag line, timestamps, tag-safe splitting |
 
 ## Layout
@@ -494,7 +507,8 @@ src/broadcast.ts      The cron run: fetch → analyze → idempotent delivery
 src/webhook.ts        Telegram webhook (auth + commands)
 src/sources.ts        trumpstruth RSS, CNN archive prefix
 src/gemini.ts         Gemini prompt, schema, request
-src/translate.ts      Keyless translation chain
+src/workers-ai.ts     Workers AI fallback (free-plan model, reasoning off)
+src/translate.ts      Hebrew checks (handles and RT labels don't force a failure)
 src/tagging.ts        Tags, keyword fallback, analyzePost
 src/message.ts        Message layout and tag line
 src/telegram.ts       Bot API calls and send outcomes

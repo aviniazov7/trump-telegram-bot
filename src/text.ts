@@ -37,6 +37,26 @@ export function htmlEscape(text: string): string {
     .replace(/'/g, "&#x27;");
 }
 
+/**
+ * A line that is only a re-post label: "RT @user", "RT: <url>", or
+ * "Reposted Donald J. Trump". Those lines name the boost; they are not
+ * the post. A line that also has commentary stays.
+ */
+const REPOST_RT_LINE = /^RT(?:\s+@\S+|\s*:\s*\S+)*$/i;
+const NAME_TOKEN = "[A-Z][\\p{L}\\p{M}.'’\\-]*";
+const REPOST_NAME_LINE = new RegExp(`^Reposted\\s+${NAME_TOKEN}(?:\\s+${NAME_TOKEN}){0,5}$`, "u");
+
+export function isRepostBoilerplateLine(line: string): boolean {
+  const trimmed = line.trim();
+  return Boolean(trimmed) && (REPOST_RT_LINE.test(trimmed) || REPOST_NAME_LINE.test(trimmed));
+}
+
+/** Drop re-post labels, leaving any real commentary on the other lines. */
+export function stripRepostBoilerplate(text: string): string {
+  const kept = text.split("\n").filter((line) => !isRepostBoilerplateLine(line));
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 /** Remove HTML tags and URLs from a feed post, keeping line structure. */
 export function stripHtml(input: string): string {
   let text = input.replace(/<br\s*\/?>/gi, "\n");
@@ -48,16 +68,17 @@ export function stripHtml(input: string): string {
   text = text.replace(/https?:\/\/\S+/g, "");
   text = text.replace(/\n{3,}/g, "\n\n");
   text = text.replace(/ {2,}/g, " ");
-  return text.trim();
+  return stripRepostBoilerplate(text);
 }
 
 /**
  * Skip empty, RT-only and archive placeholders.
  * "Video post from October 14, 2026" is the feed's title for a caption-less
  * video, not a caption. "View video" is the attachment link's label.
+ * "RT @user" and "Reposted <name>" are boost labels, not a caption.
  */
 export function isMeaningfulText(text: string): boolean {
-  const cleaned = text.trim();
+  const cleaned = stripRepostBoilerplate(text);
   if (!cleaned) return false;
   if (/^RT:\s*https?:\/\/\S+$/.test(cleaned)) return false;
   if (cleaned.startsWith("[No Title]")) return false;

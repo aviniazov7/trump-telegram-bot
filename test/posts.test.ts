@@ -178,6 +178,44 @@ describe("sources", () => {
     expect(pureRepostIds(alone)).toEqual([]);
   });
 
+  it("drops an RT @handle boost, and keeps quoted words the original does not have", () => {
+    const file = "https://archive.example/same.mp4";
+    const original = "100";
+    const boost = (id: string, quote: string) =>
+      `<item><title><![CDATA[RT @realDonaldTrump]]></title>
+        <description><![CDATA[<p>RT <span class="h-card"><a href="https://truthsocial.com/@realDonaldTrump">@realDonaldTrump</a></span></p>
+        <p>Reposted <a href="https://www.trumpstruth.org/statuses/42328">Donald J. Trump</a></p>
+        <blockquote>${quote}</blockquote>]]></description>
+        <truth:originalId>${id}</truth:originalId>
+        <archive:reference originalId="${original}"></archive:reference></item>`;
+    const video =
+      `<item><title>Video post from October 14, 2026</title>
+        <description><![CDATA[<p></p><p><a href="${file}">View video</a></p>]]></description>
+        <truth:originalId>${original}</truth:originalId></item>`;
+    const wordless = parseRss(
+      `<rss><channel>${boost("200", `<p></p><p><a href="${file}">View video</a></p>`)}${video}</channel></rss>`,
+      10,
+    );
+    const repost = wordless.find((p) => p.id === "200");
+    expect(repost?.text).toBe("");
+    expect(repost?.quote?.text ?? "").toBe("");
+    expect(repost?.repostOf).toBe(original);
+    expect(repost?.quote?.media).toContain("video");
+    expect(repost?.mediaUrls?.some((url) => url.includes("same.mp4"))).toBe(true);
+    expect(pureRepostIds(wordless)).toContain("200");
+    expect(sameMediaRepostIds(wordless)).toContain("200");
+
+    const withQuote = parseRss(
+      `<rss><channel>${boost("201", "<p>The Democrats are destroying our country.</p>")}${video}</channel></rss>`,
+      10,
+    );
+    const quoted = withQuote.find((p) => p.id === "201");
+    expect(quoted?.text).toBe("");
+    expect(quoted?.quote?.text).toBe("The Democrats are destroying our country.");
+    expect(quoted?.quote?.author).toBe("Donald J. Trump");
+    expect(pureRepostIds(withQuote)).not.toContain("201");
+  });
+
   it("treats a later wordless post with the same video file as a duplicate", () => {
     const file = "https://static.example/files/original/7265835d5c66df41.mp4";
     const xml = `<rss><channel>

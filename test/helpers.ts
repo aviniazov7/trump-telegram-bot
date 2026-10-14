@@ -1,7 +1,7 @@
 import { type Config, loadConfig } from "../src/config";
 import type { Env } from "../src/env";
 import { memoryLogger } from "../src/log";
-import { type Ctx, makeCtx } from "../src/runtime";
+import { type Ctx, makeCtx, type WorkersAiClient } from "../src/runtime";
 
 export interface Call {
   url: string;
@@ -63,7 +63,7 @@ export function testConfig(overrides: Partial<Config> = {}, env: Partial<Env> = 
 export function testCtx(
   routes: Record<string, Handler> = {},
   overrides: Partial<Config> = {},
-  opts: { now?: () => number } = {},
+  opts: { now?: () => number; ai?: WorkersAiClient } = {},
 ): Ctx & { calls: Call[]; hosts: () => string[]; sleeps: number[] } {
   const fake = fakeFetch(routes);
   const sleeps: number[] = [];
@@ -74,6 +74,7 @@ export function testCtx(
     },
     now: opts.now,
     log: memoryLogger(),
+    ai: opts.ai,
   });
   return Object.assign(ctx, { calls: fake.calls, hosts: fake.hosts, sleeps });
 }
