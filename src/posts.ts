@@ -52,7 +52,26 @@ export function advanceCursor(cursor: Cursor, chronologicalIds: string[], doneId
  * Send order: posts already partly sent first (finish what was started), then
  * high-impact posts, then the rest — each group oldest first.
  */
-export function sendOrder<T extends { post: Post; impact: string | null }>(items: T[], startedIds: Set<string>): T[] {
+/**
+ * KV key for the single Telegram message that covers these textless posts.
+ * Short backlogs keep the ids readable; a long one is hashed so the key
+ * stays under KV's limit.
+ */
+export function mediaDigestId(ids: string[]): string {
+  const body = ids.join(".");
+  if (body.length <= 420) return `digest:${body}`;
+  let hash = 0xcbf29ce484222325n;
+  for (const ch of body) {
+    hash ^= BigInt(ch.codePointAt(0) ?? 0);
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return `digest:${hash.toString(16)}`;
+}
+
+export function sendOrder<T extends { post: Post; impact: string | null }>(
+  items: T[],
+  startedIds: Set<string>,
+): T[] {
   const rank = (item: T): number => (startedIds.has(item.post.id) ? 0 : item.impact === "high" ? 1 : 2);
   return items
     .map((item, index) => ({ item, index }))

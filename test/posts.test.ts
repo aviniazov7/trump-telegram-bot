@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { advanceCursor, type Cursor, filterNewPosts, sendOrder } from "../src/posts";
+import { advanceCursor, type Cursor, filterNewPosts, mediaDigestId, sendOrder } from "../src/posts";
 import {
   CNN_FRESH_BYTES,
   CNN_READ_BYTES,
@@ -12,6 +12,7 @@ import {
   parseCnnArchive,
   parseRss,
   pureRepostIds,
+  sameMediaRepostIds,
 } from "../src/sources";
 import { CNN_HOST, RSS_HOST, rssFeed, testCtx } from "./helpers";
 
@@ -79,6 +80,21 @@ describe("advanceCursor", () => {
   });
 });
 
+describe("mediaDigestId", () => {
+  it("is stable and readable for a short burst", () => {
+    expect(mediaDigestId(["2", "3", "4"])).toBe("digest:2.3.4");
+    expect(mediaDigestId(["2", "3", "4"])).toBe(mediaDigestId(["2", "3", "4"]));
+  });
+
+  it("hashes a backlog that would not fit in a KV key", () => {
+    const ids = Array.from({ length: 40 }, (_, i) => String(10n ** 17n + BigInt(i)));
+    const id = mediaDigestId(ids);
+    expect(id.startsWith("digest:")).toBe(true);
+    expect(id.length).toBeLessThan(80);
+    expect(id).not.toContain(ids[0] ?? "");
+  });
+});
+
 describe("sendOrder", () => {
   it("puts started posts first, then high impact, then the rest — each oldest first", () => {
     const items = [
@@ -138,10 +154,10 @@ describe("sources", () => {
       '<blockquote><p></p><p><a href="https://archive.example/a.mp4">View video</a></p></blockquote>';
     const commentary = `<p>Look at this<br />RT: https://truthsocial.com/users/realDonaldTrump/statuses/${video}</p>`;
     const xml = (id: string, description: string) =>
-      `<rss><channel><item><title>x</title><description><![CDATA[${description}]]></description>` +
+      `<rss><channel><item><title>Quote post from October 13, 2026</title><description><![CDATA[${description}]]></description>` +
       `<pubDate>Tue, 13 Oct 2026 11:21:00 +0000</pubDate><truth:originalId>${id}</truth:originalId>` +
       `<truth:originalUrl>https://truthsocial.com/@realDonaldTrump/${id}</truth:originalUrl></item>` +
-      `<item><title>Video</title><description><![CDATA[<p></p><p><a href="https://archive.example/a.mp4">View video</a></p>]]></description>` +
+      `<item><title>Video post from October 13, 2026</title><description><![CDATA[<p></p><p><a href="https://archive.example/a.mp4">View video</a></p>]]></description>` +
       `<pubDate>Tue, 13 Oct 2026 11:21:00 +0000</pubDate><truth:originalId>${video}</truth:originalId>` +
       `<truth:originalUrl>https://truthsocial.com/@realDonaldTrump/${video}</truth:originalUrl></item></channel></rss>`;
 
@@ -154,12 +170,62 @@ describe("sources", () => {
     expect(pureRepostIds(withWords)).toEqual([]);
 
     const alone = parseRss(
-      `<rss><channel><item><title>Quote</title><description><![CDATA[${quote}]]></description>` +
+      `<rss><channel><item><title>Quote post from October 13, 2026</title><description><![CDATA[${quote}]]></description>` +
         `<truth:originalId>${repost}</truth:originalId><truth:originalUrl>https://truthsocial.com/@realDonaldTrump/${repost}</truth:originalUrl>` +
         `</item></channel></rss>`,
       10,
     );
     expect(pureRepostIds(alone)).toEqual([]);
+  });
+
+  it("treats a later wordless post with the same video file as a duplicate", () => {
+    const file = "https://static.example/files/original/7265835d5c66df41.mp4";
+    const xml = `<rss><channel>
+      <item><title>Video post from October 14, 2026</title>
+        <description><![CDATA[<p></p><p><a href="${file}">View video</a></p>]]></description>
+        <truth:originalId>30</truth:originalId></item>
+      <item><title>Video post from October 14, 2026</title>
+        <description><![CDATA[<p></p><p><a href="${file}?dl=1">View video</a></p>]]></description>
+        <truth:originalId>20</truth:originalId></item>
+      <item><title>A real caption</title>
+        <description><![CDATA[<p>A real caption</p><p><a href="${file}">View video</a></p>]]></description>
+        <truth:originalId>10</truth:originalId></item>
+    </channel></rss>`;
+    const posts = parseRss(xml, 10);
+    expect(posts.find((p) => p.id === "10")?.text).toBe("A real caption");
+    expect(posts.find((p) => p.id === "20")?.text).toBe("");
+    expect(sameMediaRepostIds(posts).sort()).toEqual(["20", "30"]);
+  });
+
+  it("uses a real title or media caption when the description is only a video link", () => {
+    const xml = (title: string, extra = "") =>
+      `<rss><channel><item><title><![CDATA[${title}]]></title>
+        <description><![CDATA[<p></p><p><a href="https://archive.example/a.mp4">View video</a></p>]]></description>
+        ${extra}
+        <truth:originalId>7</truth:originalId>
+        <truth:originalUrl>https://truthsocial.com/@realDonaldTrump/7</truth:originalUrl>
+      </item></channel></rss>`;
+    expect(parseRss(xml("Video post from October 14, 2026"), 5)[0]?.text).toBe("");
+    expect(parseRss(xml("Greenland has enormous oil"), 5)[0]?.text).toBe("Greenland has enormous oil");
+    const captioned = parseRss(
+      xml(
+        "Video post from October 14, 2026",
+        `<media:content url="https://archive.example/a.mp4" medium="video"><media:description>We are winning big</media:description></media:content>`,
+      ),
+      5,
+    );
+    expect(captioned[0]?.text).toBe("We are winning big");
+    expect(captioned[0]?.media).toEqual(["video"]);
+  });
+
+  it("reads archive:reference as the re-post target when the RT line is missing", () => {
+    const xml = `<rss><channel><item>
+      <title>Quote post from October 14, 2026</title>
+      <description><![CDATA[<p><a href="https://archive.example/b.jpg">View image</a></p>]]></description>
+      <truth:originalId>55</truth:originalId>
+      <archive:reference type="quote" originalId="44"></archive:reference>
+    </item></channel></rss>`;
+    expect(parseRss(xml, 5)[0]?.repostOf).toBe("44");
   });
 
   it("sorts newest first by numeric snowflake ID", () => {
@@ -229,6 +295,13 @@ describe("fetchPosts", () => {
     const merged = mergePosts(a, b);
     expect(ids(merged)).toEqual(["3", "2"]);
     expect(merged[1]?.text).toBe("from RSS");
+  });
+
+  it("keeps a caption the other source has when the first copy is a bare video", () => {
+    const rss = [{ ...post("2"), text: "", media: ["video" as const], mediaUrls: ["https://archive.example/a.mp4"] }];
+    const cnn = [{ ...post("2"), text: "Caption from the archive" }];
+    expect(mergePosts(rss, cnn)[0]?.text).toBe("Caption from the archive");
+    expect(mergePosts(rss, cnn)[0]?.mediaUrls).toEqual(["https://archive.example/a.mp4"]);
   });
 
   it("keeps the RSS when the archive doesn't help", async () => {

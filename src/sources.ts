@@ -3,7 +3,7 @@
  * (fallback, and deep scan when the RSS window doesn't reach last_seen).
  */
 import type { Ctx } from "./runtime";
-import { isMeaningfulText, stripHtml } from "./text";
+import { htmlUnescape, isMeaningfulText, stripHtml } from "./text";
 
 export type MediaKind = "image" | "video";
 
@@ -22,6 +22,11 @@ export interface Post {
   url: string;
   /** Images/videos attached to the post itself. */
   media?: MediaKind[];
+  /**
+   * Attachment file URLs, including a quoted post's video. Used to notice
+   * the same file posted again under another status id.
+   */
+  mediaUrls?: string[];
   quote?: Quote | null;
   /**
    * Status id this item re-posts, when the feed marks it `RT: <status url>`.
@@ -75,12 +80,58 @@ export function pureRepostIds(posts: Post[]): string[] {
     .filter((p) => p.repostOf && p.repostOf !== p.id && ids.has(p.repostOf) && !isMeaningfulText(p.text))
     .map((p) => p.id);
 }
-const MEDIA_LINK_RE = /<a\b[^>]*>\s*View (image|video|media)\s*<\/a>/gi;
+
+/** Host + path, without a query, so the same file isn't two keys. */
+export function canonicalMediaUrl(url: string): string {
+  const bare = url.trim().split("?")[0]?.replace(/\/+$/, "") ?? "";
+  try {
+    const parsed = new URL(bare);
+    return `${parsed.host}${parsed.pathname}`.toLowerCase();
+  } catch {
+    return bare.toLowerCase();
+  }
+}
+
+/**
+ * Wordless posts whose video file already belongs to an earlier status in
+ * this window. Truth Social's re-post is a second id pointing at the same
+ * mp4; the `RT:` line is usually there too, but a missing one must not
+ * deliver the video again.
+ */
+export function sameMediaRepostIds(posts: Post[]): string[] {
+  const chrono = [...posts].sort((a, b) => {
+    if (/^\d+$/.test(a.id) && /^\d+$/.test(b.id)) {
+      return BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0;
+    }
+    return 0;
+  });
+  const seen = new Set<string>();
+  const skip: string[] = [];
+  for (const post of chrono) {
+    const videos = (post.mediaUrls ?? []).map(canonicalMediaUrl).filter((url) => VIDEO_URL_RE.test(url));
+    if (!isMeaningfulText(post.text) && videos.some((url) => seen.has(url))) skip.push(post.id);
+    for (const url of videos) seen.add(url);
+  }
+  return skip;
+}
+
+const MEDIA_LINK_RE = /<a\b([^>]*)>\s*View (image|video|media)\s*<\/a>/gi;
+
+function attr(attrs: string, name: string): string {
+  const match = new RegExp(`\\b${name}\\s*=\\s*["']([^"']*)["']`, "i").exec(attrs);
+  return match?.[1] ? htmlUnescape(match[1]) : "";
+}
 
 /** Split trumpstruth's post HTML into own text, media and the quoted post. */
-export function parseTruthHtml(html: string): { text: string; media: MediaKind[]; quote: Quote | null } {
+export function parseTruthHtml(html: string): {
+  text: string;
+  media: MediaKind[];
+  mediaUrls: string[];
+  quote: Quote | null;
+} {
   let body = html.replace(RT_HTML_RE, "");
   let quote: Quote | null = null;
+  let quotedUrls: string[] = [];
   const quoted = /<blockquote>([\s\S]*?)<\/blockquote>/i.exec(body);
   const quotedBy = /<p>\s*Quoted\s*([\s\S]*?)<\/p>/i.exec(body);
   if (quoted) {
@@ -90,15 +141,19 @@ export function parseTruthHtml(html: string): { text: string; media: MediaKind[]
       text: inner.text,
       media: [...inner.media, ...(inner.quote?.media ?? [])],
     };
+    quotedUrls = inner.mediaUrls;
     body = body.replace(quoted[0], "");
   }
   if (quotedBy) body = body.replace(quotedBy[0], "");
   const media: MediaKind[] = [];
-  body = body.replace(MEDIA_LINK_RE, (_m, kind: string) => {
+  const mediaUrls: string[] = [];
+  body = body.replace(MEDIA_LINK_RE, (_m, attrs: string, kind: string) => {
     media.push(kind.toLowerCase() === "video" ? "video" : "image");
+    const href = attr(attrs, "href");
+    if (href) mediaUrls.push(href);
     return "";
   });
-  return { text: stripHtml(body), media, quote };
+  return { text: stripHtml(body), media, mediaUrls: [...mediaUrls, ...quotedUrls], quote };
 }
 
 /** Worth sending: own text, quoted text, or at least an image/video. */
@@ -111,28 +166,94 @@ export function hasContent(post: Pick<Post, "text" | "media" | "quote">): boolea
   );
 }
 
+const MEDIA_CONTENT_RE = /<media:content\b([^>]*)\/?>/gi;
+
+function mediaKind(url: string, medium: string): MediaKind {
+  if (medium.toLowerCase() === "video" || VIDEO_URL_RE.test(url)) return "video";
+  return "image";
+}
+
+/** Caption on the post's own media, ignoring a quoted status's attachments. */
+function ownMediaCaption(item: string): string {
+  const own = item.replace(/<archive:reference\b[\s\S]*?<\/archive:reference>/gi, "");
+  const description = stripHtml(xmlTag(own, "media:description"));
+  const title = stripHtml(xmlTag(own, "media:title"));
+  if (isMeaningfulText(description)) return description;
+  if (isMeaningfulText(title)) return title;
+  return "";
+}
+
+function xmlMedia(item: string): { url: string; kind: MediaKind }[] {
+  const found: { url: string; kind: MediaKind }[] = [];
+  for (const match of item.matchAll(MEDIA_CONTENT_RE)) {
+    const url = attr(match[1] ?? "", "url");
+    if (!url) continue;
+    found.push({ url, kind: mediaKind(url, attr(match[1] ?? "", "medium")) });
+  }
+  return found;
+}
+
+function archiveReferenceId(item: string): string | null {
+  const match = /<archive:reference\b[^>]*\boriginalId\s*=\s*["'](\d+)["']/i.exec(item);
+  return match?.[1] ?? null;
+}
+
+function dedupeUrls(urls: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const url of urls) {
+    const key = canonicalMediaUrl(url);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(url);
+  }
+  return out;
+}
+
 export function parseRss(xml: string, limit: number): Post[] {
   const posts: Post[] = [];
+  const seen = new Set<string>();
   for (const match of xml.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
     const item = match[1] ?? "";
     const description = xmlTag(item, "description");
-    const title = xmlTag(item, "title");
+    const title = stripHtml(xmlTag(item, "title"));
     const link = xmlTag(item, "link") || xmlTag(item, "guid");
-    // Titles of text-less posts are placeholders ("Video post from …"), so
-    // the title is only a fallback for an empty description.
+    // Titles of text-less posts are placeholders ("Video post from …").
+    // A real title is used only when the description has no words of its own.
     const parsed = description
       ? parseTruthHtml(description)
-      : { text: stripHtml(title), media: [], quote: null };
+      : { text: "", media: [], mediaUrls: [], quote: null };
+    const attachments = xmlMedia(item.replace(/<archive:reference\b[\s\S]*?<\/archive:reference>/gi, ""));
+    const quotedAttachments = xmlMedia(
+      /<archive:reference\b[\s\S]*?<\/archive:reference>/i.exec(item)?.[0] ?? "",
+    );
+    for (const attachment of attachments) {
+      if (!parsed.media.includes(attachment.kind)) parsed.media.push(attachment.kind);
+    }
+    const caption = ownMediaCaption(item);
+    const text = [parsed.text, caption, title].find((part) => isMeaningfulText(part)) ?? "";
     const post: Post = {
       id: xmlTag(item, "truth:originalId") || (link ? (link.replace(/\/+$/, "").split("/").pop() ?? "") : ""),
-      text: isMeaningfulText(parsed.text) ? parsed.text : "",
+      text,
       createdAt: xmlTag(item, "pubDate"),
       url: xmlTag(item, "truth:originalUrl") || link,
       media: parsed.media,
+      mediaUrls: dedupeUrls([
+        ...parsed.mediaUrls,
+        ...attachments.map((a) => a.url),
+        ...quotedAttachments.map((a) => a.url),
+      ]),
       quote: parsed.quote,
-      repostOf: repostTarget(description) || repostTarget(title),
+      repostOf: repostTarget(description) || repostTarget(title) || archiveReferenceId(item),
     };
-    if (!hasContent(post)) continue;
+    if (!post.id || !hasContent(post)) continue;
+    const prior = seen.has(post.id) ? posts.findIndex((p) => p.id === post.id) : -1;
+    if (prior >= 0) {
+      const current = posts[prior];
+      if (current) posts[prior] = combinePosts(current, post);
+      continue;
+    }
+    seen.add(post.id);
     posts.push(post);
     if (posts.length >= limit) break;
   }
@@ -187,9 +308,10 @@ export function parseCnnArchive(text: string, limit: number): Post[] {
     const rawBody = String(item.content || item.text || "");
     const body = rawBody.replace(RT_TEXT_RE, "");
     const postText = stripHtml(body);
-    const media: MediaKind[] = (Array.isArray(item.media) ? item.media : [])
-      .filter((m): m is string => typeof m === "string")
-      .map((url) => (VIDEO_URL_RE.test(url) ? "video" : "image"));
+    const urls = (Array.isArray(item.media) ? item.media : []).filter(
+      (m): m is string => typeof m === "string",
+    );
+    const media: MediaKind[] = urls.map((url) => (VIDEO_URL_RE.test(url) ? "video" : "image"));
     const id = String(item.id ?? "");
     const post: Post = {
       id,
@@ -197,10 +319,11 @@ export function parseCnnArchive(text: string, limit: number): Post[] {
       createdAt: String(item.created_at ?? ""),
       url: id ? `${TRUTH_SOCIAL_PROFILE}/${id}` : "",
       media,
+      mediaUrls: dedupeUrls(urls),
       quote: null,
       repostOf: repostTarget(rawBody),
     };
-    if (!hasContent(post)) continue;
+    if (!id || posts.some((p) => p.id === id) || !hasContent(post)) continue;
     posts.push(post);
     if (posts.length >= limit) break;
   }
@@ -268,10 +391,40 @@ export async function fetchCnn(ctx: Ctx, bytes = CNN_READ_BYTES): Promise<Post[]
   return parseCnnArchive(await readPrefix(res, bytes), ctx.cfg.maxScanPosts);
 }
 
-/** Union of two newest-first lists by post ID; the first list wins on duplicates. */
+function hasWords(post: Post): boolean {
+  return isMeaningfulText(post.text) || isMeaningfulText(post.quote?.text ?? "");
+}
+
+/**
+ * One status seen in both sources. The primary copy wins, except when only
+ * the other copy actually has words — a caption must not be thrown away
+ * because the RSS description was just "View video".
+ */
+function combinePosts(primary: Post, other: Post): Post {
+  const useOther = !hasWords(primary) && hasWords(other);
+  const base = useOther ? other : primary;
+  const fill = useOther ? primary : other;
+  return {
+    ...base,
+    url: base.url || fill.url,
+    createdAt: base.createdAt || fill.createdAt,
+    media: base.media?.length ? base.media : fill.media,
+    mediaUrls: dedupeUrls([...(primary.mediaUrls ?? []), ...(other.mediaUrls ?? [])]),
+    repostOf: base.repostOf || fill.repostOf || null,
+    quote: base.quote ?? fill.quote ?? null,
+    text: isMeaningfulText(base.text) ? base.text : fill.text,
+  };
+}
+
+/** Union of two newest-first lists by post ID. See `combinePosts` for duplicates. */
 export function mergePosts(primary: Post[], secondary: Post[]): Post[] {
+  const extras = new Map(secondary.map((post) => [post.id, post]));
+  const merged = primary.map((post) => {
+    const other = extras.get(post.id);
+    return other ? combinePosts(post, other) : post;
+  });
   const seen = new Set(primary.map((p) => p.id));
-  return newestFirst([...primary, ...secondary.filter((p) => !seen.has(p.id))]);
+  return newestFirst([...merged, ...secondary.filter((p) => !seen.has(p.id))]);
 }
 
 /**

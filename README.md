@@ -83,9 +83,15 @@ GitHub Actions: CI only (tests, lint, secret scan) + optional deploy on push to 
     another overlapping run already claimed.
   - If the claim can't be written, nothing is sent.
   - If the KV mirror can't be written, the claim still stands: at most once.
-  - A wordless Truth Social re-post (`RT:` of a status already in this
-    window) is not delivered. The original and the boost are two ids; the
-    boost is the same video or quote.
+  - A wordless Truth Social re-post is not delivered. The original and the
+    boost are two ids; the boost is the same video or quote. That includes an
+    `RT:` line and, if that line is missing, a second id that points at a
+    video file already in this window.
+  - A video or image with no caption, title or quoted text is not sent as
+    its own "video without text" message. One such post is skipped. Two or
+    more that are ready in the same run go out as a single short digest of
+    links, and that set is fixed before the send so a retry cannot deliver
+    the same posts again.
 
   A run that stops anywhere resumes exactly where it left off. The analysis
   is cached in `analysis:<post>`, so a resumed post goes out with the same
@@ -199,9 +205,11 @@ those from the post's own words:
 | Post | Message |
 |---|---|
 | Text (with or without media) | Text + Hebrew translation, as usual |
-| Only an image / a video | `🖼️ פוסט תמונה ללא טקסט` / `🎥 פוסט וידאו ללא טקסט` + link. No translation, no Gemini call |
-| Quote of a post that has text | The quoted text (`🔁 Quoting …`) + its translation |
-| Quote of a media-only post | e.g. `🔁 ציטוט של פוסט וידאו של Donald J. Trump` + link |
+| Video/image whose RSS title or `media:description` is a real caption | That caption + Hebrew translation. Placeholder titles (`Video post from …`) are not captions |
+| One image or video and no words anywhere | Skipped. Nothing is sent |
+| Several caption-less posts ready together | One digest: `🇺🇸 טראמפ — N סרטונים` and a link per post. No Gemini call |
+| Quote of a post that has text | The quoted text (`🔁 Quoting …`) + its translation, unless this status is a re-post of one already in the window |
+| Quote of a media-only post already in the window | Skipped (same video again) |
 
 ## Monitoring
 

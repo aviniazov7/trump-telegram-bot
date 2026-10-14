@@ -25,7 +25,10 @@ export function formatTimestamp(date: string): string {
 }
 
 /** First line: impact marker and topic hashtags. Single line, so splitting never cuts a tag. */
-export function buildTagLine(categories: string[] | null | undefined, impact: string | null | undefined): string {
+export function buildTagLine(
+  categories: string[] | null | undefined,
+  impact: string | null | undefined,
+): string {
   const labels = (categories ?? []).flatMap((c) => (c in MARKET_CATEGORIES ? [MARKET_CATEGORIES[c]] : []));
   const tags = labels.map((label) => `#${label}`).join(" ");
   const marker = impact ? IMPACT_MARKERS[impact] : undefined;
@@ -43,9 +46,10 @@ const kindLabel = (kinds: string[] | undefined): string =>
   kinds?.includes("video") ? "וידאו" : kinds?.length ? "תמונה" : "";
 
 /**
- * The line shown instead of a translation when a post has no words at all —
- * e.g. "🎥 פוסט וידאו ללא טקסט" — rather than translating the archive's
- * "View video" / "Quoted …" placeholders.
+ * Fallback line for a post with no words. The cron does not send this on its
+ * own: one caption-less post is skipped, and several are one digest
+ * (`buildMediaDigest`). Kept so a direct `buildMessage` call still describes
+ * the attachment instead of translating "View video".
  */
 export function mediaOnlyLine(post: Post): string {
   const parts: string[] = [];
@@ -57,6 +61,53 @@ export function mediaOnlyLine(post: Post): string {
     parts.push(`🔁 ציטוט של פוסט${quoted ? ` ${quoted}` : ""}${author}`);
   }
   return parts.join(" · ") || "📎 פוסט ללא טקסט";
+}
+
+function mediaEmoji(post: Post): string {
+  const kinds = [...(post.media ?? []), ...(post.quote?.media ?? [])];
+  if (kinds.includes("video")) return "🎥";
+  if (kinds.includes("image")) return "🖼️";
+  return "📎";
+}
+
+function digestHeading(posts: Post[]): string {
+  const n = posts.length;
+  const emoji = posts.map(mediaEmoji);
+  if (emoji.every((e) => e === "🎥")) return n === 1 ? "סרטון" : `${n} סרטונים`;
+  if (emoji.every((e) => e === "🖼️")) return n === 1 ? "תמונה" : `${n} תמונות`;
+  return n === 1 ? "פוסט מדיה" : `${n} פוסטים של מדיה`;
+}
+
+function digestRange(posts: Post[]): string {
+  const stamps = posts.map((p) => formatTimestamp(p.createdAt)).filter((s) => s && s !== "—");
+  const first = stamps[0];
+  const last = stamps[stamps.length - 1];
+  if (!first) return "—";
+  if (!last || first === last) return first;
+  const [date, time] = first.split(" ");
+  const [lastDate, lastTime] = last.split(" ");
+  if (date && time && lastTime && date === lastDate) return `${date} ${time}–${lastTime}`;
+  return `${first}–${last}`;
+}
+
+/**
+ * One short message for several caption-less posts, instead of one
+ * "video without text" alert each. `posts` are chronological (oldest first).
+ */
+export function buildMediaDigest(posts: Post[]): string {
+  const lines = posts.map((post) => {
+    const stamp = formatTimestamp(post.createdAt);
+    const time = stamp.includes(" ") ? (stamp.split(" ")[1] ?? stamp) : stamp;
+    const label = `${mediaEmoji(post)} ${time}`;
+    return post.url ? `• <a href="${htmlEscape(post.url)}">${label}</a>` : `• ${label}`;
+  });
+  return [
+    `🇺🇸 <b>טראמפ — ${digestHeading(posts)}</b>`,
+    `🕐 ${digestRange(posts)}`,
+    "",
+    "בלי כיתוב — הקישורים:",
+    ...lines,
+  ].join("\n");
 }
 
 export interface MessageParts {

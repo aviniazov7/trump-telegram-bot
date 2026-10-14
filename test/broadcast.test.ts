@@ -269,27 +269,192 @@ describe("Gemini failures", () => {
   });
 });
 
-describe("media-only posts", () => {
-  it("are delivered with a short line and never sent to Gemini", async () => {
+const videoRss = (items: string[]) => `<rss><channel>${items.join("")}</channel></rss>`;
+
+/** A caption-less video the way trumpstruth actually publishes it. */
+function videoItem(id: string, when: string, href = `https://archive.example/${id}.mp4`): string {
+  return `<item><title><![CDATA[Video post from October 14, 2026]]></title>
+    <description><![CDATA[<p></p><p><a href="${href}">View video</a></p>]]></description>
+    <pubDate>${when}</pubDate>
+    <truth:originalId>${id}</truth:originalId>
+    <truth:originalUrl>https://truthsocial.com/@realDonaldTrump/${id}</truth:originalUrl></item>`;
+}
+
+function textItem(id: string, text: string, when = "Sat, 10 Oct 2026 18:59:16 +0000"): string {
+  return `<item><title><![CDATA[${text}]]></title>
+    <description><![CDATA[<p>${text}</p>]]></description>
+    <pubDate>${when}</pubDate>
+    <truth:originalId>${id}</truth:originalId>
+    <truth:originalUrl>https://truthsocial.com/@realDonaldTrump/${id}</truth:originalUrl></item>`;
+}
+
+describe("caption-less videos", () => {
+  it("skips a single video with no caption and never calls Gemini", async () => {
     await seed("1", ["a"]);
     const tg = new FakeTelegram();
-    const video = '</p><p><a href="https://archive.example/v.mp4">View video</a>';
     const ctx = testCtx(
       {
         [RSS_HOST]: () =>
-          new Response(rssFeed(["2", "1"], (id) => (id === "2" ? video : `Post number-${id}`))),
+          new Response(videoRss([videoItem("2", "Wed, 14 Oct 2026 05:18:04 +0000"), textItem("1", "Older post")])),
         [TELEGRAM]: tg.handler,
+        [CNN_HOST]: () => new Response("[]"),
       },
       { maxSubrequests: 200 },
       { now: () => NOW },
     );
     await runCron(ctx, store);
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0]?.text).toContain("🎥 פוסט וידאו ללא טקסט");
-    expect(tg.sent[0]?.text).not.toContain("View video");
+    expect(tg.sent.filter((s) => s.chat === "a")).toEqual([]);
     expect(ctx.hosts()).not.toContain(GEMINI);
-    expect(await store.getAnalysis("2")).toBeNull(); // nothing to cache
+    expect(await store.getAnalysis("2")).toBeNull();
     expect((await store.getMeta()).lastSeen).toBe("2");
+    expect((await store.getMeta()).openDigest).toEqual([]);
+  });
+
+  it("sends one digest for a burst, and does not send it again", async () => {
+    await seed("1", ["a", "b"]);
+    const xml = videoRss([
+      videoItem("5", "Wed, 14 Oct 2026 05:20:52 +0000"),
+      videoItem("4", "Wed, 14 Oct 2026 05:19:52 +0000"),
+      videoItem("3", "Wed, 14 Oct 2026 05:19:59 +0000"),
+      videoItem("2", "Wed, 14 Oct 2026 05:18:04 +0000"),
+      textItem("1", "Older post"),
+    ]);
+    const tg = new FakeTelegram();
+    const ctx = testCtx(
+      {
+        [RSS_HOST]: () => new Response(xml),
+        [TELEGRAM]: tg.handler,
+        [CNN_HOST]: () => new Response("[]"),
+      },
+      { maxSubrequests: 200 },
+      { now: () => NOW },
+    );
+    await runCron(ctx, store);
+    const toA = tg.sent.filter((s) => s.chat === "a");
+    expect(toA).toHaveLength(1);
+    expect(tg.sent.filter((s) => s.chat === "b")).toHaveLength(1);
+    const text = toA[0]?.text ?? "";
+    expect(text).toContain("4 סרטונים");
+    expect(text).toContain("בלי כיתוב");
+    expect(text).toContain("14/10/2026 08:18–08:20");
+    expect(text).not.toContain("ללא טקסט");
+    expect(text).not.toContain("View video");
+    for (const id of ["2", "3", "4", "5"]) expect(text).toContain(`https://truthsocial.com/@realDonaldTrump/${id}`);
+    expect(ctx.hosts()).not.toContain(GEMINI);
+    expect((await store.getMeta()).lastSeen).toBe("5");
+    expect((await store.getMeta()).openDigest).toEqual([]);
+
+    const again = new FakeTelegram();
+    const second = testCtx(
+      {
+        [RSS_HOST]: () => new Response(xml),
+        [TELEGRAM]: again.handler,
+        [CNN_HOST]: () => new Response("[]"),
+      },
+      { maxSubrequests: 200 },
+      { now: () => NOW + 60_000 },
+    );
+    await runCron(second, store);
+    expect(again.sent.filter((s) => s.chat === "a" || s.chat === "b")).toEqual([]);
+  });
+
+  it("does not add a video that arrived after the digest was committed", async () => {
+    await seed("1", ["a"], { openDigest: ["2", "3"] });
+    const xml = videoRss([
+      videoItem("4", "Wed, 14 Oct 2026 05:22:23 +0000"),
+      videoItem("3", "Wed, 14 Oct 2026 05:19:59 +0000"),
+      videoItem("2", "Wed, 14 Oct 2026 05:18:04 +0000"),
+      textItem("1", "Older post"),
+    ]);
+    const tg = new FakeTelegram();
+    const ctx = testCtx(
+      {
+        [RSS_HOST]: () => new Response(xml),
+        [TELEGRAM]: tg.handler,
+        [CNN_HOST]: () => new Response("[]"),
+      },
+      { maxSubrequests: 200 },
+      { now: () => NOW },
+    );
+    await runCron(ctx, store);
+    const text = tg.sent.find((s) => s.chat === "a")?.text ?? "";
+    expect(tg.sent.filter((s) => s.chat === "a")).toHaveLength(1);
+    expect(text).toContain("/2");
+    expect(text).toContain("/3");
+    expect(text).not.toContain("/4");
+    expect((await store.getMeta()).lastSeen).toBe("3");
+
+    const later = new FakeTelegram();
+    await runCron(
+      testCtx(
+        {
+          [RSS_HOST]: () => new Response(xml),
+          [TELEGRAM]: later.handler,
+          [CNN_HOST]: () => new Response("[]"),
+        },
+        { maxSubrequests: 200 },
+        { now: () => NOW + 60_000 },
+      ),
+      store,
+    );
+    expect(later.sent.filter((s) => s.chat === "a")).toEqual([]);
+    expect((await store.getMeta()).lastSeen).toBe("4");
+  });
+
+  it("translates a video whose title is a real caption", async () => {
+    await seed("1", ["a"]);
+    const xml = videoRss([
+      `<item><title><![CDATA[Greenland has enormous oil]]></title>
+        <description><![CDATA[<p></p><p><a href="https://archive.example/g.mp4">View video</a></p>]]></description>
+        <pubDate>Wed, 14 Oct 2026 04:18:41 +0000</pubDate>
+        <truth:originalId>2</truth:originalId>
+        <truth:originalUrl>https://truthsocial.com/@realDonaldTrump/2</truth:originalUrl></item>`,
+      textItem("1", "Older post"),
+    ]);
+    const tg = new FakeTelegram();
+    const ctx = testCtx(
+      {
+        [RSS_HOST]: () => new Response(xml),
+        [TELEGRAM]: tg.handler,
+        [CNN_HOST]: () => new Response("[]"),
+        [GEMINI]: () =>
+          json(geminiAnswer({ hebrew: "לגרינלנד יש נפט עצום", categories: ["oil"], impact: "medium" })),
+      },
+      { maxSubrequests: 200 },
+      { now: () => NOW },
+    );
+    await runCron(ctx, store);
+    const text = tg.sent.find((s) => s.chat === "a")?.text ?? "";
+    expect(text).toContain("Greenland has enormous oil");
+    expect(text).toContain("לגרינלנד יש נפט עצום");
+    expect(text).not.toContain("ללא טקסט");
+    expect(text).not.toContain("בלי כיתוב");
+    expect(ctx.hosts()).toContain(GEMINI);
+  });
+
+  it("does not send the same video file twice when a later post has no RT line", async () => {
+    await seed("1", ["a"]);
+    const file = "https://archive.example/same.mp4";
+    const xml = videoRss([
+      videoItem("3", "Wed, 14 Oct 2026 05:19:00 +0000", file),
+      videoItem("2", "Wed, 14 Oct 2026 05:18:00 +0000", file),
+      textItem("1", "Older post"),
+    ]);
+    const tg = new FakeTelegram();
+    await runCron(
+      testCtx(
+        {
+          [RSS_HOST]: () => new Response(xml),
+          [TELEGRAM]: tg.handler,
+          [CNN_HOST]: () => new Response("[]"),
+        },
+        { maxSubrequests: 200 },
+        { now: () => NOW },
+      ),
+      store,
+    );
+    expect(tg.sent.filter((s) => s.chat === "a")).toEqual([]);
+    expect((await store.getMeta()).lastSeen).toBe("3");
   });
 });
 
@@ -668,7 +833,7 @@ describe("overlapping runs and pure re-posts", () => {
     expect([...a, ...b].sort()).toEqual(["a", "b"]);
   });
 
-  it("sends a video once when the feed also has Truth Social's re-post of it", async () => {
+  it("does not send a caption-less video or the re-post of it", async () => {
     await seed("old", ["a", "b"]);
     const video = "117433335383227958";
     const repost = "117433336229580757";
@@ -679,10 +844,10 @@ describe("overlapping runs and pure re-posts", () => {
       '<blockquote><p></p><p><a href="https://archive.example/a.mp4">View video</a></p></blockquote>';
     const xml =
       "<rss><channel>" +
-      `<item><title>Quote</title><description><![CDATA[${quote}]]></description>` +
+      `<item><title>Quote post from October 13, 2026</title><description><![CDATA[${quote}]]></description>` +
       `<pubDate>Tue, 13 Oct 2026 11:21:46 +0000</pubDate><truth:originalId>${repost}</truth:originalId>` +
       `<truth:originalUrl>https://truthsocial.com/@realDonaldTrump/${repost}</truth:originalUrl></item>` +
-      '<item><title>Video</title><description><![CDATA[<p></p><p><a href="https://archive.example/a.mp4">View video</a></p>]]></description>' +
+      '<item><title>Video post from October 13, 2026</title><description><![CDATA[<p></p><p><a href="https://archive.example/a.mp4">View video</a></p>]]></description>' +
       `<pubDate>Tue, 13 Oct 2026 11:21:33 +0000</pubDate><truth:originalId>${video}</truth:originalId>` +
       `<truth:originalUrl>https://truthsocial.com/@realDonaldTrump/${video}</truth:originalUrl></item>` +
       `<item><title>Older</title><description><![CDATA[<p>Older post</p>]]></description>` +
@@ -697,10 +862,8 @@ describe("overlapping runs and pure re-posts", () => {
     );
     await runCron(ctx, store);
     const to = (chat: string) => tg.sent.filter((s) => s.chat === chat);
-    expect(to("a")).toHaveLength(1);
-    expect(to("b")).toHaveLength(1);
-    expect(to("a")[0]?.text).toContain("פוסט וידאו ללא טקסט");
-    expect(to("a")[0]?.text).not.toContain("ציטוט");
+    expect(to("a")).toHaveLength(0);
+    expect(to("b")).toHaveLength(0);
     expect((await store.getMeta()).lastSeen).toBe(repost);
     expect((await store.getSendLog(repost)).a).toBeUndefined();
   });

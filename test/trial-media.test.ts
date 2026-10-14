@@ -25,10 +25,16 @@ const QUOTE_WITH_TEXT =
 
 describe("2. media-only and quote posts", () => {
   it("parses the archive's media and quote markup instead of keeping placeholders", () => {
-    expect(parseTruthHtml(VIDEO_ONLY)).toEqual({ text: "", media: ["video"], quote: null });
+    expect(parseTruthHtml(VIDEO_ONLY)).toEqual({
+      text: "",
+      media: ["video"],
+      mediaUrls: ["https://archive.example/a.mp4"],
+      quote: null,
+    });
     expect(parseTruthHtml(QUOTE_OF_VIDEO)).toEqual({
       text: "",
       media: ["image"],
+      mediaUrls: ["https://archive.example/b.jpg", "https://archive.example/a.mp4"],
       quote: { author: "Donald J. Trump", text: "", media: ["video"] },
     });
     expect(parseTruthHtml(QUOTE_WITH_TEXT).quote?.text).toBe("We will win BIG on November 3rd!");
