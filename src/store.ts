@@ -62,6 +62,12 @@ export interface Meta extends Cursor {
   lastSuccess: number;
   /** Consecutive runs in which no post source could be reached. */
   sourceFailures: number;
+  /**
+   * Textless media posts already committed to one digest message.
+   * Set before the send so a retry uses the same set and cannot include
+   * a post that arrived later (that would deliver the earlier ones twice).
+   */
+  openDigest: string[];
 }
 
 export const emptyMeta = (): Meta => ({
@@ -72,6 +78,7 @@ export const emptyMeta = (): Meta => ({
   menu: "",
   lastSuccess: 0,
   sourceFailures: 0,
+  openDigest: [],
 });
 
 export interface Subscriber {
@@ -155,6 +162,7 @@ export class Store {
     const raw = await this.kv.get<Partial<Meta>>("meta", "json");
     if (!raw) return emptyMeta();
     const meta = { ...emptyMeta(), ...raw };
+    if (!Array.isArray(meta.openDigest)) meta.openDigest = [];
     if (meta.v !== 1) throw new Error(`Unsupported state version ${String(meta.v)}`);
     return meta;
   }

@@ -35,8 +35,11 @@ describe("html helpers", () => {
   it("recognises placeholder posts", () => {
     expect(isMeaningfulText("RT: https://truthsocial.com/x")).toBe(false);
     expect(isMeaningfulText("[No Title] - Post from ...")).toBe(false);
+    expect(isMeaningfulText("Video post from October 14, 2026")).toBe(false);
+    expect(isMeaningfulText("View video")).toBe(false);
     expect(isMeaningfulText("  ")).toBe(false);
     expect(isMeaningfulText("MAKE AMERICA GREAT AGAIN!")).toBe(true);
+    expect(isMeaningfulText("Greenland has enormous oil")).toBe(true);
   });
 });
 

@@ -15,11 +15,11 @@
 
 import { RUN_LEASE_MS } from "./coordinator";
 import { scrub, toHex } from "./log";
-import { buildMessage, translatableText } from "./message";
+import { buildMediaDigest, buildMessage, translatableText } from "./message";
 import { alertAdmin, checkHeartbeat, recordSourceFailure, recordSuccess } from "./monitor";
-import { advanceCursor, filterNewPosts, sendOrder } from "./posts";
+import { advanceCursor, filterNewPosts, mediaDigestId, sendOrder } from "./posts";
 import type { Ctx } from "./runtime";
-import { contains, fetchPosts, type Post, pureRepostIds } from "./sources";
+import { contains, fetchPosts, type Post, pureRepostIds, sameMediaRepostIds } from "./sources";
 import { KvWriteError, type Meta, type Store, type Subscriber } from "./store";
 import { analyzePost, type PostAnalysis } from "./tagging";
 import { sendMessage, telegramCall } from "./telegram";
@@ -254,9 +254,10 @@ async function runSteps(ctx: Ctx, store: Store, meta: Meta, persist: () => Promi
 
   const fresh = filterNewPosts(posts, meta.lastSeen);
   // A wordless RT of a status already in this window is the same post again
-  // (Truth Social archives the original and the boost under two ids). Mark
-  // it done so the cursor can pass it, and don't deliver it.
-  const reposts = new Set(pureRepostIds(posts));
+  // (Truth Social archives the original and the boost under two ids). So is
+  // a second id that points at a video file we already have. Mark it done
+  // so the cursor can pass it, and don't deliver it.
+  const reposts = new Set([...pureRepostIds(posts), ...sameMediaRepostIds(posts)]);
   const skipping = fresh.filter((p) => reposts.has(p.id));
   if (skipping.length)
     ctx.log.info(`Skipping ${skipping.length} pure re-post(s) already covered by the original`);
@@ -264,10 +265,16 @@ async function runSteps(ctx: Ctx, store: Store, meta: Meta, persist: () => Promi
   const chronological = fresh.map((p) => p.id);
   advanceCursor(meta, chronological);
   // Forget progress on posts that are no longer pending (stale entries).
-  for (const id of Object.keys(meta.pending)) if (!chronological.includes(id)) delete meta.pending[id];
+  // A media digest id is not a status id, so it is kept until that digest finishes.
+  const digestKey = meta.openDigest.length ? mediaDigestId(meta.openDigest) : "";
+  for (const id of Object.keys(meta.pending)) {
+    if (id === digestKey) continue;
+    if (!chronological.includes(id)) delete meta.pending[id];
+  }
 
   const todo = fresh.filter((p) => !meta.sentAhead.includes(p.id));
-  if (todo.length) await deliverNewPosts(ctx, store, meta, todo, chronological, persist);
+  if (todo.length || meta.openDigest.length)
+    await deliverNewPosts(ctx, store, meta, todo, chronological, posts, persist);
   await recordSuccess(ctx, store, meta);
 }
 
@@ -290,18 +297,23 @@ async function deliverNewPosts(
   meta: Meta,
   todo: Post[],
   chronological: string[],
+  allPosts: Post[],
   persist: () => Promise<void>,
 ) {
+  const textual = todo.filter((p) => translatableText(p));
+  const textless = todo.filter((p) => !translatableText(p));
   const { targets, subscriberCount } = await deliveryTargets(ctx, store);
   ctx.log.info(
-    `${todo.length} new post(s) for ${subscriberCount} subscriber(s)${ctx.cfg.dryRun ? " [DRY RUN]" : ""}`,
+    `${textual.length} new post(s) for ${subscriberCount} subscriber(s)` +
+      (textless.length ? `, ${textless.length} caption-less` : "") +
+      (ctx.cfg.dryRun ? " [DRY RUN]" : ""),
   );
 
   // Translate and classify first (cached per post), so high-impact posts can
   // jump the queue and a resumed post is sent with identical text.
   const prepared: Prepared[] = [];
   const gaveUp: { id: string; error: string; quota: boolean }[] = [];
-  for (const post of todo) {
+  for (const post of textual) {
     const text = translatableText(post);
     let analysis = text ? await store.getAnalysis(post.id) : MEDIA_ONLY;
     if (!analysis) {
@@ -389,5 +401,91 @@ async function deliverNewPosts(
       ctx.log.info(`Run budget used up at post ${id} — continuing next run`);
       break;
     }
+  }
+
+  await deliverTextless(
+    ctx,
+    store,
+    meta,
+    textless,
+    chronological,
+    allPosts,
+    targets,
+    subscriberCount,
+    persist,
+  );
+}
+
+/**
+ * Caption-less posts are not each sent as "video without text".
+ * One of them has nothing to say, so it is marked done and skipped.
+ * Two or more that are ready together become a single digest. The id set
+ * is saved in `meta.openDigest` before the send, so a retry cannot grow
+ * the set and deliver the earlier posts a second time.
+ */
+async function deliverTextless(
+  ctx: Ctx,
+  store: Store,
+  meta: Meta,
+  textless: Post[],
+  chronological: string[],
+  allPosts: Post[],
+  targets: Target[],
+  subscriberCount: number,
+  persist: () => Promise<void>,
+): Promise<void> {
+  if (!meta.openDigest.length) {
+    if (textless.length < 2) {
+      const lone = textless[0];
+      if (lone) {
+        advanceCursor(meta, chronological, lone.id);
+        ctx.log.info(`Skipping caption-less post ${lone.id}`);
+        await persist();
+      }
+      return;
+    }
+    meta.openDigest = textless.map((p) => p.id);
+    meta.pending[mediaDigestId(meta.openDigest)] ??= ctx.now();
+    await persist();
+  }
+
+  const ids = meta.openDigest;
+  const byId = new Map(allPosts.map((p) => [p.id, p]));
+  const chosen = ids.flatMap((id) => {
+    const post = byId.get(id);
+    return post ? [post] : [];
+  });
+  const digestId = mediaDigestId(ids);
+  if (chosen.length < 2) {
+    ctx.log.warn(`Dropping media digest ${digestId}: not enough posts still in the window`);
+    delete meta.pending[digestId];
+    for (const id of ids) advanceCursor(meta, chronological, id);
+    meta.openDigest = [];
+    await persist();
+    return;
+  }
+
+  let message = buildMediaDigest(chosen);
+  if (ctx.cfg.dryRun) message = `🧪 <b>DRY RUN</b> — היה נשלח ל-${subscriberCount} מנויים:\n\n${message}`;
+  const item: Prepared = {
+    post: { id: digestId, text: "", createdAt: chosen[0]?.createdAt ?? "", url: "" },
+    message,
+    impact: null,
+  };
+  if (meta.pending[digestId] === undefined) {
+    meta.pending[digestId] = ctx.now();
+    await persist();
+  }
+  const outcome = await deliverPost(ctx, store, item, targets);
+  const expired = ctx.now() - (meta.pending[digestId] ?? ctx.now()) > POST_RETRY_WINDOW_MS;
+  if (outcome === "done" || (outcome === "retry-later" && expired)) {
+    if (outcome !== "done")
+      ctx.log.warn(`Media digest ${digestId}: giving up on chats still failing after 60 min`);
+    delete meta.pending[digestId];
+    for (const id of ids) advanceCursor(meta, chronological, id);
+    meta.openDigest = [];
+    await persist();
+  } else if (outcome === "out-of-budget") {
+    ctx.log.info(`Run budget used up on media digest ${digestId} — continuing next run`);
   }
 }

@@ -51,12 +51,18 @@ export function stripHtml(input: string): string {
   return text.trim();
 }
 
-/** Skip empty, RT-only and "[No Title]" placeholder posts. */
+/**
+ * Skip empty, RT-only and archive placeholders.
+ * "Video post from October 14, 2026" is the feed's title for a caption-less
+ * video, not a caption. "View video" is the attachment link's label.
+ */
 export function isMeaningfulText(text: string): boolean {
   const cleaned = text.trim();
   if (!cleaned) return false;
   if (/^RT:\s*https?:\/\/\S+$/.test(cleaned)) return false;
   if (cleaned.startsWith("[No Title]")) return false;
+  if (/^(?:video|image|quote|media)\s+post\s+from\b/i.test(cleaned)) return false;
+  if (/^view\s+(?:image|video|media)$/i.test(cleaned)) return false;
   return true;
 }
 
