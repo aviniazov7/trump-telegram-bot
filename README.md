@@ -8,7 +8,7 @@
 
 Hebrew broadcasts of Donald Trump's Truth Social posts, tagged by likely market impact, on Telegram within minutes of publication. Live bot: [t.me/TrumpHebrewBot](https://t.me/TrumpHebrewBot).
 
-Built by [Avraham Niazov](https://github.com/aviniazov7), a junior backend and full-stack developer.
+Built by [Avraham Niazov](https://github.com/aviniazov7).
 
 ## What it does
 
