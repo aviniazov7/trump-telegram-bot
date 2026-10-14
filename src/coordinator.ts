@@ -18,6 +18,12 @@ export const RUN_LOCK_NAME = "cron";
 export const RUN_LEASE_MS = 4 * 60 * 1000;
 /** Claims older than this are dropped. Delivery retries give up after 60 minutes. */
 const CLAIM_TTL_MS = 2 * 24 * 60 * 60 * 1000;
+/**
+ * How long a processed Telegram update_id is remembered. Telegram retries a
+ * webhook that was slow or non-200 for about a day; two days covers that
+ * window with margin. KV can't compare-and-swap, so the claim lives here.
+ */
+export const UPDATE_DEDUPE_TTL_MS = 2 * 24 * 60 * 60 * 1000;
 
 interface Lease {
   token: string;
@@ -38,6 +44,10 @@ export interface RunLock {
   getLog(postId: string): Promise<Record<string, string>>;
   heartbeat(): Promise<number>;
   markHeartbeat(now: number): Promise<void>;
+  /** True when this caller is the first to process `updateId` inside the TTL. */
+  claimUpdate(updateId: number, now: number): Promise<boolean>;
+  /** Drop a claim so a failed attempt can be retried. */
+  releaseUpdate(updateId: number): Promise<void>;
   reset(): Promise<void>;
 }
 
@@ -112,6 +122,20 @@ export class Coordinator extends DurableObject<Env> implements RunLock {
     await this.ctx.storage.put("heartbeat", now);
   }
 
+  async claimUpdate(updateId: number, now: number): Promise<boolean> {
+    const key = `upd:${updateId}`;
+    return this.ctx.storage.transaction(async (txn) => {
+      const at = await txn.get<number>(key);
+      if (at !== undefined && now - at < UPDATE_DEDUPE_TTL_MS) return false;
+      await txn.put(key, now);
+      return true;
+    });
+  }
+
+  async releaseUpdate(updateId: number): Promise<void> {
+    await this.ctx.storage.delete(`upd:${updateId}`);
+  }
+
   /** Test helper. Wipes the lease, claims and heartbeat. */
   async reset(): Promise<void> {
     await this.ctx.storage.deleteAll();
@@ -119,13 +143,16 @@ export class Coordinator extends DurableObject<Env> implements RunLock {
 
   private async prune(now: number): Promise<void> {
     try {
-      const cutoff = now - CLAIM_TTL_MS;
-      const entries = await this.ctx.storage.list<SendRecord>({ prefix: "sent:" });
       const stale: string[] = [];
-      for (const [key, value] of entries) if ((value?.at ?? 0) < cutoff) stale.push(key);
+      const claims = await this.ctx.storage.list<SendRecord>({ prefix: "sent:" });
+      const claimCutoff = now - CLAIM_TTL_MS;
+      for (const [key, value] of claims) if ((value?.at ?? 0) < claimCutoff) stale.push(key);
+      const updates = await this.ctx.storage.list<number>({ prefix: "upd:" });
+      const updateCutoff = now - UPDATE_DEDUPE_TTL_MS;
+      for (const [key, at] of updates) if ((at ?? 0) < updateCutoff) stale.push(key);
       if (stale.length) await this.ctx.storage.delete(stale);
     } catch (err) {
-      console.warn("Send-claim prune failed:", err instanceof Error ? err.message : String(err));
+      console.warn("Coordinator prune failed:", err instanceof Error ? err.message : String(err));
     }
   }
 }

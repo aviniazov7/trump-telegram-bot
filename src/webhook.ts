@@ -43,7 +43,7 @@ const notFound = () => new Response("Not found", { status: 404 });
 export async function handleWebhook(
   request: Request,
   env: Env,
-  opts: { fetch?: Fetcher } = {},
+  opts: { fetch?: Fetcher; waitUntil?: (promise: Promise<unknown>) => void } = {},
 ): Promise<Response> {
   const cfg = loadConfig(env);
   if (cfg.webhookSecret.length < MIN_SECRET_LENGTH || !cfg.botToken) {
@@ -71,15 +71,47 @@ export async function handleWebhook(
   }
 
   const ctx = makeCtx({ ...cfg, runTimeBudgetMs: WEBHOOK_TIME_BUDGET_MS }, { fetch: opts.fetch });
+  const store = openStore(env);
+  const task = deliverUpdate(ctx, store, update);
+  if (opts.waitUntil) {
+    // 200 before sendMessage. Telegram retries an update when the webhook is
+    // slow or not 2xx, and the retry is a second delivery of the same update_id.
+    opts.waitUntil(task.catch((err) => ctx.log.error("Webhook update failed:", err)));
+    return new Response("ok");
+  }
   try {
-    await handleUpdate(ctx, openStore(env), update);
+    // Tests call in without waitUntil and need the send finished, and a
+    // thrown KV error, before this returns. 500 lets Telegram redeliver.
+    await task;
   } catch (err) {
-    // 500 makes Telegram redeliver the update later, so a KV hiccup doesn't
-    // lose a /start.
     ctx.log.error("Webhook update failed:", err);
     return new Response("Error", { status: 500 });
   }
   return new Response("ok");
+}
+
+/**
+ * One Telegram update, at most once. The claim is taken before any send and
+ * dropped if handling throws, so a later delivery of the same update_id can
+ * still apply. A duplicate that arrives while the first attempt is in flight
+ * loses the claim and sends nothing.
+ */
+async function deliverUpdate(ctx: Ctx, store: Store, update: Update): Promise<void> {
+  const updateId = typeof update.update_id === "number" ? update.update_id : undefined;
+  if (updateId !== undefined && !(await store.claimUpdate(updateId, ctx.now()))) {
+    ctx.log.info(`Duplicate Telegram update ${updateId} ignored`);
+    return;
+  }
+  try {
+    await handleUpdate(ctx, store, update);
+  } catch (err) {
+    if (updateId !== undefined) {
+      await store.releaseUpdate(updateId).catch((releaseErr) => {
+        ctx.log.error("Failed to release update claim:", releaseErr);
+      });
+    }
+    throw err;
+  }
 }
 
 interface Chat {
@@ -162,7 +194,12 @@ export async function handleUpdate(ctx: Ctx, store: Store, update: Update): Prom
       if (!(await store.getSubscriber(chatId))) {
         await store.putSubscriber(chatId, null);
         ctx.log.info(`Subscribed ${await ctx.log.chat(chatId)} (bot added)`);
-        await welcome(ctx, chatId, member.chat.type, null);
+        // In a private chat Telegram sends this update together with the
+        // /start message when the user presses Start (the user was "kicked"
+        // until then). /start sends the welcome. Doing it here as well
+        // delivered the same text twice on 2026-10-14. Groups have no paired
+        // /start, so they are still welcomed here.
+        if (member.chat.type !== "private") await welcome(ctx, chatId, member.chat.type, null);
       }
     } else if (["kicked", "left", "restricted"].includes(status)) {
       await store.deleteSubscriber(chatId);

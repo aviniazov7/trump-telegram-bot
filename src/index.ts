@@ -15,8 +15,12 @@ import { bindWorkersAi } from "./workers-ai";
 export { Coordinator } from "./coordinator";
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    if (new URL(request.url).pathname.startsWith("/telegram/")) return handleWebhook(request, env);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (new URL(request.url).pathname.startsWith("/telegram/")) {
+      // Answer Telegram before the send. A slow sendMessage used to hold the
+      // response, and a late or non-200 answer is what makes Telegram retry.
+      return handleWebhook(request, env, { waitUntil: (promise) => ctx.waitUntil(promise) });
+    }
     return new Response("Not found", { status: 404 });
   },
 
