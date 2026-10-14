@@ -1,7 +1,9 @@
 /** Market-impact tagging, and the per-post analysis that combines it with translation. */
 import { CATEGORY_KEYS, GEMINI_MAX_CHARS, GeminiError, IMPACT_LEVELS, geminiJson, msUntilQuotaReset } from "./gemini";
 import type { Ctx } from "./runtime";
+import { isMeaningfulText } from "./text";
 import { looksTranslated, needsTranslation } from "./translate";
+import { workersAiTranslate } from "./workers-ai";
 
 /** Machine keys → Hebrew hashtag labels, in display order. */
 export const MARKET_CATEGORIES: Record<string, string> = {
@@ -114,15 +116,20 @@ export interface PostAnalysis {
   translated: boolean;
   categories: string[];
   impact: Impact | null;
-  /** "gemini" (with `model`), "none" when nothing needed translating, "" when it failed. */
+  /** "gemini" or "workers-ai" (with `model`), "none" when nothing needed translating, "" when it failed. */
   provider: string;
   model?: string;
-  /** Why Gemini failed, per model (also saved under gemini-error:<post>). */
+  /** Why translation failed, per provider (also saved under gemini-error:<post>). */
   geminiError?: string;
   /** The run ran out of time before Gemini could be asked: not a failure. */
   outOfTime?: boolean;
-  /** Every model's daily quota is used up: retrying before the reset is pointless. */
+  /** Every Gemini model's daily quota is used up and Workers AI is not configured. */
   quotaExhausted?: boolean;
+  /**
+   * Every provider that was asked returned an echo (or already had, on an
+   * earlier run). Calling them again spends quota and cannot succeed.
+   */
+  deterministic?: boolean;
 }
 
 /** Remembers which models are out of daily quota (backed by KV in the Worker). */
@@ -133,14 +140,37 @@ export interface QuotaTracker {
 
 const noQuotaTracking: QuotaTracker = { exhausted: async () => null, markExhausted: async () => {} };
 
+const ECHO_REASON = /:\s*(?:untranslated text|no answer|skipped — earlier untranslated text)\s*$/;
+
+/** Providers whose last answer was an echo. Asking them again burns quota. */
+export function echoedProviders(error: string): Set<string> {
+  const found = new Set<string>();
+  if (!error) return found;
+  for (const part of error.split(" | ")) {
+    const match = /^\s*(.+?):\s*(?:untranslated text|no answer|skipped — earlier untranslated text)\s*$/.exec(part);
+    if (match?.[1]) found.add(match[1]);
+  }
+  return found;
+}
+
+function deterministicFailure(errors: string[]): boolean {
+  return errors.length > 0 && errors.every((part) => ECHO_REASON.test(part));
+}
+
 /**
- * Translate and tag a post with Gemini: the primary model first, then the
- * fallback model (GEMINI_FALLBACK_MODEL) in the same run. There is no other
- * translator in the Worker — the keyless ones are blocked from Cloudflare's
- * network — so a failure returns `translated: false` with the reasons, and the
- * caller decides whether to retry next run or send the English original.
+ * Translate and tag a post. Gemini first (primary, then GEMINI_FALLBACK_MODEL).
+ * If both fail — quota, HTTP error, or an answer that is still English —
+ * one Workers AI call is the fallback. A failure returns `translated: false`
+ * with every reason, and the caller retries or sends the English original.
+ * `priorError` is the last saved failure, so a model that already echoed this
+ * post is not called again.
  */
-export async function analyzePost(ctx: Ctx, text: string, quota: QuotaTracker = noQuotaTracking): Promise<PostAnalysis> {
+export async function analyzePost(
+  ctx: Ctx,
+  text: string,
+  quota: QuotaTracker = noQuotaTracking,
+  priorError = "",
+): Promise<PostAnalysis> {
   const untranslated = (geminiError: string, extra: Partial<PostAnalysis> = {}): PostAnalysis => ({
     hebrew: text,
     translated: false,
@@ -149,14 +179,21 @@ export async function analyzePost(ctx: Ctx, text: string, quota: QuotaTracker = 
     geminiError,
     ...extra,
   });
-  if (!needsTranslation(text)) return { hebrew: text, translated: true, ...finalTags([], null, text), provider: "none" };
+  if (!isMeaningfulText(text) || !needsTranslation(text)) {
+    return { hebrew: text, translated: true, ...finalTags([], null, text), provider: "none" };
+  }
   if (!ctx.cfg.geminiApiKey) return untranslated("GEMINI_API_KEY not set");
   if (text.length > GEMINI_MAX_CHARS) return untranslated(`post longer than ${GEMINI_MAX_CHARS} chars`);
 
   const models = [...new Set([ctx.cfg.geminiModel, ctx.cfg.geminiFallbackModel].filter(Boolean))];
+  const echoed = echoedProviders(priorError);
   const errors: string[] = [];
   let outOfQuota = 0;
   for (const model of models) {
+    if (echoed.has(model)) {
+      errors.push(`${model}: skipped — earlier untranslated text`);
+      continue;
+    }
     const exhausted = await quota.exhausted(model);
     if (exhausted) {
       outOfQuota += 1;
@@ -170,7 +207,7 @@ export async function analyzePost(ctx: Ctx, text: string, quota: QuotaTracker = 
         const parsed = parseMarketTags(data);
         // Invalid tags from Gemini: keep only what keywords can vouch for.
         const { categories, impact } = finalTags(parsed.categories, parsed.categories.length ? parsed.impact : null, text);
-        ctx.log.info(`Translated and tagged post via ${model}: ${categories.join(",")}, impact=${impact}`);
+        ctx.log.info(`Translated and tagged post via gemini (${model}): ${categories.join(",")}, impact=${impact}`);
         return {
           hebrew,
           translated: true,
@@ -198,5 +235,42 @@ export async function analyzePost(ctx: Ctx, text: string, quota: QuotaTracker = 
     }
     ctx.log.warn(`Gemini failed — ${errors.at(-1)}`);
   }
-  return untranslated(errors.join(" | "), outOfQuota === models.length ? { quotaExhausted: true } : {});
+
+  const aiModel = ctx.cfg.workersAiModel;
+  const aiReady = Boolean(ctx.ai && aiModel);
+  if (aiReady && echoed.has("workers-ai")) {
+    errors.push("workers-ai: skipped — earlier untranslated text");
+  } else if (aiReady) {
+    if (ctx.budget.timeUp() || !ctx.budget.canFetch()) {
+      errors.push("workers-ai: no time left in this run");
+    } else {
+      try {
+        const hebrew = await workersAiTranslate(ctx, text);
+        if (looksTranslated(text, hebrew)) {
+          const { categories, impact } = finalTags([], null, text);
+          ctx.log.info(`Translated post via workers-ai (${aiModel}): ${categories.join(",")}, impact=${impact}`);
+          return {
+            hebrew,
+            translated: true,
+            categories,
+            impact,
+            provider: "workers-ai",
+            model: aiModel,
+            ...(errors.length ? { geminiError: errors.join(" | ") } : {}),
+          };
+        }
+        errors.push(`workers-ai: ${hebrew ? "untranslated text" : "no answer"}`);
+        ctx.log.warn(`Workers AI failed — ${errors.at(-1)}`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        errors.push(`workers-ai: ${message}`.slice(0, 300));
+        ctx.log.warn(`Workers AI failed — ${errors.at(-1)}`);
+      }
+    }
+  }
+
+  const extra: Partial<PostAnalysis> = {};
+  if (outOfQuota === models.length && models.length > 0 && !aiReady) extra.quotaExhausted = true;
+  if (deterministicFailure(errors)) extra.deterministic = true;
+  return untranslated(errors.join(" | "), extra);
 }

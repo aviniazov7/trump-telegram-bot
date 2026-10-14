@@ -3,7 +3,7 @@
  * (fallback, and deep scan when the RSS window doesn't reach last_seen).
  */
 import type { Ctx } from "./runtime";
-import { htmlUnescape, isMeaningfulText, stripHtml } from "./text";
+import { htmlUnescape, isMeaningfulText, isRepostBoilerplateLine, stripHtml } from "./text";
 
 export type MediaKind = "image" | "video";
 
@@ -69,16 +69,29 @@ export function repostTarget(raw: string): string | null {
   return RT_STATUS_RE.exec(raw)?.[1] ?? null;
 }
 
+/** Own words plus quoted words, after placeholder and re-post labels are dropped. */
+function meaningfulBlob(post: Post): string {
+  return [post.text, post.quote?.text ?? ""].filter((part) => isMeaningfulText(part)).join("\n").trim();
+}
+
 /**
- * Ids of wordless re-posts whose original status is in `posts`.
- * The caller marks them done without sending: subscribers already get the
- * original, and the boost is the same video/quote a minute later.
+ * Ids of re-posts whose original status is in `posts` and which add no words
+ * of their own. The caller marks them done without sending: subscribers
+ * already get the original, and the boost is the same video a minute later.
+ * A boost whose quote carries words the original does not is kept.
  */
 export function pureRepostIds(posts: Post[]): string[] {
-  const ids = new Set(posts.map((p) => p.id));
+  const byId = new Map(posts.map((p) => [p.id, p]));
   return posts
-    .filter((p) => p.repostOf && p.repostOf !== p.id && ids.has(p.repostOf) && !isMeaningfulText(p.text))
-    .map((p) => p.id);
+    .filter((post) => {
+      if (!post.repostOf || post.repostOf === post.id) return false;
+      const original = byId.get(post.repostOf);
+      if (!original) return false;
+      const extra = meaningfulBlob(post);
+      if (!extra) return true;
+      return meaningfulBlob(original) === extra;
+    })
+    .map((post) => post.id);
 }
 
 /** Host + path, without a query, so the same file isn't two keys. */
@@ -93,10 +106,10 @@ export function canonicalMediaUrl(url: string): string {
 }
 
 /**
- * Wordless posts whose video file already belongs to an earlier status in
- * this window. Truth Social's re-post is a second id pointing at the same
- * mp4; the `RT:` line is usually there too, but a missing one must not
- * deliver the video again.
+ * Posts whose video file already belongs to an earlier status in this
+ * window, when this copy adds no words. A re-post is a second id pointing
+ * at the same mp4. If its quote carries words the earlier post lacked,
+ * the copy is kept.
  */
 export function sameMediaRepostIds(posts: Post[]): string[] {
   const chrono = [...posts].sort((a, b) => {
@@ -105,12 +118,18 @@ export function sameMediaRepostIds(posts: Post[]): string[] {
     }
     return 0;
   });
-  const seen = new Set<string>();
+  const seen = new Map<string, Post>();
   const skip: string[] = [];
   for (const post of chrono) {
     const videos = (post.mediaUrls ?? []).map(canonicalMediaUrl).filter((url) => VIDEO_URL_RE.test(url));
-    if (!isMeaningfulText(post.text) && videos.some((url) => seen.has(url))) skip.push(post.id);
-    for (const url of videos) seen.add(url);
+    const blob = meaningfulBlob(post);
+    const owners = videos.flatMap((url) => {
+      const owner = seen.get(url);
+      return owner ? [owner] : [];
+    });
+    // Same file again, and this copy adds no words the earlier one lacked.
+    if (owners.length && (!blob || owners.some((owner) => meaningfulBlob(owner) === blob))) skip.push(post.id);
+    for (const url of videos) if (!seen.has(url)) seen.set(url, post);
   }
   return skip;
 }
@@ -132,12 +151,23 @@ export function parseTruthHtml(html: string): {
   let body = html.replace(RT_HTML_RE, "");
   let quote: Quote | null = null;
   let quotedUrls: string[] = [];
+  // "Reposted Donald J. Trump" is the boost's label, not commentary. When
+  // the name is all the paragraph says, keep it as the quote's author.
+  const repostedName = /<p>\s*Reposted\s*([\s\S]*?)<\/p>/i.exec(body);
+  let repostAuthor = "";
+  if (repostedName) {
+    const name = stripHtml(repostedName[1] ?? "");
+    if (isRepostBoilerplateLine(`Reposted ${name}`)) {
+      repostAuthor = name;
+      body = body.replace(repostedName[0], "");
+    }
+  }
   const quoted = /<blockquote>([\s\S]*?)<\/blockquote>/i.exec(body);
   const quotedBy = /<p>\s*Quoted\s*([\s\S]*?)<\/p>/i.exec(body);
   if (quoted) {
     const inner = parseTruthHtml(quoted[1] ?? "");
     quote = {
-      author: stripHtml(quotedBy?.[1] ?? ""),
+      author: stripHtml(quotedBy?.[1] ?? "") || repostAuthor,
       text: inner.text,
       media: [...inner.media, ...(inner.quote?.media ?? [])],
     };

@@ -23,7 +23,7 @@ import { contains, fetchPosts, type Post, pureRepostIds, sameMediaRepostIds } fr
 import { KvWriteError, type Meta, type Store, type Subscriber } from "./store";
 import { analyzePost, type PostAnalysis } from "./tagging";
 import { sendMessage, telegramCall } from "./telegram";
-import { htmlEscape, splitForTelegram } from "./text";
+import { htmlEscape, isMeaningfulText, splitForTelegram } from "./text";
 
 /** Give up on chats still failing this long after a post was first attempted. */
 export const POST_RETRY_WINDOW_MS = 60 * 60 * 1000;
@@ -300,8 +300,9 @@ async function deliverNewPosts(
   allPosts: Post[],
   persist: () => Promise<void>,
 ) {
-  const textual = todo.filter((p) => translatableText(p));
-  const textless = todo.filter((p) => !translatableText(p));
+  const readable = (post: Post) => isMeaningfulText(translatableText(post));
+  const textual = todo.filter(readable);
+  const textless = todo.filter((post) => !readable(post));
   const { targets, subscriberCount } = await deliveryTargets(ctx, store);
   ctx.log.info(
     `${textual.length} new post(s) for ${subscriberCount} subscriber(s)` +
@@ -312,16 +313,22 @@ async function deliverNewPosts(
   // Translate and classify first (cached per post), so high-impact posts can
   // jump the queue and a resumed post is sent with identical text.
   const prepared: Prepared[] = [];
-  const gaveUp: { id: string; error: string; quota: boolean }[] = [];
+  const gaveUp: { id: string; error: string; quota: boolean; immediate: boolean }[] = [];
   for (const post of textual) {
     const text = translatableText(post);
     let analysis = text ? await store.getAnalysis(post.id) : MEDIA_ONLY;
     if (!analysis) {
       if (ctx.budget.timeUp() || !ctx.budget.canFetch(1 + RESERVED_SUBREQUESTS)) break;
-      const fresh = await analyzePost(ctx, text, {
-        exhausted: (model) => store.geminiQuotaExhausted(model),
-        markExhausted: (model, reason, seconds) => store.markGeminiQuotaExhausted(model, reason, seconds),
-      });
+      const prior = await store.getGeminiFailures(post.id);
+      const fresh = await analyzePost(
+        ctx,
+        text,
+        {
+          exhausted: (model) => store.geminiQuotaExhausted(model),
+          markExhausted: (model, reason, seconds) => store.markGeminiQuotaExhausted(model, reason, seconds),
+        },
+        prior?.attempts.at(-1)?.error ?? "",
+      );
       if (fresh.outOfTime) break; // not a failure: try again next run
       if (fresh.translated) {
         // The fallback model saved it, but keep the primary's failure too.
@@ -333,7 +340,9 @@ async function deliverNewPosts(
         const record = await store.recordGeminiFailure(post.id, ctx.now(), fresh.geminiError ?? "unknown");
         const waited = ctx.now() - record.firstFailureAt;
         // Waiting is pointless when every model is out of daily quota.
-        if (ctx.cfg.geminiApiKey && !fresh.quotaExhausted && waited < ctx.cfg.geminiRetryMs) {
+        // An echo will not become Hebrew on the next run. A 429 or a 5xx might,
+        // and so might Workers AI, so those keep the retry window.
+        if (ctx.cfg.geminiApiKey && !fresh.quotaExhausted && !fresh.deterministic && waited < ctx.cfg.geminiRetryMs) {
           ctx.log.warn(
             `Post ${post.id}: no translation yet (${fresh.geminiError}) — retrying next run ` +
               `(${Math.floor(waited / 60_000)}/${ctx.cfg.geminiRetryMs / 60_000} min)`,
@@ -351,6 +360,7 @@ async function deliverNewPosts(
           id: post.id,
           error: fresh.geminiError ?? "unknown",
           quota: Boolean(fresh.quotaExhausted),
+          immediate: Boolean(fresh.deterministic),
         });
       }
     }
@@ -372,11 +382,16 @@ async function deliverNewPosts(
   const otherFailures = gaveUp.filter((g) => !g.quota);
   if (otherFailures.length) {
     const [first] = otherFailures;
+    const triedWorkersAi = otherFailures.some((failure) => failure.error.includes("workers-ai"));
+    const who = triedWorkersAi ? "Gemini ו-Workers AI" : "Gemini";
+    const span = otherFailures.every((failure) => failure.immediate)
+      ? "בניסיון אחד"
+      : `במשך ${ctx.cfg.geminiRetryMs / 60_000} דק׳`;
     await alertAdmin(
       ctx,
       store,
       "translation",
-      `⚠️ Gemini נכשל במשך ${ctx.cfg.geminiRetryMs / 60_000} דק׳ ב-${otherFailures.length} פוסט(ים) — הם נשלחים באנגלית בלבד.\n` +
+      `⚠️ ${who} נכשל ${span} ב-${otherFailures.length} פוסט(ים) — הם נשלחים באנגלית בלבד.\n` +
         `סיבה אחרונה: <code>${htmlEscape(scrub(first?.error ?? "").slice(0, 300))}</code>\n` +
         `פרטים: <code>npm run gemini-errors</code> (מפתח gemini-error:${first?.id} ב-KV).`,
     );

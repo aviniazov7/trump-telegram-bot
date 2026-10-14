@@ -1,5 +1,12 @@
 import type { Env } from "./env";
 
+/**
+ * Free-plan multilingual instruct model (100+ languages, including Hebrew).
+ * Not one of the models Cloudflare moved to Workers Paid.
+ * https://developers.cloudflare.com/workers-ai/models/glm-4.7-flash/
+ */
+export const DEFAULT_WORKERS_AI_MODEL = "@cf/zai-org/glm-4.7-flash";
+
 /** Parsed, defaulted configuration for one invocation. */
 export interface Config {
   botToken: string;
@@ -12,6 +19,12 @@ export interface Config {
   geminiThinkingLevel: string;
   /** Tried when the primary model fails; "" disables it. */
   geminiFallbackModel: string;
+  /**
+   * Workers AI model used only after Gemini fails. "" disables it.
+   * Default is a multilingual instruct model that stays on the Workers Free
+   * plan (10,000 neurons/day). Paid-only models are not used.
+   */
+  workersAiModel: string;
   /** Per Gemini call, so one slow call can't eat the run. */
   geminiTimeoutMs: number;
   /** Keep retrying Gemini (each run) this long before sending in English. */
@@ -44,6 +57,7 @@ export function loadConfig(env: Env): Config {
     geminiModel: str(env.GEMINI_MODEL) || "gemini-3.5-flash-lite",
     geminiThinkingLevel: str(env.GEMINI_THINKING_LEVEL).toLowerCase(),
     geminiFallbackModel: env.GEMINI_FALLBACK_MODEL === undefined ? "gemini-3.8-flash" : str(env.GEMINI_FALLBACK_MODEL),
+    workersAiModel: env.WORKERS_AI_MODEL === undefined ? DEFAULT_WORKERS_AI_MODEL : str(env.WORKERS_AI_MODEL),
     geminiTimeoutMs: int(env.GEMINI_TIMEOUT_SECONDS, 12) * 1000,
     geminiRetryMs: int(env.GEMINI_RETRY_MINUTES, 15) * 60_000,
     staleAlertMinutes: int(env.STALE_ALERT_MINUTES, 35),

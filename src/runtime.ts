@@ -54,7 +54,19 @@ export class BudgetExhausted extends Error {
 
 export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
 
-/** Everything a unit of work needs; tests swap `fetch`, `sleep` and `now`. */
+/** Chat input for the Workers AI fallback. Tests pass a fake `run`. */
+export interface WorkersAiChatInput {
+  messages: { role: "system" | "user" | "assistant"; content: string }[];
+  temperature?: number;
+  max_completion_tokens?: number;
+  chat_template_kwargs?: { enable_thinking?: boolean };
+}
+
+export interface WorkersAiClient {
+  run(model: string, input: WorkersAiChatInput, options?: { signal?: AbortSignal }): Promise<unknown>;
+}
+
+/** Everything a unit of work needs; tests swap `fetch`, `sleep`, `now` and `ai`. */
 export interface Ctx {
   cfg: Config;
   budget: Budget;
@@ -63,13 +75,21 @@ export interface Ctx {
   http(url: string, init?: RequestInit & { timeoutMs?: number }): Promise<Response>;
   sleep(ms: number): Promise<void>;
   now(): number;
+  /** Present when the Worker has an AI binding and the fallback model is set. */
+  ai?: WorkersAiClient;
 }
 
 export const HTTP_TIMEOUT_MS = 15_000;
 
 export function makeCtx(
   cfg: Config,
-  opts: { fetch?: Fetcher; sleep?: (ms: number) => Promise<void>; now?: () => number; log?: Logger } = {},
+  opts: {
+    fetch?: Fetcher;
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+    log?: Logger;
+    ai?: WorkersAiClient;
+  } = {},
 ): Ctx {
   const now = opts.now ?? Date.now;
   const doFetch = opts.fetch ?? ((url, init) => fetch(url, init));
@@ -79,6 +99,7 @@ export function makeCtx(
     budget,
     log: opts.log ?? new Logger(cfg.botToken),
     now,
+    ...(opts.ai ? { ai: opts.ai } : {}),
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     async http(url, init = {}) {
       budget.take();

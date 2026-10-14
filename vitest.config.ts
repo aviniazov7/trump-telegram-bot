@@ -6,6 +6,10 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   plugins: [
     cloudflareTest({
+      // Workers AI has no local simulator. Tests inject a fake client and
+      // never call the binding, so the remote proxy (and its API token) is
+      // not used. Production still has the [ai] binding in wrangler.toml.
+      remoteBindings: false,
       wrangler: { configPath: "./wrangler.toml" },
       miniflare: {
         bindings: {

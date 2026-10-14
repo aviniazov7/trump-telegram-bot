@@ -9,6 +9,11 @@ export interface Env {
    * so overlapping invocations can't deliver the same post twice.
    */
   COORDINATOR: DurableObjectNamespace<Coordinator>;
+  /**
+   * Workers AI. Translation fallback after Gemini fails. The call disables
+   * reasoning so it stays inside the free daily neuron allowance.
+   */
+  AI?: Ai;
 
   // Secrets — set with `wrangler secret put`, never in wrangler.toml.
   TELEGRAM_BOT_TOKEN: string;
@@ -22,6 +27,8 @@ export interface Env {
   GEMINI_MODEL?: string;
   GEMINI_THINKING_LEVEL?: string;
   GEMINI_FALLBACK_MODEL?: string;
+  /** "" disables the Workers AI fallback. Default: @cf/zai-org/glm-4.7-flash. */
+  WORKERS_AI_MODEL?: string;
   GEMINI_TIMEOUT_SECONDS?: string;
   GEMINI_RETRY_MINUTES?: string;
   STALE_ALERT_MINUTES?: string;
