@@ -202,7 +202,8 @@ To drop them instead, use `--prune-empty auto`.
 
 - `data/` is in `.gitignore`, and the workflow has `contents: read`, so it
   can't commit state anymore.
-- State lives in the `BOT_STATE` repository variable, which only
-  collaborators can see (see README → *State storage*).
+- State lived in the `BOT_STATE` repository variable, which only
+  collaborators can see. The live Worker stores state in KV; see
+  [State in KV](operations.md#state-in-kv).
 - Logs show chat IDs only as keyed hashes (`chat#3a1f76687d`), and a test
   (`LogRedactionTests`) fails if a raw ID reaches the logs.
