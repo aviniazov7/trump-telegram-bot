@@ -3,8 +3,10 @@
 **Status: implemented**, then cut over on 2026-10-12. On 2026-10-13 the
 GitHub Actions workflow and `legacy/` were deleted, and a Durable Object
 (`Coordinator`) took the single-flight lease and the send claims — the
-duplicate-send risk called out below. The README describes the live bot.
-The rest of this document is the original proposal, kept for its reasoning.
+duplicate-send risk called out below. The live bot is described in
+[operations.md](operations.md). The repository README is the portfolio
+overview. The rest of this document is the original proposal, kept for its
+reasoning.
 
 ## Why
 
