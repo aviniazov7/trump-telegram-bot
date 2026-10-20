@@ -54,9 +54,14 @@ export function loadConfig(env: Env): Config {
     // Anything but an explicit "false" keeps shadow mode on: failing safe
     // means previewing to the admin, never double-sending to subscribers.
     dryRun: str(env.DRY_RUN).toLowerCase() !== "false",
-    geminiModel: str(env.GEMINI_MODEL) || "gemini-3.5-flash-lite",
+    // Fuller Flash for translation quality. Flash-lite is only the fallback:
+    // on Oct 12 gemini-3.8-flash's free daily quota (20 requests) returned 429
+    // while flash-lite's separate quota was untouched. The exhausted model is
+    // skipped until midnight Pacific, so the bot stays inside the free tier.
+    geminiModel: str(env.GEMINI_MODEL) || "gemini-3.8-flash",
     geminiThinkingLevel: str(env.GEMINI_THINKING_LEVEL).toLowerCase(),
-    geminiFallbackModel: env.GEMINI_FALLBACK_MODEL === undefined ? "gemini-3.8-flash" : str(env.GEMINI_FALLBACK_MODEL),
+    geminiFallbackModel:
+      env.GEMINI_FALLBACK_MODEL === undefined ? "gemini-3.5-flash-lite" : str(env.GEMINI_FALLBACK_MODEL),
     workersAiModel: env.WORKERS_AI_MODEL === undefined ? DEFAULT_WORKERS_AI_MODEL : str(env.WORKERS_AI_MODEL),
     geminiTimeoutMs: int(env.GEMINI_TIMEOUT_SECONDS, 12) * 1000,
     geminiRetryMs: int(env.GEMINI_RETRY_MINUTES, 15) * 60_000,

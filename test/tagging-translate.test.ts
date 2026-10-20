@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { WorkersAiChatInput } from "../src/runtime";
 import { analyzePost, keywordCategories, parseMarketTags } from "../src/tagging";
-import { looksTranslated, needsTranslation } from "../src/translate";
+import { hasArabicScript, looksTranslated, needsTranslation, repairArabicScript } from "../src/translate";
 import { bindWorkersAi, extractWorkersAiText } from "../src/workers-ai";
 import { type Call, GEMINI, GTX, geminiAnswer, json, testCtx } from "./helpers";
 
@@ -18,15 +18,24 @@ describe("parseMarketTags", () => {
   });
 
   it("normalises case, aliases and duplicates", () => {
-    const data = { categories: [" Tariffs ", "tariff", "Fed", "interest rates", "Stock-Market"], impact: " Medium " };
-    expect(parseMarketTags(data)).toEqual({ categories: ["tariffs", "fed_rates", "stocks"], impact: "medium" });
+    const data = {
+      categories: [" Tariffs ", "tariff", "Fed", "interest rates", "Stock-Market"],
+      impact: " Medium ",
+    };
+    expect(parseMarketTags(data)).toEqual({
+      categories: ["tariffs", "fed_rates", "stocks"],
+      impact: "medium",
+    });
   });
 
   it("drops unknown and non-string categories, and 'other' next to a real topic", () => {
     expect(parseMarketTags({ categories: ["weather", 5, null, "oil"] }).categories).toEqual(["oil"]);
     expect(parseMarketTags({ categories: ["other", "crypto"] }).categories).toEqual(["crypto"]);
     expect(parseMarketTags({ categories: ["other"] }).categories).toEqual(["other"]);
-    expect(parseMarketTags({ categories: "oil", impact: "low" })).toEqual({ categories: ["oil"], impact: "low" });
+    expect(parseMarketTags({ categories: "oil", impact: "low" })).toEqual({
+      categories: ["oil"],
+      impact: "low",
+    });
   });
 
   it("rejects invalid impact values and garbage", () => {
@@ -55,10 +64,15 @@ describe("keywordCategories", () => {
   });
 });
 
-const PRIMARY = "gemini-3.5-flash-lite";
-const FALLBACK = "gemini-3.8-flash";
+const PRIMARY = "gemini-3.8-flash";
+const FALLBACK = "gemini-3.5-flash-lite";
+/** Arabic letters mixed into a Hebrew word, as produced on 2026-10-20. */
+const MIXED = "بالמפלגה הרפובליקנית";
+const REPAIRED = "באלמפלגה הרפובליקנית";
+const CLEAN_PARTY = "במפלגה הרפובליקנית";
 const modelOf = (call: Call) => /models\/([^:]+):/.exec(call.url)?.[1];
-const answer = (data: unknown, finish?: string, thought?: string) => () => json(geminiAnswer(data, finish, thought));
+const answer = (data: unknown, finish?: string, thought?: string) => () =>
+  json(geminiAnswer(data, finish, thought));
 const good = answer({ hebrew: HEBREW, categories: ["tariffs", "china"], impact: "high" });
 /** Route Gemini calls per model. */
 const byModel = (primary: () => Response, fallback: () => Response) => (call: Call) =>
@@ -104,21 +118,36 @@ describe("analyzePost", () => {
     expect(primary?.url).not.toContain("test-gemini-key");
     expect(primary?.headers.get("x-goog-api-key")).toBe("test-gemini-key");
     const body = JSON.parse(primary?.body ?? "{}");
-    expect(body.systemInstruction.parts[0].text).toContain("Hebrew");
+    expect(body.systemInstruction.parts[0].text).toContain("Hebrew script only");
+    expect(body.systemInstruction.parts[0].text).toContain("Do not transliterate");
+    expect(body.systemInstruction.parts[0].text).toContain("אני שמח להודיע");
+    expect(body.systemInstruction.parts[0].text).toContain("טוהר הבחירות");
+    expect(body.systemInstruction.parts[0].text).not.toContain("previous translation was invalid");
     expect(body.generationConfig).toMatchObject({ responseMimeType: "application/json" });
-    expect(body.generationConfig.thinkingConfig).toBeUndefined(); // lite
-    expect(Object.keys(body.generationConfig.responseSchema.properties)).toEqual(["hebrew", "categories", "impact"]);
-    expect(JSON.parse(fallback?.body ?? "{}").generationConfig.thinkingConfig).toEqual({ thinkingLevel: "low" });
+    expect(body.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "low" });
+    expect(Object.keys(body.generationConfig.responseSchema.properties)).toEqual([
+      "hebrew",
+      "categories",
+      "impact",
+    ]);
+    const fallbackBody = JSON.parse(fallback?.body ?? "{}");
+    expect(fallbackBody.generationConfig.thinkingConfig).toBeUndefined();
+    expect(fallbackBody.systemInstruction.parts[0].text).not.toContain("previous translation was invalid");
   });
 
   it("ignores thought parts", async () => {
-    const ctx = testCtx({ [GEMINI]: answer({ hebrew: HEBREW, categories: ["oil"], impact: "low" }, "STOP", "thinking…") });
+    const ctx = testCtx({
+      [GEMINI]: answer({ hebrew: HEBREW, categories: ["oil"], impact: "low" }, "STOP", "thinking…"),
+    });
     expect((await analyzePost(ctx, ENGLISH)).hebrew).toBe(HEBREW);
   });
 
   it("uses keyword topics when Gemini's tags are invalid (tariffs → at least 🟠)", async () => {
     const ctx = testCtx({ [GEMINI]: answer({ hebrew: HEBREW, categories: ["weather"], impact: "high" }) });
-    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ categories: ["tariffs", "china"], impact: "medium" });
+    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({
+      categories: ["tariffs", "china"],
+      impact: "medium",
+    });
   });
 
   it.each([
@@ -127,9 +156,13 @@ describe("analyzePost", () => {
     ["an English echo", answer({ hebrew: ENGLISH, categories: [], impact: "low" }), "untranslated text"],
     ["non-JSON text", answer("Sure! Here is the translation"), "answer is not JSON"],
     ["a blocked prompt", () => json({ promptFeedback: { blockReason: "SAFETY" } }), "blockReason=SAFETY"],
-    ["a timeout", () => {
-      throw new DOMException("The operation timed out.", "TimeoutError");
-    }, "timeout after 12s"],
+    [
+      "a timeout",
+      () => {
+        throw new DOMException("The operation timed out.", "TimeoutError");
+      },
+      "timeout after 12s",
+    ],
   ])("falls back to the second model after %s, and reports why", async (_name, primary, reason) => {
     const ctx = testCtx({ [GEMINI]: byModel(primary, good) });
     const result = await analyzePost(ctx, ENGLISH);
@@ -141,7 +174,13 @@ describe("analyzePost", () => {
   it("returns untranslated, with both models' reasons, when both fail and Workers AI is not configured", async () => {
     const ctx = testCtx({ [GEMINI]: fail503, [GTX]: () => json([[[HEBREW, ENGLISH]]]) });
     const result = await analyzePost(ctx, ENGLISH);
-    expect(result).toMatchObject({ hebrew: ENGLISH, translated: false, provider: "", categories: ["tariffs", "china"], impact: "medium" });
+    expect(result).toMatchObject({
+      hebrew: ENGLISH,
+      translated: false,
+      provider: "",
+      categories: ["tariffs", "china"],
+      impact: "medium",
+    });
     expect(result.geminiError).toMatch(new RegExp(`${PRIMARY}: HTTP 503.*\\| ${FALLBACK}: HTTP 503`));
     expect(result.deterministic).toBeUndefined();
     expect(ctx.hosts()).not.toContain(GTX);
@@ -151,7 +190,11 @@ describe("analyzePost", () => {
   it("does not call Workers AI when Gemini succeeds", async () => {
     const workers = fakeAi(() => aiReply(HEBREW));
     const ctx = testCtx({ [GEMINI]: good }, {}, { ai: workers.ai });
-    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ translated: true, provider: "gemini", model: PRIMARY });
+    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({
+      translated: true,
+      provider: "gemini",
+      model: PRIMARY,
+    });
     expect(workers.prompts).toEqual([]);
   });
 
@@ -160,7 +203,12 @@ describe("analyzePost", () => {
     const workers = fakeAi(() => aiReply(HEBREW));
     const ctx = testCtx({ [GEMINI]: byModel(echo, echo) }, {}, { ai: workers.ai });
     const result = await analyzePost(ctx, ENGLISH);
-    expect(result).toMatchObject({ translated: true, provider: "workers-ai", model: "@cf/zai-org/glm-4.7-flash", hebrew: HEBREW });
+    expect(result).toMatchObject({
+      translated: true,
+      provider: "workers-ai",
+      model: "@cf/zai-org/glm-4.7-flash",
+      hebrew: HEBREW,
+    });
     expect(result.geminiError).toContain("untranslated text");
     expect(workers.prompts).toHaveLength(1);
     expect(workers.prompts[0]?.chat_template_kwargs).toEqual({ enable_thinking: false });
@@ -240,18 +288,21 @@ describe("analyzePost", () => {
       {
         [GEMINI]: (call) =>
           JSON.parse(call.body).generationConfig.thinkingConfig
-            ? new Response('{"error":{"message":"thinking_level is not supported for this model"}}', { status: 400 })
+            ? new Response('{"error":{"message":"thinking_level is not supported for this model"}}', {
+                status: 400,
+              })
             : good(),
       },
-      { geminiThinkingLevel: "low", geminiModel: FALLBACK, geminiFallbackModel: "" },
+      { geminiThinkingLevel: "low", geminiModel: PRIMARY, geminiFallbackModel: "" },
     );
-    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ translated: true, model: FALLBACK });
-    expect(ctx.calls.map(modelOf)).toEqual([FALLBACK, FALLBACK]);
+    expect(await analyzePost(ctx, ENGLISH)).toMatchObject({ translated: true, model: PRIMARY });
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, PRIMARY]);
   });
 
   it("waits out a short 429 once", async () => {
     const ctx = testCtx({
-      [GEMINI]: (_c, n) => (n === 0 ? new Response('{"error":{"details":[{"retryDelay":"4s"}]}}', { status: 429 }) : good()),
+      [GEMINI]: (_c, n) =>
+        n === 0 ? new Response('{"error":{"details":[{"retryDelay":"4s"}]}}', { status: 429 }) : good(),
     });
     expect((await analyzePost(ctx, ENGLISH)).model).toBe(PRIMARY);
     expect(ctx.sleeps).toEqual([5000]);
@@ -259,7 +310,11 @@ describe("analyzePost", () => {
 
   it("caps each call at GEMINI_TIMEOUT_SECONDS and keeps time back for sending", async () => {
     let t = 0;
-    const ctx = testCtx({ [GEMINI]: good }, { geminiTimeoutMs: 12_000, runTimeBudgetMs: 90_000 }, { now: () => t });
+    const ctx = testCtx(
+      { [GEMINI]: good },
+      { geminiTimeoutMs: 12_000, runTimeBudgetMs: 90_000 },
+      { now: () => t },
+    );
     t = 75_000; // 15 s left: 15 - 8 s reserve = 7 s for this call
     const timeouts: number[] = [];
     const http = ctx.http.bind(ctx);
@@ -283,7 +338,10 @@ describe("analyzePost", () => {
     const ctx = testCtx({ [GEMINI]: good });
     expect(await analyzePost(ctx, "🇺🇸🇺🇸 100%")).toMatchObject({ translated: true, provider: "none" });
     const noKey = testCtx({ [GEMINI]: good }, { geminiApiKey: "" });
-    expect(await analyzePost(noKey, ENGLISH)).toMatchObject({ translated: false, geminiError: "GEMINI_API_KEY not set" });
+    expect(await analyzePost(noKey, ENGLISH)).toMatchObject({
+      translated: false,
+      geminiError: "GEMINI_API_KEY not set",
+    });
     expect([...ctx.calls, ...noKey.calls]).toEqual([]);
   });
 });
@@ -300,6 +358,112 @@ describe("translation checks", () => {
     expect(needsTranslation("https://x.com 🇺🇸")).toBe(false);
     expect(needsTranslation("RT @realDonaldTrump")).toBe(false);
   });
+
+  it("detects Arabic script in all four blocks and leaves Hebrew alone", () => {
+    expect(hasArabicScript("בשל אמוני")).toBe(false);
+    expect(hasArabicScript("ישני עונג להכריז ש")).toBe(false);
+    expect(hasArabicScript("טוהר הבחירות")).toBe(false);
+    expect(hasArabicScript(MIXED)).toBe(true);
+    expect(hasArabicScript("ש\u0750")).toBe(true); // Arabic Supplement
+    expect(hasArabicScript("\uFB50")).toBe(true); // Presentation Forms-A
+    expect(hasArabicScript("\uFE8D")).toBe(true); // Presentation Forms-B
+    expect(hasArabicScript("\uFEFF")).toBe(true);
+  });
+
+  it("repairs Arabic letters used as Hebrew, keeps numbers, and strips the rest", () => {
+    expect(repairArabicScript(MIXED)).toBe(REPAIRED);
+    expect(repairArabicScript("בשל אמוני")).toBe("בשל אמוני");
+    expect(repairArabicScript("Election Integrity 100%")).toBe("Election Integrity 100%");
+    expect(repairArabicScript("\u0661\u0662\u0663")).toBe("123");
+    expect(repairArabicScript("\u06F5")).toBe("5");
+    expect(repairArabicScript("\uFE8D\u0644")).toBe("אל");
+    expect(repairArabicScript("ש\u0750לום")).toBe("שלום");
+    expect(hasArabicScript(repairArabicScript(`${MIXED}\u0750\uFE70`))).toBe(false);
+  });
+});
+
+describe("Arabic script in a translation", () => {
+  const mixed = () => answer({ hebrew: MIXED, categories: ["other"], impact: "low" })();
+  const clean = () => answer({ hebrew: CLEAN_PARTY, categories: ["other"], impact: "low" })();
+
+  it("retries on the fallback model with stricter instructions", async () => {
+    const ctx = testCtx({ [GEMINI]: byModel(mixed, clean) });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result).toMatchObject({
+      translated: true,
+      provider: "gemini",
+      model: FALLBACK,
+      hebrew: CLEAN_PARTY,
+    });
+    expect(result.geminiError).toContain(`${PRIMARY}: arabic script in translation`);
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, FALLBACK]);
+    const retry = JSON.parse(ctx.calls[1]?.body ?? "{}");
+    expect(retry.systemInstruction.parts[0].text).toContain("previous translation was invalid");
+    expect(retry.systemInstruction.parts[0].text).toContain("Hebrew script only");
+    expect(retry.systemInstruction.parts[0].text).toContain("Do not transliterate");
+  });
+
+  it("repairs Arabic script when the strict retry still returns it", async () => {
+    const ctx = testCtx({ [GEMINI]: mixed });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result).toMatchObject({ translated: true, provider: "gemini", model: FALLBACK, hebrew: REPAIRED });
+    expect(hasArabicScript(result.hebrew)).toBe(false);
+    expect(result.geminiError).toContain(`${FALLBACK}: arabic script repaired`);
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, FALLBACK]);
+  });
+
+  it("asks the fallback again, strictly, when that model was the one that mixed scripts", async () => {
+    const daily = () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            details: [{ violations: [{ quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }] }],
+          },
+        }),
+        { status: 429 },
+      );
+    let lite = 0;
+    const ctx = testCtx({
+      [GEMINI]: (call) => {
+        if (modelOf(call) === PRIMARY) return daily();
+        lite += 1;
+        return lite === 1 ? mixed() : clean();
+      },
+    });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result).toMatchObject({ translated: true, model: FALLBACK, hebrew: CLEAN_PARTY });
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, FALLBACK, FALLBACK]);
+    expect(JSON.parse(ctx.calls[1]?.body ?? "{}").systemInstruction.parts[0].text).not.toContain(
+      "previous translation was invalid",
+    );
+    expect(JSON.parse(ctx.calls[2]?.body ?? "{}").systemInstruction.parts[0].text).toContain(
+      "previous translation was invalid",
+    );
+  });
+
+  it("retries the only configured model strictly, then repairs", async () => {
+    const ctx = testCtx({ [GEMINI]: mixed }, { geminiFallbackModel: "" });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result).toMatchObject({ translated: true, model: PRIMARY, hebrew: REPAIRED });
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, PRIMARY]);
+    expect(JSON.parse(ctx.calls[1]?.body ?? "{}").systemInstruction.parts[0].text).toContain(
+      "previous translation was invalid",
+    );
+  });
+
+  it("repairs Arabic script from Workers AI without publishing it", async () => {
+    const workers = fakeAi(() => aiReply(MIXED));
+    const ctx = testCtx({ [GEMINI]: fail503 }, {}, { ai: workers.ai });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result).toMatchObject({
+      translated: true,
+      provider: "workers-ai",
+      model: "@cf/zai-org/glm-4.7-flash",
+      hebrew: REPAIRED,
+    });
+    expect(hasArabicScript(result.hebrew)).toBe(false);
+    expect(result.geminiError).toContain("workers-ai: arabic script repaired");
+  });
 });
 
 describe("Workers AI answers", () => {
@@ -307,11 +471,25 @@ describe("Workers AI answers", () => {
     expect(extractWorkersAiText(aiReply(HEBREW)).text).toBe(HEBREW);
     expect(extractWorkersAiText({ response: `"${HEBREW}"` }).text).toBe(HEBREW);
     expect(extractWorkersAiText({ result: { response: `\`\`\`\n${HEBREW}\n\`\`\`` } }).text).toBe(HEBREW);
-    expect(extractWorkersAiText({ choices: [{ finish_reason: "stop", message: { content: `{"hebrew":"${HEBREW}"}` } }] }).text).toBe(HEBREW);
+    expect(
+      extractWorkersAiText({
+        choices: [{ finish_reason: "stop", message: { content: `{"hebrew":"${HEBREW}"}` } }],
+      }).text,
+    ).toBe(HEBREW);
     expect(extractWorkersAiText(aiReply(HEBREW, "length"))).toEqual({ text: HEBREW, truncated: true });
     expect(
       extractWorkersAiText({
-        choices: [{ finish_reason: "stop", message: { content: [{ type: "reasoning", text: ENGLISH }, { type: "text", text: HEBREW }] } }],
+        choices: [
+          {
+            finish_reason: "stop",
+            message: {
+              content: [
+                { type: "reasoning", text: ENGLISH },
+                { type: "text", text: HEBREW },
+              ],
+            },
+          },
+        ],
       }).text,
     ).toBe(HEBREW);
     expect(extractWorkersAiText(null)).toEqual({ text: "", truncated: false });

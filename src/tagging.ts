@@ -1,8 +1,17 @@
 /** Market-impact tagging, and the per-post analysis that combines it with translation. */
-import { CATEGORY_KEYS, GEMINI_MAX_CHARS, GeminiError, IMPACT_LEVELS, geminiJson, msUntilQuotaReset } from "./gemini";
+import {
+  CATEGORY_KEYS,
+  GEMINI_MAX_CHARS,
+  GEMINI_STRICT_SYSTEM_PROMPT,
+  GEMINI_SYSTEM_PROMPT,
+  GeminiError,
+  geminiJson,
+  IMPACT_LEVELS,
+  msUntilQuotaReset,
+} from "./gemini";
 import type { Ctx } from "./runtime";
 import { isMeaningfulText } from "./text";
-import { looksTranslated, needsTranslation } from "./translate";
+import { hasArabicScript, looksTranslated, needsTranslation, repairArabicScript } from "./translate";
 import { workersAiTranslate } from "./workers-ai";
 
 /** Machine keys → Hebrew hashtag labels, in display order. */
@@ -83,7 +92,10 @@ export function parseMarketTags(data: unknown): { categories: string[]; impact: 
   if (found.size > 1) found.delete("other");
   const categories = CATEGORY_KEYS.filter((c) => found.has(c));
   const impact = typeof obj.impact === "string" ? obj.impact.trim().toLowerCase() : "";
-  return { categories, impact: (IMPACT_LEVELS as readonly string[]).includes(impact) ? (impact as Impact) : null };
+  return {
+    categories,
+    impact: (IMPACT_LEVELS as readonly string[]).includes(impact) ? (impact as Impact) : null,
+  };
 }
 
 export function keywordCategories(text: string): string[] {
@@ -147,7 +159,9 @@ export function echoedProviders(error: string): Set<string> {
   const found = new Set<string>();
   if (!error) return found;
   for (const part of error.split(" | ")) {
-    const match = /^\s*(.+?):\s*(?:untranslated text|no answer|skipped — earlier untranslated text)\s*$/.exec(part);
+    const match = /^\s*(.+?):\s*(?:untranslated text|no answer|skipped — earlier untranslated text)\s*$/.exec(
+      part,
+    );
     if (match?.[1]) found.add(match[1]);
   }
   return found;
@@ -164,6 +178,10 @@ function deterministicFailure(errors: string[]): boolean {
  * with every reason, and the caller retries or sends the English original.
  * `priorError` is the last saved failure, so a model that already echoed this
  * post is not called again.
+ *
+ * Hebrew that contains Arabic script is not accepted. The next model is asked
+ * again with stricter instructions; if Arabic script remains, those characters
+ * are repaired or stripped and the Hebrew is kept.
  */
 export async function analyzePost(
   ctx: Ctx,
@@ -189,6 +207,62 @@ export async function analyzePost(
   const echoed = echoedProviders(priorError);
   const errors: string[] = [];
   let outOfQuota = 0;
+  let contaminated: { model: string; hebrew: string; data: Record<string, unknown> } | null = null;
+  let sentStrict = false;
+
+  const acceptGemini = (model: string, hebrew: string, data: Record<string, unknown>): PostAnalysis => {
+    const parsed = parseMarketTags(data);
+    // Invalid tags from Gemini: keep only what keywords can vouch for.
+    const { categories, impact } = finalTags(
+      parsed.categories,
+      parsed.categories.length ? parsed.impact : null,
+      text,
+    );
+    ctx.log.info(
+      `Translated and tagged post via gemini (${model}): ${categories.join(",")}, impact=${impact}`,
+    );
+    return {
+      hebrew,
+      translated: true,
+      categories,
+      impact,
+      provider: "gemini",
+      model,
+      ...(errors.length ? { geminiError: errors.join(" | ") } : {}),
+    };
+  };
+
+  const onGeminiError = async (
+    model: string,
+    err: unknown,
+  ): Promise<"out-of-time" | "break" | "continue"> => {
+    if (!(err instanceof GeminiError)) throw err;
+    if (err.message === "no time left in this run")
+      return errors.length || contaminated ? "break" : "out-of-time";
+    errors.push(`${model}: ${err.message}`.slice(0, 300));
+    if (err.dailyQuota) {
+      outOfQuota += 1;
+      // Don't spend calls (and run time) on it again until the reset.
+      await quota.markExhausted(model, err.message, msUntilQuotaReset(ctx.now()) / 1000);
+      ctx.log.warn(`Gemini ${model}: daily quota used up — skipping it until the reset (midnight Pacific)`);
+    }
+    return "continue";
+  };
+
+  const consider = (
+    model: string,
+    data: Record<string, unknown>,
+  ): PostAnalysis | { model: string; hebrew: string; data: Record<string, unknown> } | null => {
+    const hebrew = typeof data.hebrew === "string" ? data.hebrew.trim() : "";
+    if (!looksTranslated(text, hebrew)) {
+      errors.push(`${model}: ${hebrew ? "untranslated text" : "no answer"}`);
+      return null;
+    }
+    if (!hasArabicScript(hebrew)) return acceptGemini(model, hebrew, data);
+    errors.push(`${model}: arabic script in translation`);
+    return { model, hebrew, data };
+  };
+
   for (const model of models) {
     if (echoed.has(model)) {
       errors.push(`${model}: skipped — earlier untranslated text`);
@@ -200,40 +274,66 @@ export async function analyzePost(
       errors.push(`${model}: skipped — ${exhausted}`);
       continue;
     }
+    const strict = contaminated !== null;
+    if (strict) sentStrict = true;
     try {
-      const data = await geminiJson(ctx, text, model);
-      const hebrew = typeof data.hebrew === "string" ? data.hebrew.trim() : "";
-      if (looksTranslated(text, hebrew)) {
-        const parsed = parseMarketTags(data);
-        // Invalid tags from Gemini: keep only what keywords can vouch for.
-        const { categories, impact } = finalTags(parsed.categories, parsed.categories.length ? parsed.impact : null, text);
-        ctx.log.info(`Translated and tagged post via gemini (${model}): ${categories.join(",")}, impact=${impact}`);
-        return {
-          hebrew,
-          translated: true,
-          categories,
-          impact,
-          provider: "gemini",
-          model,
-          ...(errors.length ? { geminiError: errors.join(" | ") } : {}),
-        };
-      }
-      errors.push(`${model}: ${hebrew ? "untranslated text" : "no answer"}`);
+      const data = await geminiJson(
+        ctx,
+        text,
+        model,
+        strict ? GEMINI_STRICT_SYSTEM_PROMPT : GEMINI_SYSTEM_PROMPT,
+      );
+      const outcome = consider(model, data);
+      if (outcome && "translated" in outcome) return outcome;
+      if (outcome) contaminated = outcome;
     } catch (err) {
-      if (!(err instanceof GeminiError)) throw err;
-      if (err.message === "no time left in this run") {
-        if (!errors.length) return untranslated(err.message, { outOfTime: true });
-        break;
+      const action = await onGeminiError(model, err);
+      if (action === "out-of-time") {
+        return untranslated(err instanceof Error ? err.message : "no time left in this run", {
+          outOfTime: true,
+        });
       }
-      errors.push(`${model}: ${err.message}`.slice(0, 300));
-      if (err.dailyQuota) {
-        outOfQuota += 1;
-        // Don't spend calls (and run time) on it again until the reset.
-        await quota.markExhausted(model, err.message, msUntilQuotaReset(ctx.now()) / 1000);
-        ctx.log.warn(`Gemini ${model}: daily quota used up — skipping it until the reset (midnight Pacific)`);
-      }
+      if (action === "break") break;
     }
     ctx.log.warn(`Gemini failed — ${errors.at(-1)}`);
+  }
+
+  // The in-loop pass already retries the next model with the strict prompt.
+  // This call is the one strict retry when the Arabic answer came from the
+  // last model (the fallback, or the only model) on the ordinary prompt.
+  if (contaminated && !sentStrict) {
+    const retryModel = ctx.cfg.geminiFallbackModel || contaminated.model;
+    const alreadySkipped = errors.some((part) => part.startsWith(`${retryModel}: skipped —`));
+    if (!alreadySkipped) {
+      if (echoed.has(retryModel)) {
+        errors.push(`${retryModel}: skipped — earlier untranslated text`);
+      } else {
+        const retryExhausted = await quota.exhausted(retryModel);
+        if (retryExhausted) {
+          errors.push(`${retryModel}: skipped — ${retryExhausted}`);
+        } else {
+          sentStrict = true;
+          try {
+            const data = await geminiJson(ctx, text, retryModel, GEMINI_STRICT_SYSTEM_PROMPT);
+            const outcome = consider(retryModel, data);
+            if (outcome && "translated" in outcome) return outcome;
+            if (outcome) contaminated = outcome;
+          } catch (err) {
+            await onGeminiError(retryModel, err);
+          }
+          ctx.log.warn(`Gemini failed — ${errors.at(-1)}`);
+        }
+      }
+    }
+  }
+
+  if (contaminated) {
+    const repaired = repairArabicScript(contaminated.hebrew).trim();
+    if (looksTranslated(text, repaired) && !hasArabicScript(repaired)) {
+      errors.push(`${contaminated.model}: arabic script repaired`);
+      ctx.log.warn(`Gemini ${contaminated.model}: repaired Arabic script in the translation`);
+      return acceptGemini(contaminated.model, repaired, contaminated.data);
+    }
   }
 
   const aiModel = ctx.cfg.workersAiModel;
@@ -245,10 +345,23 @@ export async function analyzePost(
       errors.push("workers-ai: no time left in this run");
     } else {
       try {
-        const hebrew = await workersAiTranslate(ctx, text);
-        if (looksTranslated(text, hebrew)) {
+        let hebrew = await workersAiTranslate(ctx, text);
+        if (hasArabicScript(hebrew)) {
+          const repaired = repairArabicScript(hebrew).trim();
+          if (looksTranslated(text, repaired) && !hasArabicScript(repaired)) {
+            errors.push("workers-ai: arabic script repaired");
+            hebrew = repaired;
+          } else {
+            errors.push("workers-ai: arabic script in translation");
+            ctx.log.warn(`Workers AI failed — ${errors.at(-1)}`);
+            hebrew = "";
+          }
+        }
+        if (looksTranslated(text, hebrew) && !hasArabicScript(hebrew)) {
           const { categories, impact } = finalTags([], null, text);
-          ctx.log.info(`Translated post via workers-ai (${aiModel}): ${categories.join(",")}, impact=${impact}`);
+          ctx.log.info(
+            `Translated post via workers-ai (${aiModel}): ${categories.join(",")}, impact=${impact}`,
+          );
           return {
             hebrew,
             translated: true,
@@ -259,8 +372,10 @@ export async function analyzePost(
             ...(errors.length ? { geminiError: errors.join(" | ") } : {}),
           };
         }
-        errors.push(`workers-ai: ${hebrew ? "untranslated text" : "no answer"}`);
-        ctx.log.warn(`Workers AI failed — ${errors.at(-1)}`);
+        if (hebrew || !errors.at(-1)?.endsWith("arabic script in translation")) {
+          errors.push(`workers-ai: ${hebrew ? "untranslated text" : "no answer"}`);
+          ctx.log.warn(`Workers AI failed — ${errors.at(-1)}`);
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         errors.push(`workers-ai: ${message}`.slice(0, 300));

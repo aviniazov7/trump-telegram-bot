@@ -1,7 +1,9 @@
 /**
  * Daily free-tier quota (Oct 12): gemini-3.8-flash answered 429 "per day"
- * while flash-lite still worked. Models out of daily quota are skipped until
- * the reset, and when all are out, posts go out without a pointless wait.
+ * while flash-lite still worked. Flash is the primary translator. A model
+ * out of daily quota is skipped until the reset and flash-lite takes over,
+ * so the bot stays inside the free tier. When all are out, posts go out
+ * without a pointless wait.
  */
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -87,21 +89,25 @@ describe("msUntilQuotaReset", () => {
 });
 
 describe("daily quota tracking", () => {
-  it("uses flash-lite as the primary model and full flash as the fallback", async () => {
+  it("uses full flash as the primary model and flash-lite only as the fallback", async () => {
     const ctx = testCtx({ [GEMINI]: ok });
-    expect(await analyzePost(ctx, ENGLISH, tracker)).toMatchObject({ translated: true, model: LITE });
-    expect(ctx.calls.map(modelOf)).toEqual([LITE]);
+    expect(await analyzePost(ctx, ENGLISH, tracker)).toMatchObject({ translated: true, model: FLASH });
+    expect(ctx.calls.map(modelOf)).toEqual([FLASH]);
   });
 
   it("marks a model out of daily quota until the reset and stops calling it", async () => {
     const at = Date.UTC(2026, 9, 12, 19, 5);
-    const first = testCtx({ [GEMINI]: (c) => (modelOf(c) === LITE ? daily() : ok()) }, {}, { now: () => at });
+    const first = testCtx(
+      { [GEMINI]: (c) => (modelOf(c) === FLASH ? daily() : ok()) },
+      {},
+      { now: () => at },
+    );
     const a = await analyzePost(first, ENGLISH, tracker);
-    expect(a).toMatchObject({ translated: true, model: FLASH });
+    expect(a).toMatchObject({ translated: true, model: LITE });
     expect(a.geminiError).toContain(
       "daily quota exhausted (GenerateRequestsPerDayPerProjectPerModel-FreeTier)",
     );
-    expect(await store.geminiQuotaExhausted(LITE)).toContain("daily quota");
+    expect(await store.geminiQuotaExhausted(FLASH)).toContain("daily quota");
     // KV sets the expiry from the real clock: the TTL must be the time to the reset.
     const key = (await env.STATE.list({ prefix: "gemini-quota:" })).keys[0];
     const ttl = (key?.expiration ?? 0) - Date.now() / 1000;
@@ -109,13 +115,14 @@ describe("daily quota tracking", () => {
 
     const second = testCtx({ [GEMINI]: ok }, {}, { now: () => at + 60_000 });
     await analyzePost(second, ENGLISH, tracker);
-    expect(second.calls.map(modelOf)).toEqual([FLASH]); // lite skipped, no wasted call
+    expect(second.calls.map(modelOf)).toEqual([LITE]); // flash skipped, no wasted call
   });
 
   it("does not mark a per-minute 429 as daily", async () => {
     const ctx = testCtx({ [GEMINI]: () => new Response(MINUTE_429, { status: 429 }) });
     const a = await analyzePost(ctx, ENGLISH, tracker);
     expect(a.quotaExhausted).toBeUndefined();
+    expect(await store.geminiQuotaExhausted(FLASH)).toBeNull();
     expect(await store.geminiQuotaExhausted(LITE)).toBeNull();
     expect(a.geminiError).toContain("minute quota GenerateRequestsPerMinutePerProjectPerModel-FreeTier");
   });
@@ -145,6 +152,6 @@ describe("daily quota tracking", () => {
     expect(toA[0]?.text.split("\n")[0]).toContain("🟠"); // tariffs → impact floor
     const alerts = sent.filter((s) => s.chat === "999" && s.text.includes("המכסה היומית"));
     expect(alerts).toHaveLength(1);
-    expect(ctx.calls.filter((c) => c.host === GEMINI).map(modelOf)).toEqual([LITE, FLASH]);
+    expect(ctx.calls.filter((c) => c.host === GEMINI).map(modelOf)).toEqual([FLASH, LITE]);
   });
 });

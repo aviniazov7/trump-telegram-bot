@@ -141,13 +141,14 @@ broadcast-only and shows no command menu.
 
 ## Translation and market tags
 
-One Gemini call per post (`GEMINI_API_KEY`, model `gemini-3.5-flash-lite`)
+One Gemini call per post (`GEMINI_API_KEY`, model `gemini-3.8-flash`)
 returns the Hebrew translation, the **topics** (`tariffs`, `fed_rates`,
 `oil` (incl. energy), `geopolitics` (war, ceasefire, sanctions), `crypto`,
 `china`, `stocks`, `other`) and the **impact** (`high`/`medium`/`low`) as
-schema-checked JSON. The prompt asks for an
-accurate, complete and neutral translation. It keeps names in
-Israeli-media spelling, and numbers, tickers and URLs as written.
+schema-checked JSON. The prompt asks for natural, fluent Israeli Hebrew:
+no word-for-word calques, no transliteration, Hebrew script only, and Latin
+script for proper nouns that have no established Hebrew spelling. Names and
+numbers stay accurate.
 
 ```
 🔴 השפעה גבוהה על השווקים · #מכסים #סין      ← high
@@ -181,21 +182,30 @@ runs. So:
    `GEMINI_TIMEOUT_SECONDS` (12), keeping 8 s of the run for sending. If a
    model rejects the thinking setting, the call is retried once without it.
    A 5xx is retried once.
-2. **Fallback model.** If the primary model (`gemini-3.5-flash-lite`) fails,
-   the same run asks `GEMINI_FALLBACK_MODEL` (`gemini-3.8-flash`). The thinking
-   level applies only to full (non-lite) models.
+2. **Fallback model.** The primary is `gemini-3.8-flash`. If it fails, the
+   same run asks `GEMINI_FALLBACK_MODEL` (`gemini-3.5-flash-lite`). The thinking
+   level applies only to full (non-lite) models. Flash-lite is not the primary
+   translator: it was mixing Arabic letters into Hebrew and translating too
+   literally.
 3. **Daily free quota.** Each model has its own free daily quota, which
    resets at midnight Pacific time (10:00 in Israel in summer time, 09:00 in
-   winter). On Oct 12, `gemini-3.8-flash` ran out (429, per-day) while
-   flash-lite was untouched, which is why flash-lite is now the primary. When
-   a 429 names a **per-day** quota, that model is marked in KV
-   (`gemini-quota:<model>`) until the reset and isn't called again, so no
-   calls or run time are wasted. If **every** Gemini model is out of quota
-   and Workers AI is not configured, a post goes out in English at once,
-   because waiting can't help, and you get one ⛽ alert. With Workers AI
-   configured, the same run tries that instead. Per-minute 429s are only
-   waited out (`retryDelay`), never marked.
-4. **Workers AI, once.** If both Gemini models fail (daily 429, any other
+   winter). On Oct 12, `gemini-3.8-flash` ran out (429, per-day, limit 20)
+   while flash-lite's separate quota was untouched. Flash stays the primary
+   for translation quality. When a 429 names a **per-day** quota, that model
+   is marked in KV (`gemini-quota:<model>`) until the reset and isn't called
+   again, so no calls or run time are wasted, and the post continues on
+   flash-lite. That keeps the bot inside the free tier. If **every** Gemini
+   model is out of quota and Workers AI is not configured, a post goes out in
+   English at once, because waiting can't help, and you get one ⛽ alert.
+   With Workers AI configured, the same run tries that instead. Per-minute
+   429s are only waited out (`retryDelay`), never marked.
+4. **Arabic script.** If a translation contains Arabic-script characters
+   (U+0600–U+06FF, U+0750–U+077F, U+FB50–U+FDFF, U+FE70–U+FEFF), it is
+   rejected. The fallback model is asked again with stricter instructions.
+   If Arabic script is still there, those characters are repaired to the
+   Hebrew letter they stand in for, or stripped, and that Hebrew is what
+   gets sent.
+5. **Workers AI, once.** If both Gemini models fail (daily 429, any other
    error, or an answer that is still English), the same run asks Workers AI
    through the `AI` binding. The model is `@cf/zai-org/glm-4.7-flash`
    (`WORKERS_AI_MODEL`), a multilingual instruct model that is still on the
@@ -203,13 +213,13 @@ runs. So:
    so a fallback stays inside the 10,000 neurons/day included on that plan.
    Paid-only models are not used. Tags then come from keywords. The log line
    says `workers-ai` or `gemini` and the model id. `""` disables this step.
-5. **Retry, then English.** A 429 or a 5xx is retried every run for
+6. **Retry, then English.** A 429 or a 5xx is retried every run for
    `GEMINI_RETRY_MINUTES` (15). A model that already returned an English echo
    for that post is not called again. If Workers AI also echoes, the post is
    sent in English on that run — waiting cannot help. Newer posts don't wait.
    The English message carries a notice, and the keyword tags (🟠 floor
    included). You get a ⚠️ alert only when Gemini and Workers AI both failed.
-6. **Every reason is kept.** Each failed attempt (time + reason per model) is
+7. **Every reason is kept.** Each failed attempt (time + reason per model) is
    saved in KV under `gemini-error:<post>` for 7 days. That includes the cases
    where the fallback model then succeeded and where the post went out in
    English. To read them:
@@ -469,7 +479,7 @@ injected `fetch`.
 | `broadcast.test.ts` | Idempotent and resumable sending, Telegram error handling, high impact first, dry run, monitoring, menu |
 | `telegram.test.ts` | Retry rules, 429, uncertain sends, gone chats, migration, no secrets in logs |
 | `webhook.test.ts` | Webhook auth (path, header, method, fail-closed), commands, membership updates |
-| `tagging-translate.test.ts` | Tag parser, keyword fallback, Gemini request/response handling, Workers AI fallback |
+| `tagging-translate.test.ts` | Tag parser, keyword fallback, Gemini request/response handling, Arabic-script repair, Workers AI fallback |
 | `text-message.test.ts` | Message building, tag line, timestamps, tag-safe splitting |
 | `gemini-quota.test.ts` | Per-day versus per-minute 429s, skipping a model until midnight Pacific |
 | `trial-tagging.test.ts` | Impact floor, including the energy-ceasefire post |
