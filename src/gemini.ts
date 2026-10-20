@@ -8,14 +8,24 @@ for an Israeli audience that follows the news and the markets.
 Translation rules:
 - Translate the whole post accurately and completely. Do not summarize, omit,
   add, explain, or soften anything, and do not intensify it either.
-- Write natural, fluent modern Hebrew, the way Israeli news outlets quote him.
-  Keep his register: short punchy sentences stay short, exclamation marks stay,
-  and words he writes in ALL CAPS for emphasis keep that emphasis.
-- Names of people, places, organizations, and media outlets: use the spelling
-  Israeli media use (Donald Trump = דונלד טראמפ, Joe Biden = ג'ו ביידן,
-  Federal Reserve = הפדרל ריזרב). Without an established Hebrew form,
-  transliterate the name and add the English in parentheses once.
-- Keep numbers, percentages, dollar amounts, dates, stock tickers, hashtags,
+- Write natural, fluent Israeli Hebrew, the way an Israeli news editor would
+  phrase the sentence. Do not translate word for word. Short punchy sentences
+  stay short, exclamation marks stay, and words he writes in ALL CAPS for
+  emphasis keep that emphasis.
+- "I am pleased to announce" is "אני שמח להודיע". Do not produce a broken
+  literal such as "ישני עונג להכריז". Prefer the political and economic term
+  Israeli media use. "Election Integrity" is not the calque "טוהר הבחירות":
+  use the wording Israeli news uses, or keep the English name in Latin if no
+  settled Hebrew term exists.
+- Hebrew script only. Never use Arabic letters or any other Arabic-script
+  character. Do not transliterate English into Hebrew letters.
+- Names of people, places, organizations, and media outlets: if Israeli media
+  have a spelling, use it (Donald Trump = דונלד טראמפ, Joe Biden = ג'ו ביידן,
+  Federal Reserve = הפדרל ריזרב). If there is no established Hebrew spelling,
+  keep the name in Latin script. Do not transliterate it. Keep every name
+  accurate.
+- Keep every number, percentage, dollar amount, and date accurate. Do not
+  change, round, translate, or drop them. Keep stock tickers, hashtags,
   @handles, and URLs exactly as written.
 - Use precise economic and political terms: tariffs = מכסים,
   interest rates = ריבית, trade deal = הסכם סחר.
@@ -51,7 +61,32 @@ Market classification (judge the English original):
 Return JSON only, matching the response schema.
 `;
 
-export const CATEGORY_KEYS = ["tariffs", "fed_rates", "oil", "geopolitics", "crypto", "china", "stocks", "other"] as const;
+/**
+ * Appended when a translation mixed Arabic script into Hebrew. The market
+ * rules stay; this retry only tightens the script and phrasing constraints.
+ */
+export const GEMINI_ARABIC_RETRY_NOTE = `\
+The previous translation was invalid because it mixed Arabic-script characters
+into Hebrew words. Translate the post again, and follow these rules strictly:
+- Hebrew script only. Arabic letters and Arabic presentation forms are
+  forbidden. Do not transliterate English into Hebrew letters.
+- Proper nouns without an established Hebrew spelling stay in Latin script.
+- Keep every name and every number exactly as written.
+- The Hebrew must be grammatical and fluent. Do not repeat a broken literal.
+`;
+
+export const GEMINI_STRICT_SYSTEM_PROMPT = `${GEMINI_SYSTEM_PROMPT}\n${GEMINI_ARABIC_RETRY_NOTE}`;
+
+export const CATEGORY_KEYS = [
+  "tariffs",
+  "fed_rates",
+  "oil",
+  "geopolitics",
+  "crypto",
+  "china",
+  "stocks",
+  "other",
+] as const;
 export const IMPACT_LEVELS = ["high", "medium", "low"] as const;
 
 export const GEMINI_RESPONSE_SCHEMA = {
@@ -93,7 +128,10 @@ export interface QuotaInfo {
  * limit: …"); the scope is read from either.
  */
 export function parseQuotaInfo(body: string): QuotaInfo {
-  const quotaId = /"quotaId"\s*:\s*"([^"]+)"/.exec(body)?.[1] ?? /Quota exceeded for metric:\s*([^,\\"]+)/.exec(body)?.[1]?.trim() ?? "";
+  const quotaId =
+    /"quotaId"\s*:\s*"([^"]+)"/.exec(body)?.[1] ??
+    /Quota exceeded for metric:\s*([^,\\"]+)/.exec(body)?.[1]?.trim() ??
+    "";
   const hay = `${quotaId} ${body}`;
   const scope = /per_?day|PerDay|requests per day|RPD/i.test(hay)
     ? "day"
@@ -113,7 +151,9 @@ const PACIFIC_CLOCK = new Intl.DateTimeFormat("en-US", {
 
 /** Milliseconds until the Gemini API's daily quotas reset: midnight Pacific time. */
 export function msUntilQuotaReset(now: number): number {
-  const parts = Object.fromEntries(PACIFIC_CLOCK.formatToParts(new Date(now)).map((p) => [p.type, Number(p.value)]));
+  const parts = Object.fromEntries(
+    PACIFIC_CLOCK.formatToParts(new Date(now)).map((p) => [p.type, Number(p.value)]),
+  );
   const elapsed = ((parts.hour ?? 0) * 3600 + (parts.minute ?? 0) * 60 + (parts.second ?? 0)) * 1000;
   return 24 * 3600 * 1000 - elapsed;
 }
@@ -149,7 +189,9 @@ async function request(ctx: Ctx, model: string, payload: Record<string, unknown>
       });
     } catch (err) {
       const what = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-      throw new GeminiError(err instanceof Error && err.name === "TimeoutError" ? `timeout after ${timeoutMs / 1000}s` : what);
+      throw new GeminiError(
+        err instanceof Error && err.name === "TimeoutError" ? `timeout after ${timeoutMs / 1000}s` : what,
+      );
     }
     if (res.ok) {
       try {
@@ -169,20 +211,35 @@ async function request(ctx: Ctx, model: string, payload: Record<string, unknown>
       }
     }
     const generationConfig = body.generationConfig as Record<string, unknown> | undefined;
-    if (res.status === 400 && attempt === 1 && generationConfig?.thinkingConfig && THINKING_REJECTED_RE.test(detail)) {
+    if (
+      res.status === 400 &&
+      attempt === 1 &&
+      generationConfig?.thinkingConfig &&
+      THINKING_REJECTED_RE.test(detail)
+    ) {
       ctx.log.warn(`Gemini ${model} rejected the thinking setting — retrying without it`);
       const { thinkingConfig: _dropped, ...rest } = generationConfig;
       body = { ...body, generationConfig: rest };
       continue;
     }
     const delay = geminiRetryDelayMs(detail);
-    if (res.status === 429 && attempt === 1 && delay !== null && delay <= GEMINI_MAX_RETRY_DELAY_MS && delay + 2_000 < ctx.budget.msLeft() - GEMINI_TIME_RESERVE_MS) {
+    if (
+      res.status === 429 &&
+      attempt === 1 &&
+      delay !== null &&
+      delay <= GEMINI_MAX_RETRY_DELAY_MS &&
+      delay + 2_000 < ctx.budget.msLeft() - GEMINI_TIME_RESERVE_MS
+    ) {
       ctx.log.warn(`Gemini rate-limited — waiting ${delay / 1000}s as asked`);
       await ctx.sleep(delay);
       continue;
     }
     // 500/503 ("overloaded") are usually momentary: one retry is cheap.
-    if (res.status >= 500 && attempt === 1 && GEMINI_5XX_RETRY_MS + 2_000 < ctx.budget.msLeft() - GEMINI_TIME_RESERVE_MS) {
+    if (
+      res.status >= 500 &&
+      attempt === 1 &&
+      GEMINI_5XX_RETRY_MS + 2_000 < ctx.budget.msLeft() - GEMINI_TIME_RESERVE_MS
+    ) {
       ctx.log.warn(`Gemini HTTP ${res.status} — retrying once`);
       await ctx.sleep(GEMINI_5XX_RETRY_MS);
       continue;
@@ -204,6 +261,7 @@ export async function geminiJson(
   ctx: Ctx,
   text: string,
   model = ctx.cfg.geminiModel,
+  systemPrompt = GEMINI_SYSTEM_PROMPT,
 ): Promise<Record<string, unknown>> {
   if (!ctx.cfg.geminiApiKey) throw new GeminiError("GEMINI_API_KEY not set");
   const generationConfig: Record<string, unknown> = {
@@ -216,7 +274,7 @@ export async function geminiJson(
     generationConfig.thinkingConfig = { thinkingLevel: ctx.cfg.geminiThinkingLevel };
   }
   const result = (await request(ctx, model, {
-    systemInstruction: { parts: [{ text: GEMINI_SYSTEM_PROMPT }] },
+    systemInstruction: { parts: [{ text: systemPrompt }] },
     contents: [{ role: "user", parts: [{ text }] }],
     generationConfig,
   })) as {
@@ -240,6 +298,7 @@ export async function geminiJson(
   } catch {
     throw new GeminiError(`answer is not JSON: ${JSON.stringify(raw.slice(0, 120))}`);
   }
-  if (!data || typeof data !== "object" || Array.isArray(data)) throw new GeminiError("answer is not a JSON object");
+  if (!data || typeof data !== "object" || Array.isArray(data))
+    throw new GeminiError("answer is not a JSON object");
   return data as Record<string, unknown>;
 }

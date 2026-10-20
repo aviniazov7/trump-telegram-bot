@@ -39,9 +39,9 @@ nothing until the dry run looks right. See [Setup](operations.md#setup) and
 | Var | Default | Meaning |
 |---|---|---|
 | `DRY_RUN` | `"true"` | Previews to the admin only. Anything except `"false"` keeps it on |
-| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Primary. Check *AI Studio → Rate limits* for your free tier |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Primary translator. Check *AI Studio → Rate limits* for your free tier |
 | `GEMINI_THINKING_LEVEL` | `low` | `minimal`/`low`/`medium`/`high`. Full (non-lite) models only |
-| `GEMINI_FALLBACK_MODEL` | `gemini-3.8-flash` | Asked in the same run when the primary fails. `""` disables it |
+| `GEMINI_FALLBACK_MODEL` | `gemini-3.5-flash-lite` | Asked in the same run when the primary fails or its free daily quota is used up. Also the strict retry when a translation contains Arabic script. `""` disables it |
 | `WORKERS_AI_MODEL` | `@cf/zai-org/glm-4.7-flash` | Workers AI fallback after Gemini fails. Free-plan multilingual model. `""` disables it |
 | `GEMINI_TIMEOUT_SECONDS` | `12` | Per call |
 | `GEMINI_RETRY_MINUTES` | `15` | How long a 429 or a 5xx is retried before the post goes out in English. An English echo does not wait this out: Gemini is not asked again, and Workers AI is tried once |

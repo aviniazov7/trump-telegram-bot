@@ -13,10 +13,13 @@ export const WORKERS_AI_MAX_TOKENS = 2048;
 const TIME_RESERVE_MS = 8_000;
 
 const SYSTEM_PROMPT = `\
-You translate Donald Trump's Truth Social posts into Hebrew for Israeli readers.
+You translate Donald Trump's Truth Social posts into natural, fluent Israeli Hebrew.
 Translate the whole post completely. Do not summarize, omit, add, or comment.
-Write natural modern Hebrew. Keep line breaks, @handles, URLs, numbers, and hashtags unchanged.
-Transliterate names the way Israeli media do (Donald Trump = דונלד טראמפ).
+Do not translate word for word. "I am pleased to announce" is "אני שמח להודיע".
+Hebrew script only. Do not use Arabic script. Do not transliterate English into Hebrew letters.
+Proper nouns with an established Israeli spelling use it (Donald Trump = דונלד טראמפ).
+Otherwise keep the name in Latin script.
+Keep line breaks, @handles, URLs, numbers, dates, and hashtags unchanged, and keep every name and number accurate.
 Return only the Hebrew translation. No JSON, no quotes, no preamble.
 `;
 
@@ -73,7 +76,8 @@ function cleanTranslation(raw: string): string {
 export function extractWorkersAiText(result: unknown): { text: string; truncated: boolean } {
   if (!result || typeof result !== "object") return { text: "", truncated: false };
   const root = result as Record<string, unknown>;
-  const nested = root.result && typeof root.result === "object" ? (root.result as Record<string, unknown>) : undefined;
+  const nested =
+    root.result && typeof root.result === "object" ? (root.result as Record<string, unknown>) : undefined;
   const payload = Array.isArray(root.choices) ? root : nested;
   const choices = payload && Array.isArray(payload.choices) ? payload.choices : undefined;
   const choice = choices?.[0];
@@ -85,7 +89,8 @@ export function extractWorkersAiText(result: unknown): { text: string; truncated
     };
   }
   if (typeof root.response === "string") return { text: cleanTranslation(root.response), truncated: false };
-  if (nested && typeof nested.response === "string") return { text: cleanTranslation(nested.response), truncated: false };
+  if (nested && typeof nested.response === "string")
+    return { text: cleanTranslation(nested.response), truncated: false };
   return { text: "", truncated: false };
 }
 

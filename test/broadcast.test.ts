@@ -206,7 +206,7 @@ describe("Gemini failures", () => {
     expect(record?.gaveUpAt).toBe(NOW + 15 * MIN);
     expect(record?.attempts).toHaveLength(4);
     expect(record?.attempts[0]?.error).toMatch(
-      /gemini-3\.5-flash-lite: HTTP 503.*\| gemini-3\.8-flash: HTTP 503/,
+      /gemini-3\.8-flash: HTTP 503.*\| gemini-3\.5-flash-lite: HTTP 503/,
     );
     expect((await store.getMeta()).lastSeen).toBe("2");
   });
@@ -236,14 +236,12 @@ describe("Gemini failures", () => {
     await seed("1", ["a"]);
     const s = setup({
       feed: ["2", "1"],
-      gemini: (call) => (call.url.includes("gemini-3.5-flash-lite") ? fail() : translate(call)),
+      gemini: (call) => (call.url.includes("gemini-3.8-flash") ? fail() : translate(call)),
     });
     await s.run();
     expect(s.tg.postsTo("a")).toEqual(["2"]);
-    expect((await store.getAnalysis("2"))?.model).toBe("gemini-3.8-flash");
-    expect((await store.getGeminiFailures("2"))?.attempts[0]?.error).toContain(
-      "gemini-3.5-flash-lite: HTTP 503",
-    );
+    expect((await store.getAnalysis("2"))?.model).toBe("gemini-3.5-flash-lite");
+    expect((await store.getGeminiFailures("2"))?.attempts[0]?.error).toContain("gemini-3.8-flash: HTTP 503");
   });
 
   it("still sends the alert when Gemini used up the run's time (the Oct 12 bug)", async () => {
