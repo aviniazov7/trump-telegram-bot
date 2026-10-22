@@ -15,15 +15,21 @@ Translation rules:
 - "I am pleased to announce" is "אני שמח להודיע". Do not produce a broken
   literal such as "ישני עונג להכריז". Prefer the political and economic term
   Israeli media use. "Election Integrity" is not the calque "טוהר הבחירות":
-  use the wording Israeli news uses, or keep the English name in Latin if no
-  settled Hebrew term exists.
-- Hebrew script only. Never use Arabic letters or any other Arabic-script
-  character. Do not transliterate English into Hebrew letters.
+  use the wording Israeli news uses. If no settled Hebrew term exists,
+  transliterate it into Hebrew and you may add the English in parentheses.
+  Do not leave the English phrase in place of the Hebrew.
+- The translation is Hebrew only. Never use Arabic letters or any other
+  non-Hebrew script: no Arabic, no Arabic presentation forms, no Cyrillic,
+  and no other alphabet mixed into a Hebrew word.
+- Do not mix English words into the Hebrew sentence. Latin script is allowed
+  only for stock tickers, hashtags, @handles, URLs, and the optional English
+  spelling of a proper name in parentheses.
 - Names of people, places, organizations, and media outlets: if Israeli media
   have a spelling, use it (Donald Trump = דונלד טראמפ, Joe Biden = ג'ו ביידן,
-  Federal Reserve = הפדרל ריזרב). If there is no established Hebrew spelling,
-  keep the name in Latin script. Do not transliterate it. Keep every name
-  accurate.
+  Federal Reserve = הפדרל ריזרב). Otherwise transliterate the name into
+  Hebrew letters. You may add the original English spelling in parentheses,
+  for example ויווק רמאסוואמי (Vivek Ramaswamy). Never spell a name with
+  Arabic letters. Keep every name accurate.
 - Keep every number, percentage, dollar amount, and date accurate. Do not
   change, round, translate, or drop them. Keep stock tickers, hashtags,
   @handles, and URLs exactly as written.
@@ -66,12 +72,18 @@ Return JSON only, matching the response schema.
  * rules stay; this retry only tightens the script and phrasing constraints.
  */
 export const GEMINI_ARABIC_RETRY_NOTE = `\
-The previous translation was invalid because it mixed Arabic-script characters
-into Hebrew words. Translate the post again, and follow these rules strictly:
-- Hebrew script only. Arabic letters and Arabic presentation forms are
-  forbidden. Do not transliterate English into Hebrew letters.
-- Proper nouns without an established Hebrew spelling stay in Latin script.
-- Keep every name and every number exactly as written.
+The previous translation was invalid because it mixed Arabic or other
+non-Hebrew scripts into the Hebrew. Translate the post again, and follow
+these rules strictly:
+- Hebrew only. Arabic letters, extended Arabic, and Arabic presentation
+  forms are forbidden. No other non-Hebrew script, and no English words
+  mixed into the Hebrew sentence.
+- Transliterate every proper name into Hebrew letters. You may put the
+  English original in parentheses after the Hebrew name, for example
+  ויווק רמאסוואמי (Vivek Ramaswamy). Never spell a name with Arabic letters.
+- Latin script is allowed only inside those parentheses, and for a ticker,
+  hashtag, @handle, or URL.
+- Keep every number exactly as written.
 - The Hebrew must be grammatical and fluent. Do not repeat a broken literal.
 `;
 

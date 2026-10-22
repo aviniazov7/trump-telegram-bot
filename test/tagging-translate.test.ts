@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { WorkersAiChatInput } from "../src/runtime";
 import { analyzePost, keywordCategories, parseMarketTags } from "../src/tagging";
-import { hasArabicScript, looksTranslated, needsTranslation, repairArabicScript } from "../src/translate";
+import {
+  hasArabicScript,
+  isArabicCodePoint,
+  looksTranslated,
+  needsTranslation,
+  repairArabicScript,
+  sanitizeArabicWords,
+} from "../src/translate";
 import { bindWorkersAi, extractWorkersAiText } from "../src/workers-ai";
 import { type Call, GEMINI, GTX, geminiAnswer, json, testCtx } from "./helpers";
 
@@ -118,8 +125,11 @@ describe("analyzePost", () => {
     expect(primary?.url).not.toContain("test-gemini-key");
     expect(primary?.headers.get("x-goog-api-key")).toBe("test-gemini-key");
     const body = JSON.parse(primary?.body ?? "{}");
-    expect(body.systemInstruction.parts[0].text).toContain("Hebrew script only");
-    expect(body.systemInstruction.parts[0].text).toContain("Do not transliterate");
+    expect(body.systemInstruction.parts[0].text).toContain("Hebrew only");
+    expect(body.systemInstruction.parts[0].text).toContain("Never use Arabic");
+    expect(body.systemInstruction.parts[0].text).toContain("transliterate");
+    expect(body.systemInstruction.parts[0].text).toContain("parentheses");
+    expect(body.systemInstruction.parts[0].text).not.toContain("Do not transliterate");
     expect(body.systemInstruction.parts[0].text).toContain("אני שמח להודיע");
     expect(body.systemInstruction.parts[0].text).toContain("טוהר הבחירות");
     expect(body.systemInstruction.parts[0].text).not.toContain("previous translation was invalid");
@@ -359,15 +369,32 @@ describe("translation checks", () => {
     expect(needsTranslation("RT @realDonaldTrump")).toBe(false);
   });
 
-  it("detects Arabic script in all four blocks and leaves Hebrew alone", () => {
+  it("detects every Arabic block the validator is required to catch", () => {
     expect(hasArabicScript("בשל אמוני")).toBe(false);
     expect(hasArabicScript("ישני עונג להכריז ש")).toBe(false);
     expect(hasArabicScript("טוהר הבחירות")).toBe(false);
+    expect(hasArabicScript("ויווק רמאסוואמי (Vivek Ramaswamy)")).toBe(false);
     expect(hasArabicScript(MIXED)).toBe(true);
+    expect(hasArabicScript("רמאסוא\u0645\u064A")).toBe(true); // Ramaswamy, Hebrew then Arabic
     expect(hasArabicScript("ש\u0750")).toBe(true); // Arabic Supplement
+    expect(hasArabicScript("\u08A0")).toBe(true); // Arabic Extended-A
+    expect(hasArabicScript("\u08FF")).toBe(true);
     expect(hasArabicScript("\uFB50")).toBe(true); // Presentation Forms-A
     expect(hasArabicScript("\uFE8D")).toBe(true); // Presentation Forms-B
     expect(hasArabicScript("\uFEFF")).toBe(true);
+    expect(isArabicCodePoint(0x05ff)).toBe(false);
+    expect(isArabicCodePoint(0x0600)).toBe(true);
+    expect(isArabicCodePoint(0x06ff)).toBe(true);
+    expect(isArabicCodePoint(0x0750)).toBe(true);
+    expect(isArabicCodePoint(0x077f)).toBe(true);
+    expect(isArabicCodePoint(0x089f)).toBe(false);
+    expect(isArabicCodePoint(0x08a0)).toBe(true);
+    expect(isArabicCodePoint(0x08ff)).toBe(true);
+    expect(isArabicCodePoint(0x0900)).toBe(false);
+    expect(isArabicCodePoint(0xfb50)).toBe(true);
+    expect(isArabicCodePoint(0xfdff)).toBe(true);
+    expect(isArabicCodePoint(0xfe70)).toBe(true);
+    expect(isArabicCodePoint(0xfeff)).toBe(true);
   });
 
   it("repairs Arabic letters used as Hebrew, keeps numbers, and strips the rest", () => {
@@ -378,7 +405,19 @@ describe("translation checks", () => {
     expect(repairArabicScript("\u06F5")).toBe("5");
     expect(repairArabicScript("\uFE8D\u0644")).toBe("אל");
     expect(repairArabicScript("ש\u0750לום")).toBe("שלום");
-    expect(hasArabicScript(repairArabicScript(`${MIXED}\u0750\uFE70`))).toBe(false);
+    expect(repairArabicScript("ש\u08A0לום")).toBe("שלום");
+    expect(hasArabicScript(repairArabicScript(`${MIXED}\u0750\u08A0\uFE70`))).toBe(false);
+  });
+
+  it("replaces Arabic letters inside a word and drops a word that is only Arabic", () => {
+    expect(sanitizeArabicWords(MIXED)).toBe(REPAIRED);
+    expect(sanitizeArabicWords("בשל אמוני")).toBe("בשל אמוני");
+    expect(sanitizeArabicWords("ויווק רמאסוא\u0645\u064A נאם")).toBe("ויווק רמאסואמי נאם");
+    expect(hasArabicScript(sanitizeArabicWords("ויווק רמאסוא\u0645\u064A נאם"))).toBe(false);
+    expect(sanitizeArabicWords("שלום \u08A0\u08FF עולם")).toBe("שלום עולם");
+    expect(sanitizeArabicWords("שלום\n\u08A0 עולם")).toBe("שלום\nעולם");
+    expect(sanitizeArabicWords("\u08A0")).toBe("");
+    expect(sanitizeArabicWords("Election Integrity 100%")).toBe("Election Integrity 100%");
   });
 });
 
@@ -386,7 +425,30 @@ describe("Arabic script in a translation", () => {
   const mixed = () => answer({ hebrew: MIXED, categories: ["other"], impact: "low" })();
   const clean = () => answer({ hebrew: CLEAN_PARTY, categories: ["other"], impact: "low" })();
 
-  it("retries on the fallback model with stricter instructions", async () => {
+  it("retries the same model once with a stricter prompt, and does not call the fallback", async () => {
+    let n = 0;
+    const ctx = testCtx({
+      [GEMINI]: () => (++n === 1 ? mixed() : clean()),
+    });
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result).toMatchObject({
+      translated: true,
+      provider: "gemini",
+      model: PRIMARY,
+      hebrew: CLEAN_PARTY,
+    });
+    expect(result.geminiError).toContain(`${PRIMARY}: arabic script in translation`);
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, PRIMARY]);
+    const first = JSON.parse(ctx.calls[0]?.body ?? "{}");
+    const retry = JSON.parse(ctx.calls[1]?.body ?? "{}");
+    expect(first.systemInstruction.parts[0].text).not.toContain("previous translation was invalid");
+    expect(retry.systemInstruction.parts[0].text).toContain("previous translation was invalid");
+    expect(retry.systemInstruction.parts[0].text).toContain("Hebrew only");
+    expect(retry.systemInstruction.parts[0].text).toContain("Transliterate");
+    expect(retry.systemInstruction.parts[0].text).not.toContain("Do not transliterate");
+  });
+
+  it("asks the fallback model after the strict retry still mixes scripts", async () => {
     const ctx = testCtx({ [GEMINI]: byModel(mixed, clean) });
     const result = await analyzePost(ctx, ENGLISH);
     expect(result).toMatchObject({
@@ -396,20 +458,41 @@ describe("Arabic script in a translation", () => {
       hebrew: CLEAN_PARTY,
     });
     expect(result.geminiError).toContain(`${PRIMARY}: arabic script in translation`);
-    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, FALLBACK]);
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, PRIMARY, FALLBACK]);
     const retry = JSON.parse(ctx.calls[1]?.body ?? "{}");
+    const fallback = JSON.parse(ctx.calls[2]?.body ?? "{}");
     expect(retry.systemInstruction.parts[0].text).toContain("previous translation was invalid");
-    expect(retry.systemInstruction.parts[0].text).toContain("Hebrew script only");
-    expect(retry.systemInstruction.parts[0].text).toContain("Do not transliterate");
+    expect(fallback.systemInstruction.parts[0].text).toContain("previous translation was invalid");
+    expect(fallback.systemInstruction.parts[0].text).toContain("Hebrew only");
   });
 
-  it("repairs Arabic script when the strict retry still returns it", async () => {
+  it("replaces Arabic words when the strict retry and the fallback still mix scripts", async () => {
     const ctx = testCtx({ [GEMINI]: mixed });
     const result = await analyzePost(ctx, ENGLISH);
     expect(result).toMatchObject({ translated: true, provider: "gemini", model: FALLBACK, hebrew: REPAIRED });
     expect(hasArabicScript(result.hebrew)).toBe(false);
     expect(result.geminiError).toContain(`${FALLBACK}: arabic script repaired`);
-    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, FALLBACK]);
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, PRIMARY, FALLBACK]);
+  });
+
+  it("retries once when Arabic Extended-A slips into a name, then keeps the clean retry", async () => {
+    const extended = () =>
+      answer({ hebrew: "ויווק רמאסווא\u08A0י (Vivek Ramaswamy)", categories: ["other"], impact: "low" })();
+    const cleanName = () =>
+      answer({ hebrew: "ויווק רמאסוואמי (Vivek Ramaswamy)", categories: ["other"], impact: "low" })();
+    let n = 0;
+    const ctx = testCtx(
+      { [GEMINI]: () => (++n === 1 ? extended() : cleanName()) },
+      { geminiFallbackModel: "" },
+    );
+    const result = await analyzePost(ctx, ENGLISH);
+    expect(result).toMatchObject({
+      translated: true,
+      model: PRIMARY,
+      hebrew: "ויווק רמאסוואמי (Vivek Ramaswamy)",
+    });
+    expect(hasArabicScript(result.hebrew)).toBe(false);
+    expect(ctx.calls.map(modelOf)).toEqual([PRIMARY, PRIMARY]);
   });
 
   it("asks the fallback again, strictly, when that model was the one that mixed scripts", async () => {
@@ -449,6 +532,7 @@ describe("Arabic script in a translation", () => {
     expect(JSON.parse(ctx.calls[1]?.body ?? "{}").systemInstruction.parts[0].text).toContain(
       "previous translation was invalid",
     );
+    expect(JSON.parse(ctx.calls[1]?.body ?? "{}").systemInstruction.parts[0].text).toContain("Transliterate");
   });
 
   it("repairs Arabic script from Workers AI without publishing it", async () => {
