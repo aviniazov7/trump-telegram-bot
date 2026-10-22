@@ -3,8 +3,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { menuFingerprint, POST_RETRY_WINDOW_MS, runCron } from "../src/broadcast";
 import type { Config } from "../src/config";
 import type { RunLock } from "../src/coordinator";
+import { LAST_SUCCESS_WRITE_INTERVAL_MS, resetMemoryMutes } from "../src/monitor";
 import type { WorkersAiClient } from "../src/runtime";
-import { resetMemoryMutes } from "../src/monitor";
 import { emptyMeta, openStore, Store } from "../src/store";
 import {
   CNN_HOST,
@@ -724,7 +724,9 @@ describe("monitoring", () => {
     const first = setup({ feed: ["1"] });
     await first.run();
     expect(adminAlerts(first.tg)[0]?.text).toContain("40 דק׳");
-    expect((await store.getMeta()).lastSuccess).toBe(NOW);
+    // Inside the hourly KV refresh, so the timestamp stays and the DO heartbeat moves.
+    expect((await store.getMeta()).lastSuccess).toBe(NOW - 40 * 60_000);
+    expect(await store.heartbeat()).toBe(NOW);
 
     resetMemoryMutes(); // a fresh Worker instance still sees the KV mute
     await env.COORDINATOR.getByName("cron").reset(); // drop the heartbeat this run just wrote
@@ -734,23 +736,55 @@ describe("monitoring", () => {
     expect(adminAlerts(second.tg)).toEqual([]);
   });
 
-  it("refreshes the heartbeat on every success, so one missed cron is not an outage", async () => {
+  it("refreshes the Durable Object heartbeat every success without rewriting a fresh KV timestamp", async () => {
     await seed("1", ["a"], { lastSuccess: NOW - 10 * 60_000 });
     const { tg, run } = setup({ feed: ["1"] });
     await run();
     expect(adminAlerts(tg)).toEqual([]);
-    expect((await store.getMeta()).lastSuccess).toBe(NOW);
+    expect((await store.getMeta()).lastSuccess).toBe(NOW - 10 * 60_000);
     expect(await store.heartbeat()).toBe(NOW);
   });
 
-  it("does not page while runs keep succeeding, even across the old 30-minute heartbeat", async () => {
-    await seed("1", ["a"], { lastSuccess: NOW });
-    for (let step = 1; step <= 8; step++) {
-      const tick = setup({ feed: ["1"], now: NOW + step * 5 * 60_000 });
-      await tick.run();
+  it("does not write meta on consecutive successes inside an hour, then writes it once the timestamp is older", async () => {
+    await seed("1", ["a"], { lastSuccess: NOW, sourceFailures: 0 });
+    const flaky = new FlakyKV(env.STATE);
+    const runAt = async (now: number) => {
+      const tick = setup({ feed: ["1"], now });
+      await runCron(tick.ctx, openStore(env, flaky as unknown as KVNamespace));
       expect(adminAlerts(tick.tg)).toEqual([]);
-    }
-    expect((await store.getMeta()).lastSuccess).toBe(NOW + 8 * 5 * 60_000);
+    };
+    // Exactly one hour is not old enough (`>`). Each step keeps the DO heartbeat 5 min fresh,
+    // so the 35-minute stale threshold does not page and does not write an alert mute.
+    const steps = LAST_SUCCESS_WRITE_INTERVAL_MS / (5 * 60_000);
+    for (let step = 1; step <= steps; step++) await runAt(NOW + step * 5 * 60_000);
+    expect(flaky.writes).toEqual([]);
+    expect((await store.getMeta()).lastSuccess).toBe(NOW);
+    expect(await store.heartbeat()).toBe(NOW + LAST_SUCCESS_WRITE_INTERVAL_MS);
+
+    const later = NOW + LAST_SUCCESS_WRITE_INTERVAL_MS + 5 * 60_000;
+    await runAt(later);
+    expect(flaky.writes).toEqual(["meta"]);
+    expect((await store.getMeta()).lastSuccess).toBe(later);
+    expect(await store.heartbeat()).toBe(later);
+  });
+
+  it("does not alert when KV lastSuccess is past the stale threshold but the Durable Object heartbeat is fresh", async () => {
+    await seed("1", ["a"], { lastSuccess: NOW - 50 * 60_000 });
+    await store.markHeartbeat(NOW - 5 * 60_000);
+    const { tg, run } = setup({ feed: ["1"] });
+    await run();
+    expect(adminAlerts(tg)).toEqual([]);
+    expect((await store.getMeta()).lastSuccess).toBe(NOW - 50 * 60_000);
+    expect(await store.heartbeat()).toBe(NOW);
+  });
+
+  it("alerts from the newer heartbeat when both copies are past the stale threshold", async () => {
+    await seed("1", ["a"], { lastSuccess: NOW - 50 * 60_000 });
+    await store.markHeartbeat(NOW - 40 * 60_000);
+    const { tg, run } = setup({ feed: ["1"] });
+    await run();
+    expect(adminAlerts(tg)[0]?.text).toContain("40 דק׳");
+    expect((await store.getMeta()).lastSuccess).toBe(NOW - 50 * 60_000);
   });
 
   it("alerts only once the gap is actually past STALE_ALERT_MINUTES", async () => {
@@ -784,6 +818,23 @@ describe("monitoring", () => {
     // A working run resets the counter.
     await setup({ feed: ["1"] }).run();
     expect((await store.getMeta()).sourceFailures).toBe(0);
+  });
+
+  it("writes meta once to clear sourceFailures, then skips meta on the next success inside the hour", async () => {
+    await seed("1", ["a"], { lastSuccess: NOW, sourceFailures: 2 });
+    const flaky = new FlakyKV(env.STATE);
+    const runAt = (now: number) => {
+      const { ctx } = setup({ feed: ["1"], now });
+      return runCron(ctx, openStore(env, flaky as unknown as KVNamespace));
+    };
+    await runAt(NOW + 5 * 60_000);
+    expect((await store.getMeta()).sourceFailures).toBe(0);
+    expect((await store.getMeta()).lastSuccess).toBe(NOW);
+    expect(flaky.writes).toEqual(["meta"]);
+
+    await runAt(NOW + 10 * 60_000);
+    expect(flaky.writes).toEqual(["meta"]);
+    expect(await store.heartbeat()).toBe(NOW + 10 * 60_000);
   });
 
   it("alerts when lastSeen fell out of the scanned window", async () => {
@@ -962,7 +1013,7 @@ describe("KV write failures", () => {
     await run();
     expect(tg.sent).toHaveLength(5);
     expect(flaky.writes.filter((k) => k.startsWith("sent:"))).toEqual(["sent:2"]);
-    // mirror + analysis + meta (cursor and heartbeat)
+    // mirror + analysis + meta (cursor moved; the heartbeat alone does not write meta)
     expect(flaky.writes).toHaveLength(3);
   });
 });

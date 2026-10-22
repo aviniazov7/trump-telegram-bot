@@ -4,10 +4,21 @@ import { KvWriteError, type Meta, type Store } from "./store";
 import { sendMessage } from "./telegram";
 
 /**
+ * How often `meta.lastSuccess` may be written. The cron is every 5 minutes;
+ * bumping the timestamp every run made `persist()` rewrite `meta` ~288
+ * times a day and burned most of the free-tier 1,000 KV writes. The Durable
+ * Object heartbeat is still updated on every success, and `checkHeartbeat`
+ * uses whichever copy is newer, so a threshold under this interval (the
+ * default is 35 minutes) still measures a real gap.
+ */
+export const LAST_SUCCESS_WRITE_INTERVAL_MS = 3_600_000;
+
+/**
  * How long since the last *successful* run before the in-band alert.
- * The heartbeat is the end of that run, written every time, so this is a
- * real gap. Writing it only every 30 minutes made the next cron (5 min
- * later, a few seconds past the threshold) look like a 35-minute outage.
+ * `checkHeartbeat` takes the newer of `meta.lastSuccess` and the Durable
+ * Object heartbeat. The object is written every successful run, so this is
+ * a real gap even though the KV copy is refreshed at most once an hour.
+ * Alerting from that KV copy alone made the next cron look like an outage.
  * Faster detection is HEALTHCHECK_URL's job.
  */
 export function staleThresholdMs(staleAlertMinutes: number): number {
@@ -94,8 +105,10 @@ const ISRAEL_SHORT = new Intl.DateTimeFormat("en-GB", {
  * Fires at the start of the first run after an outage; a Worker that isn't
  * running at all can't report anything — HEALTHCHECK_URL covers that.
  *
- * The Durable Object copy wins over `meta.lastSuccess` when it is newer, so
- * a stale KV read (or a lost meta write) can't page for a run that succeeded.
+ * The Durable Object copy wins over `meta.lastSuccess` when it is newer.
+ * That copy is updated every successful run, while `meta.lastSuccess` lags
+ * by up to an hour, so a threshold under an hour still sees a real gap. A
+ * stale KV read (or a lost meta write) can't page for a run that succeeded.
  */
 export async function checkHeartbeat(ctx: Ctx, store: Store, meta: Meta): Promise<void> {
   let beat = 0;
@@ -134,10 +147,14 @@ export async function recordSourceFailure(ctx: Ctx, store: Store, meta: Meta): P
   }
 }
 
-/** Mark the run successful: refresh the heartbeat and ping HEALTHCHECK_URL. */
+/**
+ * Mark the run successful: refresh the Durable Object heartbeat every run,
+ * and ping HEALTHCHECK_URL. `meta` is touched only when a field changes, so
+ * an idle cron does not spend a KV write.
+ */
 export async function recordSuccess(ctx: Ctx, store: Store, meta: Meta): Promise<void> {
-  meta.sourceFailures = 0;
-  meta.lastSuccess = ctx.now();
+  if (meta.sourceFailures !== 0) meta.sourceFailures = 0;
+  if (ctx.now() - meta.lastSuccess > LAST_SUCCESS_WRITE_INTERVAL_MS) meta.lastSuccess = ctx.now();
   try {
     await store.markHeartbeat(ctx.now());
   } catch (err) {

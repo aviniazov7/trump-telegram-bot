@@ -55,9 +55,10 @@ GEMINI_RETRY_MINUTES = "15"
 # Reasoning is turned off in the call so a short translation stays inside
 # the 10,000 neurons/day included on Workers Free. Paid-only models are not used.
 WORKERS_AI_MODEL = "@cf/zai-org/glm-4.7-flash"
-# In-band "no successful run" alert, measured from the end of the last
-# successful run (recorded every run). For faster detection use
-# HEALTHCHECK_URL (healthchecks.io), which costs no KV writes.
+# In-band "no successful run" alert. checkHeartbeat uses the newer of the
+# Durable Object heartbeat (every successful run) and meta.lastSuccess
+# (at most once an hour, so idle crons do not write KV). For faster
+# detection use HEALTHCHECK_URL (healthchecks.io), which costs no KV writes.
 STALE_ALERT_MINUTES = "35"
 SOURCE_FAILURE_ALERT_RUNS = "10"
 ALERT_REPEAT_MINUTES = "60"
