@@ -146,8 +146,8 @@ returns the Hebrew translation, the **topics** (`tariffs`, `fed_rates`,
 `oil` (incl. energy), `geopolitics` (war, ceasefire, sanctions), `crypto`,
 `china`, `stocks`, `other`) and the **impact** (`high`/`medium`/`low`) as
 schema-checked JSON. The prompt asks for natural, fluent Israeli Hebrew:
-no word-for-word calques, no transliteration, Hebrew script only, and Latin
-script for proper nouns that have no established Hebrew spelling. Names and
+no word-for-word calques, Hebrew only, and proper names transliterated
+into Hebrew. The English spelling may follow in parentheses. Names and
 numbers stay accurate.
 
 ```
@@ -200,11 +200,11 @@ runs. So:
    With Workers AI configured, the same run tries that instead. Per-minute
    429s are only waited out (`retryDelay`), never marked.
 4. **Arabic script.** If a translation contains Arabic-script characters
-   (U+0600–U+06FF, U+0750–U+077F, U+FB50–U+FDFF, U+FE70–U+FEFF), it is
-   rejected. The fallback model is asked again with stricter instructions.
-   If Arabic script is still there, those characters are repaired to the
-   Hebrew letter they stand in for, or stripped, and that Hebrew is what
-   gets sent.
+   (U+0600–U+06FF, U+0750–U+077F, U+08A0–U+08FF, U+FB50–U+FDFF, U+FE70–U+FEFF),
+   it is rejected. The same model is asked once more with stricter
+   instructions. If Arabic script is still there, the next fallback model is
+   asked. Words that still contain Arabic are replaced with Hebrew letters
+   or removed, and that Hebrew is what gets sent.
 5. **Workers AI, once.** If both Gemini models fail (daily 429, any other
    error, or an answer that is still English), the same run asks Workers AI
    through the `AI` binding. The model is `@cf/zai-org/glm-4.7-flash`

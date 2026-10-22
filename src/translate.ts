@@ -7,9 +7,11 @@
  * Cloudflare's network on 2026-10-12, Google's endpoints answered 429,
  * Lingva 403/400 and MyMemory "quota used up" — every time.
  *
- * Arabic script in a Hebrew answer is a bad translation (the lite model mixes
- * the two). hasArabicScript detects it; repairArabicScript is the last resort
- * after a stricter retry still returns those characters.
+ * Arabic script in a Hebrew answer is a bad translation (the model mixes the
+ * two, as with רמאסוא + Arabic مي for Ramaswamy). hasArabicScript detects
+ * it. sanitizeArabicWords is the last resort after a stricter retry and the
+ * fallback model still return those characters: Arabic letters inside a word
+ * are replaced, and a word that is only unmapped Arabic is removed.
  */
 
 const HEBREW_RE = /[\u0590-\u05FF]/;
@@ -35,11 +37,15 @@ export function looksTranslated(source: string, candidate: string | null | undef
   return HEBREW_RE.test(candidate);
 }
 
-/** Arabic, Arabic Supplement, and both Arabic presentation-form blocks. */
+/**
+ * Arabic, Arabic Supplement, Arabic Extended-A, and both Arabic
+ * presentation-form blocks.
+ */
 export function isArabicCodePoint(cp: number): boolean {
   return (
     (cp >= 0x0600 && cp <= 0x06ff) ||
     (cp >= 0x0750 && cp <= 0x077f) ||
+    (cp >= 0x08a0 && cp <= 0x08ff) ||
     (cp >= 0xfb50 && cp <= 0xfdff) ||
     (cp >= 0xfe70 && cp <= 0xfeff)
   );
@@ -154,4 +160,31 @@ export function repairArabicScript(text: string): string {
     }
   }
   return out;
+}
+
+const WORD_CONTENT_RE = /[\p{L}\p{N}]/u;
+
+/**
+ * Last resort for a translation that still contains Arabic script.
+ * Each whitespace-delimited word that contains Arabic is rewritten with
+ * {@link repairArabicScript}. A word that is only unmapped Arabic, or that
+ * still contains Arabic after that rewrite, is removed. Hebrew, Latin, and
+ * every other clean word are left as written.
+ */
+export function sanitizeArabicWords(text: string): string {
+  const kept: string[] = [];
+  for (const part of text.split(/(\s+)/)) {
+    if (!part || !hasArabicScript(part)) {
+      kept.push(part);
+      continue;
+    }
+    const repaired = repairArabicScript(part);
+    if (!hasArabicScript(repaired) && WORD_CONTENT_RE.test(repaired)) kept.push(repaired);
+  }
+  return kept
+    .join("")
+    .replace(/[^\S\n]{2,}/g, " ")
+    .replace(/[^\S\n]+\n/g, "\n")
+    .replace(/\n[^\S\n]+/g, "\n")
+    .trim();
 }

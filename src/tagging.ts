@@ -11,7 +11,7 @@ import {
 } from "./gemini";
 import type { Ctx } from "./runtime";
 import { isMeaningfulText } from "./text";
-import { hasArabicScript, looksTranslated, needsTranslation, repairArabicScript } from "./translate";
+import { hasArabicScript, looksTranslated, needsTranslation, sanitizeArabicWords } from "./translate";
 import { workersAiTranslate } from "./workers-ai";
 
 /** Machine keys → Hebrew hashtag labels, in display order. */
@@ -179,9 +179,10 @@ function deterministicFailure(errors: string[]): boolean {
  * `priorError` is the last saved failure, so a model that already echoed this
  * post is not called again.
  *
- * Hebrew that contains Arabic script is not accepted. The next model is asked
- * again with stricter instructions; if Arabic script remains, those characters
- * are repaired or stripped and the Hebrew is kept.
+ * Hebrew that contains Arabic script is not accepted. The same model is asked
+ * once more with stricter instructions. If Arabic script remains, the next
+ * fallback model is asked with those instructions. Words that still contain
+ * Arabic are then replaced or removed, and that Hebrew is what gets sent.
  */
 export async function analyzePost(
   ctx: Ctx,
@@ -208,7 +209,8 @@ export async function analyzePost(
   const errors: string[] = [];
   let outOfQuota = 0;
   let contaminated: { model: string; hebrew: string; data: Record<string, unknown> } | null = null;
-  let sentStrict = false;
+  /** After Arabic script, later models are asked with the strict prompt only. */
+  let arabicSeen = false;
 
   const acceptGemini = (model: string, hebrew: string, data: Record<string, unknown>): PostAnalysis => {
     const parsed = parseMarketTags(data);
@@ -263,6 +265,7 @@ export async function analyzePost(
     return { model, hebrew, data };
   };
 
+  let halted = false;
   for (const model of models) {
     if (echoed.has(model)) {
       errors.push(`${model}: skipped — earlier untranslated text`);
@@ -274,64 +277,44 @@ export async function analyzePost(
       errors.push(`${model}: skipped — ${exhausted}`);
       continue;
     }
-    const strict = contaminated !== null;
-    if (strict) sentStrict = true;
-    try {
-      const data = await geminiJson(
-        ctx,
-        text,
-        model,
-        strict ? GEMINI_STRICT_SYSTEM_PROMPT : GEMINI_SYSTEM_PROMPT,
-      );
-      const outcome = consider(model, data);
-      if (outcome && "translated" in outcome) return outcome;
-      if (outcome) contaminated = outcome;
-    } catch (err) {
-      const action = await onGeminiError(model, err);
-      if (action === "out-of-time") {
-        return untranslated(err instanceof Error ? err.message : "no time left in this run", {
-          outOfTime: true,
-        });
-      }
-      if (action === "break") break;
-    }
-    ctx.log.warn(`Gemini failed — ${errors.at(-1)}`);
-  }
-
-  // The in-loop pass already retries the next model with the strict prompt.
-  // This call is the one strict retry when the Arabic answer came from the
-  // last model (the fallback, or the only model) on the ordinary prompt.
-  if (contaminated && !sentStrict) {
-    const retryModel = ctx.cfg.geminiFallbackModel || contaminated.model;
-    const alreadySkipped = errors.some((part) => part.startsWith(`${retryModel}: skipped —`));
-    if (!alreadySkipped) {
-      if (echoed.has(retryModel)) {
-        errors.push(`${retryModel}: skipped — earlier untranslated text`);
-      } else {
-        const retryExhausted = await quota.exhausted(retryModel);
-        if (retryExhausted) {
-          errors.push(`${retryModel}: skipped — ${retryExhausted}`);
-        } else {
-          sentStrict = true;
-          try {
-            const data = await geminiJson(ctx, text, retryModel, GEMINI_STRICT_SYSTEM_PROMPT);
-            const outcome = consider(retryModel, data);
-            if (outcome && "translated" in outcome) return outcome;
-            if (outcome) contaminated = outcome;
-          } catch (err) {
-            await onGeminiError(retryModel, err);
-          }
-          ctx.log.warn(`Gemini failed — ${errors.at(-1)}`);
+    // Ordinary prompt, then one strict retry when that answer mixed scripts.
+    // A later model is asked once, with the strict prompt: that is the
+    // fallback attempt, not a second strict retry.
+    const prompts = arabicSeen
+      ? [GEMINI_STRICT_SYSTEM_PROMPT]
+      : [GEMINI_SYSTEM_PROMPT, GEMINI_STRICT_SYSTEM_PROMPT];
+    for (const prompt of prompts) {
+      try {
+        const data = await geminiJson(ctx, text, model, prompt);
+        const outcome = consider(model, data);
+        if (outcome && "translated" in outcome) return outcome;
+        ctx.log.warn(`Gemini failed — ${errors.at(-1)}`);
+        if (outcome) {
+          contaminated = outcome;
+          arabicSeen = true;
+          if (prompt === GEMINI_SYSTEM_PROMPT) continue;
         }
+        break;
+      } catch (err) {
+        const action = await onGeminiError(model, err);
+        if (action === "out-of-time") {
+          return untranslated(err instanceof Error ? err.message : "no time left in this run", {
+            outOfTime: true,
+          });
+        }
+        ctx.log.warn(`Gemini failed — ${errors.at(-1)}`);
+        if (action === "break") halted = true;
+        break;
       }
     }
+    if (halted) break;
   }
 
   if (contaminated) {
-    const repaired = repairArabicScript(contaminated.hebrew).trim();
+    const repaired = sanitizeArabicWords(contaminated.hebrew);
     if (looksTranslated(text, repaired) && !hasArabicScript(repaired)) {
       errors.push(`${contaminated.model}: arabic script repaired`);
-      ctx.log.warn(`Gemini ${contaminated.model}: repaired Arabic script in the translation`);
+      ctx.log.warn(`Gemini ${contaminated.model}: replaced or removed Arabic words in the translation`);
       return acceptGemini(contaminated.model, repaired, contaminated.data);
     }
   }
@@ -347,7 +330,7 @@ export async function analyzePost(
       try {
         let hebrew = await workersAiTranslate(ctx, text);
         if (hasArabicScript(hebrew)) {
-          const repaired = repairArabicScript(hebrew).trim();
+          const repaired = sanitizeArabicWords(hebrew);
           if (looksTranslated(text, repaired) && !hasArabicScript(repaired)) {
             errors.push("workers-ai: arabic script repaired");
             hebrew = repaired;
