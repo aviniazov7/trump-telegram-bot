@@ -58,7 +58,11 @@ export interface Meta extends Cursor {
   pending: Record<string, number>;
   /** Fingerprint of the bot menu last applied to Telegram. */
   menu: string;
-  /** End of the last successful run (ms); the heartbeat. */
+  /**
+   * End of the last successful run recorded in KV (ms). Refreshed at most
+   * once an hour. The fresh heartbeat is the Durable Object copy, written
+   * every successful run.
+   */
   lastSuccess: number;
   /** Consecutive runs in which no post source could be reached. */
   sourceFailures: number;

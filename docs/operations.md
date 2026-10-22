@@ -49,7 +49,7 @@ it.
                     │   5. order: in progress → 🔴 high → rest (each oldest first)        │
                     │   6. per post: claim chats in the Durable Object → send → record  │
                     │        outcomes (KV `sent:<post>` is a mirror; KV failure → STOP)│
-                    │   7. cursor/heartbeat → KV meta, ping HEALTHCHECK_URL              │
+                    │   7. KV meta only if it changed; DO heartbeat every run; ping HC  │
                     │                                                                    │
  Telegram ─────────▶│ fetch() POST /telegram/<path>  (secret header, constant-time)     │
   (webhook)         │   /start /trumphere → sub:<chat>   /stop → delete   welcome/bye   │
@@ -265,12 +265,16 @@ is why no ⚠️ alert arrived for that day's failures.
 | ⛽ Gemini quota | Every Gemini model's free daily quota is used up and Workers AI is not configured; posts go out in English until the reset (once per 12 h) |
 | ⚠️ Possible missed posts | `lastSeen` wasn't in the scanned window |
 
-The heartbeat is the end of the last successful run. It is written on every
-success (`meta.lastSuccess`, and a copy in the Durable Object so a stale KV
-read can't page). A cron that merely lands a few seconds past a 30-minute
-write interval is not an outage. Mutes are kept in KV. When KV can't record a
-mute (writes failing), the mute is kept in the running Worker's memory
-instead. That's best effort: a fresh Worker instance can repeat an alert once.
+The heartbeat is the end of the last successful run. Every success writes it
+to the Durable Object. `meta.lastSuccess` is the KV copy, refreshed only when
+that timestamp is more than an hour old, so an idle cron does not spend a KV
+write. The stale check uses whichever copy is newer, so
+`STALE_ALERT_MINUTES` (35) still measures a real gap while runs succeed: the
+object is minutes old, and a stale KV read can't page. A cron that merely
+lands past the hourly KV refresh is not an outage. Mutes are kept in KV.
+When KV can't record a mute (writes failing), the mute is kept in the running
+Worker's memory instead. That's best effort: a fresh Worker instance can
+repeat an alert once.
 
 A Worker that doesn't run at all can't send alerts. For that case, and for
 detection faster than 35 minutes, set `HEALTHCHECK_URL` to a
@@ -303,14 +307,17 @@ by every Worker on the account:
 
 | What | Writes |
 |---|---|
-| Heartbeat | 288/day (every successful run writes `meta`; the old 30-minute throttle paged on healthy runs) |
-| Each new post | 2 KV writes plus the cursor/heartbeat meta write: analysis cache + send-log mirror. The claim itself is a Durable Object write, not KV. Independent of the subscriber count |
+| `meta.lastSuccess` | ≤24/day. Written only when the stored timestamp is more than an hour old. Idle runs do not write `meta` |
+| Each new post | 2 KV writes (analysis cache + send-log mirror) plus one `meta` write when the cursor or another field changed. The send claim and the per-run heartbeat are Durable Object writes, not KV. Independent of the subscriber count |
 | Each failed Gemini attempt | 1 (`gemini-error:<post>`), at most ~4 per post (one per run during the 15 min retry window) |
 | Subscribe / unsubscribe / dead chat | 1 each |
 | Alerts | 1 each (mute) |
 
-At ~30 posts a day that's about 350 KV writes, under 1,000. The Durable Object
-writes (one lease plus a claim per post) are not part of that KV quota.
+Idle crons used to rewrite `meta` every 5 minutes (~288 writes/day) just to
+bump the heartbeat. That KV copy is now at most hourly. At ~30 posts a day
+the remaining writes are the post cache and send-log mirror, cursor updates,
+and the hourly refresh — under 1,000. Durable Object writes (one lease, one
+heartbeat, and a claim per post) are not part of that KV quota.
 
 ### When to move to Workers Paid or D1
 
