@@ -10,10 +10,10 @@ compatibility_date = "2026-09-25"
 workers_dev = true
 
 [triggers]
-# Every 5 minutes. Each run stops starting new work after
+# Every 15 minutes. Each run stops starting new work after
 # RUN_TIME_BUDGET_SECONDS. Cloudflare can still dispatch a second invocation
 # (duplicate or retry); Coordinator is the single-flight lease.
-crons = ["*/5 * * * *"]
+crons = ["*/15 * * * *"]
 
 [[kv_namespaces]]
 binding = "STATE"

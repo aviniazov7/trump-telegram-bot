@@ -127,31 +127,42 @@ describe("daily quota tracking", () => {
     expect(a.geminiError).toContain("minute quota GenerateRequestsPerMinutePerProjectPerModel-FreeTier");
   });
 
-  it("when every model is out of daily quota: sends in English right away, with one ⛽ alert", async () => {
+  it("when every model is out of daily quota: holds the post one run, then sends English with one clean notice", async () => {
     const NOW = Date.UTC(2026, 9, 12, 19, 5);
     await store.putMeta({ ...emptyMeta(), lastSeen: "1", lastSuccess: NOW, menu: "x" });
     await store.putSubscriber("a", null);
     const sent: { chat: string; text: string }[] = [];
-    const ctx = testCtx(
-      {
-        [RSS_HOST]: () => new Response(rssFeed(["2", "1"], (id) => `${ENGLISH} number-${id}`)),
-        [TELEGRAM]: (call) => {
-          const body = JSON.parse(call.body || "{}");
-          if (body.text) sent.push({ chat: String(body.chat_id), text: body.text });
-          return json({ ok: true, result: {} });
+    let now = NOW;
+    const ctx = () =>
+      testCtx(
+        {
+          [RSS_HOST]: () => new Response(rssFeed(["2", "1"], (id) => `${ENGLISH} number-${id}`)),
+          [TELEGRAM]: (call) => {
+            const body = JSON.parse(call.body || "{}");
+            if (body.text) sent.push({ chat: String(body.chat_id), text: body.text });
+            return json({ ok: true, result: {} });
+          },
+          [GEMINI]: daily,
         },
-        [GEMINI]: daily,
-      },
-      { maxSubrequests: 200 },
-      { now: () => NOW },
-    );
-    await runCron(ctx, store);
+        { maxSubrequests: 200 },
+        { now: () => now },
+      );
+    const first = ctx();
+    await runCron(first, store);
+    expect(sent.filter((s) => s.chat === "a")).toHaveLength(0); // retried next cron run
+    expect(first.calls.filter((c) => c.host === GEMINI).map(modelOf)).toEqual([FLASH, LITE]);
+
+    now = NOW + 15 * 60_000;
+    const second = ctx();
+    await runCron(second, store);
     const toA = sent.filter((s) => s.chat === "a");
-    expect(toA).toHaveLength(1); // no 15-minute wait
-    expect(toA[0]?.text).toContain("התרגום לעברית נכשל");
+    expect(toA).toHaveLength(1);
+    expect(toA[0]?.text).toContain("⚠️ התרגום לעברית אינו זמין כרגע.");
+    expect(toA[0]?.text.split("━━━━━━━━━━━━━━━")[1]).not.toMatch(/HTTP |429|quota|skipped|Gemini/);
     expect(toA[0]?.text.split("\n")[0]).toContain("🟠"); // tariffs → impact floor
     const alerts = sent.filter((s) => s.chat === "999" && s.text.includes("המכסה היומית"));
     expect(alerts).toHaveLength(1);
-    expect(ctx.calls.filter((c) => c.host === GEMINI).map(modelOf)).toEqual([FLASH, LITE]);
+    // Quota marked in KV: no Gemini call is wasted on the second run.
+    expect(second.calls.filter((c) => c.host === GEMINI)).toHaveLength(0);
   });
 });

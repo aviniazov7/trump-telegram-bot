@@ -14,12 +14,12 @@ const rss = (description: string, title = "Video post from October 11, 2026") =>
 const VIDEO_ONLY = '<p></p><p><a href="https://archive.example/a.mp4">View video</a></p>';
 const IMAGE_ONLY = '<p></p><p><a href="https://archive.example/a.jpg">View image</a></p>';
 const QUOTE_OF_VIDEO =
-  '<p><span><br />RT: https://truthsocial.com/users/realDonaldTrump/statuses/117422953300698902</span></p>' +
+  "<p><span><br />RT: https://truthsocial.com/users/realDonaldTrump/statuses/117422953300698902</span></p>" +
   '<p><a href="https://archive.example/b.jpg">View image</a></p>' +
   '<p>Quoted <a href="https://www.trumpstruth.org/statuses/42252">Donald J. Trump</a></p>' +
   '<blockquote><p></p><p><a href="https://archive.example/a.mp4">View video</a></p></blockquote>';
 const QUOTE_WITH_TEXT =
-  '<p><span><br />RT: https://truthsocial.com/users/realDonaldTrump/statuses/117419806852030114</span></p>' +
+  "<p><span><br />RT: https://truthsocial.com/users/realDonaldTrump/statuses/117419806852030114</span></p>" +
   '<p>Quoted <a href="https://www.trumpstruth.org/statuses/1">Donald J. Trump</a></p>' +
   "<blockquote><p>We will win BIG on November 3rd!</p></blockquote>";
 
@@ -57,7 +57,9 @@ describe("2. media-only and quote posts", () => {
     expect(msg).toContain(line);
     expect(msg).not.toContain("תרגום לעברית");
     expect(msg).not.toMatch(/View (image|video)|Quoted|צפה ב/);
-    expect(msg).toContain('<a href="https://truthsocial.com/@realDonaldTrump/117422953300698902">לפוסט המקורי</a>');
+    expect(msg).toContain(
+      '<a href="https://truthsocial.com/@realDonaldTrump/117422953300698902">לפוסט המקורי</a>',
+    );
   });
 
   it("translates the quoted text when the quote post has no words of its own", () => {
@@ -77,7 +79,11 @@ describe("2. media-only and quote posts", () => {
         media: ["https://static.example/x.jpg"],
       },
       { id: "117422953300698902", content: "", media: ["https://static.example/y.mp4"] },
-      { id: "117422953300698903", content: "RT: https://truthsocial.com/users/realDonaldTrump/statuses/117422953300698902", media: [] },
+      {
+        id: "117422953300698903",
+        content: "RT: https://truthsocial.com/users/realDonaldTrump/statuses/117422953300698902",
+        media: [],
+      },
     ]);
     const posts = parseCnnArchive(archive, 10);
     expect(posts.map((p) => [p.id, p.text, p.media])).toEqual([
