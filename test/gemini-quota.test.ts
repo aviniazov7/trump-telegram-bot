@@ -54,7 +54,7 @@ const MINUTE_429 = JSON.stringify({
 const ok = () => json(geminiAnswer({ hebrew: HEBREW, categories: ["tariffs"], impact: "high" }));
 const daily = () => new Response(DAILY_429, { status: 429 });
 
-const store = openStore(env);
+const store = openStore(env, env.STATE);
 beforeEach(async () => {
   for (const { name } of (await env.STATE.list()).keys) await env.STATE.delete(name);
   await env.COORDINATOR.getByName("cron").reset();

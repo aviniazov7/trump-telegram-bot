@@ -19,7 +19,7 @@ import {
 } from "./helpers";
 
 const NOW = 1_800_000_000_000;
-const store = openStore(env);
+const store = openStore(env, env.STATE);
 
 beforeEach(async () => {
   for (const { name } of (await env.STATE.list()).keys) await env.STATE.delete(name);
@@ -990,6 +990,11 @@ describe("KV write failures", () => {
       claimUpdate: (updateId, now) => real.claimUpdate(updateId, now),
       releaseUpdate: (updateId) => real.releaseUpdate(updateId),
       reset: () => real.reset(),
+      stateGet: (k, now) => real.stateGet(k, now),
+      statePut: (k, e) => real.statePut(k, e),
+      stateList: (p, now) => real.stateList(p, now),
+      stateImported: (f) => real.stateImported(f),
+      stateImport: (f, e) => real.stateImport(f, e),
     };
     const { tg, ctx } = setup({ feed: ["2", "1"] });
     await expect(runCron(ctx, new Store(env.STATE, lock))).rejects.toThrow(/coordinator unavailable/);

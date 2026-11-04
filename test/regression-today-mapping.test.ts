@@ -15,7 +15,7 @@ import { stripHtml } from "../src/text";
 import { GEMINI, geminiAnswer, json, RSS_HOST, TELEGRAM, testCtx } from "./helpers";
 
 const NOW = 1_800_000_000_000;
-const store = openStore(env);
+const store = openStore(env, env.STATE);
 
 const POSTS: Record<string, { en: string; he: string }> = {
   "100": { en: "Already sent earlier.", he: "נשלח כבר." },

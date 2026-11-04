@@ -1,5 +1,6 @@
 /**
- * Bot state in Workers KV.
+ * Bot state. Stored in the Coordinator Durable Object through a KV-shaped
+ * adapter (do-kv.ts); legacy Workers KV keys are only read, never written.
  *
  * Keys:
  *   meta                    cursor (lastSeen, sentAhead), posts in progress,
@@ -35,6 +36,7 @@
  * stops the run's sends immediately (see broadcast.ts).
  */
 import { RUN_LOCK_NAME, type RunLock } from "./coordinator";
+import { DoKV } from "./do-kv";
 import type { Env } from "./env";
 import type { Cursor } from "./posts";
 import type { PostAnalysis } from "./tagging";
@@ -108,8 +110,14 @@ export interface GeminiFailureRecord {
 /** KV's minimum expirationTtl. */
 const MIN_TTL_S = 60;
 
-export function openStore(env: Env, kv: KVNamespace = env.STATE): Store {
-  return new Store(kv, env.COORDINATOR.getByName(RUN_LOCK_NAME));
+/**
+ * Default: state in the Coordinator Durable Object, with read-only fallback
+ * to legacy KV keys (see do-kv.ts). Passing `kv` uses that namespace directly
+ * (tests).
+ */
+export function openStore(env: Env, kv?: KVNamespace): Store {
+  const lock = env.COORDINATOR.getByName(RUN_LOCK_NAME);
+  return new Store(kv ?? (new DoKV(lock, env.STATE) as unknown as KVNamespace), lock);
 }
 
 export class Store {

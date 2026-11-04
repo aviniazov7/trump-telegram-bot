@@ -49,7 +49,27 @@ export interface RunLock {
   /** Drop a claim so a failed attempt can be retried. */
   releaseUpdate(updateId: number): Promise<void>;
   reset(): Promise<void>;
+  stateGet(key: string, now: number): Promise<StateEntry | null>;
+  statePut(key: string, entry: StateEntry): Promise<void>;
+  stateList(prefix: string, now: number): Promise<{ name: string; metadata: unknown }[]>;
+  stateImported(flag: string): Promise<boolean>;
+  stateImport(flag: string, entries: { name: string; entry: StateEntry }[]): Promise<void>;
 }
+
+/**
+ * Bot state formerly kept in Workers KV (meta, subscribers, analysis, quota
+ * and alert markers...). DO storage writes do not count against KV's
+ * 1,000/day free write limit. `value: null` is a tombstone: the key was
+ * deleted here, so the legacy KV copy must not be read again.
+ */
+export interface StateEntry {
+  value: string | null;
+  metadata?: unknown;
+  /** ms; absent = no expiry. */
+  expiresAt?: number;
+}
+
+const stateKey = (key: string) => `kv:${key}`;
 
 const sentKey = (postId: string) => `sent:${postId}`;
 
@@ -136,6 +156,42 @@ export class Coordinator extends DurableObject<Env> implements RunLock {
     await this.ctx.storage.delete(`upd:${updateId}`);
   }
 
+  async stateGet(key: string, now: number): Promise<StateEntry | null> {
+    const entry = await this.ctx.storage.get<StateEntry>(stateKey(key));
+    if (!entry) return null;
+    if (entry.expiresAt !== undefined && entry.expiresAt <= now) return { value: null };
+    return entry;
+  }
+
+  async statePut(key: string, entry: StateEntry): Promise<void> {
+    await this.ctx.storage.put(stateKey(key), entry);
+  }
+
+  async stateList(prefix: string, now: number): Promise<{ name: string; metadata: unknown }[]> {
+    const rows = await this.ctx.storage.list<StateEntry>({ prefix: stateKey(prefix) });
+    const out: { name: string; metadata: unknown }[] = [];
+    for (const [k, e] of rows) {
+      if (e.value === null || (e.expiresAt !== undefined && e.expiresAt <= now)) continue;
+      out.push({ name: k.slice(3), metadata: e.metadata });
+    }
+    return out;
+  }
+
+  async stateImported(flag: string): Promise<boolean> {
+    return (await this.ctx.storage.get(`imported:${flag}`)) === true;
+  }
+
+  /** One-time import of legacy KV keys. Never overwrites a key (or tombstone) already here. */
+  async stateImport(flag: string, entries: { name: string; entry: StateEntry }[]): Promise<void> {
+    await this.ctx.storage.transaction(async (txn) => {
+      if ((await txn.get(`imported:${flag}`)) === true) return;
+      for (const { name, entry } of entries) {
+        if ((await txn.get(stateKey(name))) === undefined) await txn.put(stateKey(name), entry);
+      }
+      await txn.put(`imported:${flag}`, true);
+    });
+  }
+
   /** Test helper. Wipes the lease, claims and heartbeat. */
   async reset(): Promise<void> {
     await this.ctx.storage.deleteAll();
@@ -150,6 +206,8 @@ export class Coordinator extends DurableObject<Env> implements RunLock {
       const updates = await this.ctx.storage.list<number>({ prefix: "upd:" });
       const updateCutoff = now - UPDATE_DEDUPE_TTL_MS;
       for (const [key, at] of updates) if ((at ?? 0) < updateCutoff) stale.push(key);
+      const state = await this.ctx.storage.list<StateEntry>({ prefix: "kv:" });
+      for (const [key, e] of state) if (e?.expiresAt !== undefined && e.expiresAt <= now) stale.push(key);
       if (stale.length) await this.ctx.storage.delete(stale);
     } catch (err) {
       console.warn("Coordinator prune failed:", err instanceof Error ? err.message : String(err));
