@@ -342,7 +342,10 @@ async function deliverNewPosts(
         // Waiting is pointless when every model is out of daily quota.
         // An echo will not become Hebrew on the next run. A 429 or a 5xx might,
         // and so might Workers AI, so those keep the retry window.
-        if (ctx.cfg.geminiApiKey && !fresh.quotaExhausted && !fresh.deterministic && waited < ctx.cfg.geminiRetryMs) {
+        // A daily-quota 429 also waits one retry window: the fallback model or a
+        // quota reset may answer next run, and subscribers prefer Hebrew late
+        // over English now. Only an echo (deterministic) is sent at once.
+        if (ctx.cfg.geminiApiKey && !fresh.deterministic && waited < ctx.cfg.geminiRetryMs) {
           ctx.log.warn(
             `Post ${post.id}: no translation yet (${fresh.geminiError}) — retrying next run ` +
               `(${Math.floor(waited / 60_000)}/${ctx.cfg.geminiRetryMs / 60_000} min)`,
@@ -382,18 +385,14 @@ async function deliverNewPosts(
   const otherFailures = gaveUp.filter((g) => !g.quota);
   if (otherFailures.length) {
     const [first] = otherFailures;
-    const triedWorkersAi = otherFailures.some((failure) => failure.error.includes("workers-ai"));
-    const who = triedWorkersAi ? "Gemini ו-Workers AI" : "Gemini";
-    const span = otherFailures.every((failure) => failure.immediate)
-      ? "בניסיון אחד"
-      : `במשך ${ctx.cfg.geminiRetryMs / 60_000} דק׳`;
+    // Raw provider errors stay in the log, never in a Telegram chat.
+    ctx.log.error(`Translation gave up on ${first?.id}: ${scrub(first?.error ?? "")}`);
     await alertAdmin(
       ctx,
       store,
       "translation",
-      `⚠️ ${who} נכשל ${span} ב-${otherFailures.length} פוסט(ים) — הם נשלחים באנגלית בלבד.\n` +
-        `סיבה אחרונה: <code>${htmlEscape(scrub(first?.error ?? "").slice(0, 300))}</code>\n` +
-        `פרטים: <code>npm run gemini-errors</code> (מפתח gemini-error:${first?.id} ב-KV).`,
+      `⚠️ התרגום לעברית נכשל ב-${otherFailures.length} פוסט(ים), והם נשלחו באנגלית.\n` +
+        "הפרטים הטכניים נשמרו בלוג (npm run gemini-errors).",
     );
   }
 

@@ -59,7 +59,13 @@ async function request(ctx: Ctx, method: string, payload: unknown): Promise<TgRe
   try {
     data = (await res.json()) as Record<string, unknown>;
   } catch {
-    return { ...empty, ok: false, errorCode: res.status, description: "non-JSON response", uncertain: res.status >= 500 };
+    return {
+      ...empty,
+      ok: false,
+      errorCode: res.status,
+      description: "non-JSON response",
+      uncertain: res.status >= 500,
+    };
   }
   const params = (data.parameters ?? {}) as Record<string, unknown>;
   const errorCode = Number(data.error_code ?? (res.ok ? 0 : res.status));
@@ -81,7 +87,14 @@ export async function telegramCall(
   payload: unknown,
   { idempotent = false, urgent = false } = {},
 ): Promise<TgResponse> {
-  let resp: TgResponse = { ok: false, errorCode: 0, description: "budget", retryAfter: 0, migrateTo: "", uncertain: false };
+  let resp: TgResponse = {
+    ok: false,
+    errorCode: 0,
+    description: "budget",
+    retryAfter: 0,
+    migrateTo: "",
+    uncertain: false,
+  };
   for (let attempt = 1; attempt <= TELEGRAM_ATTEMPTS; attempt++) {
     if (!ctx.budget.canFetch(1, { urgent })) return resp;
     resp = await request(ctx, method, payload);
@@ -137,10 +150,16 @@ export interface SendOptions {
   urgent?: boolean;
 }
 
-export async function sendMessage(ctx: Ctx, chatId: string, text: string, opts: SendOptions = {}): Promise<SendResult> {
+export async function sendMessage(
+  ctx: Ctx,
+  chatId: string,
+  text: string,
+  opts: SendOptions = {},
+): Promise<SendResult> {
   const chunks = splitForTelegram(text);
   const urgent = opts.urgent ?? false;
-  if (!ctx.budget.canFetch(chunks.length + (opts.reserve ?? 0), { urgent })) return { status: "retry", migratedTo: "" };
+  if (!ctx.budget.canFetch(chunks.length + (opts.reserve ?? 0), { urgent }))
+    return { status: "retry", migratedTo: "" };
 
   let target = chatId;
   let migratedTo = "";

@@ -71,7 +71,10 @@ export function repostTarget(raw: string): string | null {
 
 /** Own words plus quoted words, after placeholder and re-post labels are dropped. */
 function meaningfulBlob(post: Post): string {
-  return [post.text, post.quote?.text ?? ""].filter((part) => isMeaningfulText(part)).join("\n").trim();
+  return [post.text, post.quote?.text ?? ""]
+    .filter((part) => isMeaningfulText(part))
+    .join("\n")
+    .trim();
 }
 
 /**
@@ -128,7 +131,8 @@ export function sameMediaRepostIds(posts: Post[]): string[] {
       return owner ? [owner] : [];
     });
     // Same file again, and this copy adds no words the earlier one lacked.
-    if (owners.length && (!blob || owners.some((owner) => meaningfulBlob(owner) === blob))) skip.push(post.id);
+    if (owners.length && (!blob || owners.some((owner) => meaningfulBlob(owner) === blob)))
+      skip.push(post.id);
     for (const url of videos) if (!seen.has(url)) seen.set(url, post);
   }
   return skip;

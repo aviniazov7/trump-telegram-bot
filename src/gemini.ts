@@ -16,20 +16,32 @@ Translation rules:
   literal such as "ישני עונג להכריז". Prefer the political and economic term
   Israeli media use. "Election Integrity" is not the calque "טוהר הבחירות":
   use the wording Israeli news uses. If no settled Hebrew term exists,
-  transliterate it into Hebrew and you may add the English in parentheses.
-  Do not leave the English phrase in place of the Hebrew.
+  transliterate it into Hebrew. Do not leave the English phrase in place of
+  the Hebrew, and do not add the English in parentheses after Hebrew terms.
+- Titles and set phrases: Attorney General = התובע הכללי (in the US:
+  שר המשפטים / התובע הכללי, never "גנרל"), Secretary of State = מזכיר
+  המדינה, Speaker = יו"ר בית הנבחרים, M.D. / Dr. = ד"ר before the name
+  (never "M.D." after it), "7th Congressional District" = המחוז השביעי לקונגרס.
+- Slogans are rendered by meaning, as Israeli media write them:
+  "NO TAX ON TIPS" = ביטול המס על טיפים, "NO TAX ON OVERTIME" = ביטול המס
+  על שעות נוספות, "MAKE AMERICA GREAT AGAIN" = להחזיר לאמריקה את גדולתה.
+- The signature "President DJT", "DONALD J. TRUMP" or "President Donald J.
+  Trump" is always written exactly: הנשיא דונלד ג'יי טראמפ (without
+  "President" when the original has only the name: דונלד ג'יי טראמפ).
 - The translation is Hebrew only. Never use Arabic letters or any other
   non-Hebrew script: no Arabic, no Arabic presentation forms, no Cyrillic,
   and no other alphabet mixed into a Hebrew word.
 - Do not mix English words into the Hebrew sentence. Latin script is allowed
-  only for stock tickers, hashtags, @handles, URLs, and the optional English
-  spelling of a proper name in parentheses.
+  only for stock tickers, hashtags, @handles, and URLs. Do not add English
+  in parentheses after names or terms.
 - Names of people, places, organizations, and media outlets: if Israeli media
   have a spelling, use it (Donald Trump = דונלד טראמפ, Joe Biden = ג'ו ביידן,
   Federal Reserve = הפדרל ריזרב). Otherwise transliterate the name into
-  Hebrew letters. You may add the original English spelling in parentheses,
-  for example ויווק רמאסוואמי (Vivek Ramaswamy). Never spell a name with
-  Arabic letters. Keep every name accurate.
+  Hebrew letters, for example ויווק רמאסוואמי, ג'ף בושאר. No English in
+  parentheses. Never spell a name with Arabic letters. Keep every name
+  accurate.
+- Translate to the very end of the post, including the signature. Never
+  stop mid-sentence.
 - Keep every number, percentage, dollar amount, and date accurate. Do not
   change, round, translate, or drop them. Keep stock tickers, hashtags,
   @handles, and URLs exactly as written.
@@ -78,11 +90,10 @@ these rules strictly:
 - Hebrew only. Arabic letters, extended Arabic, and Arabic presentation
   forms are forbidden. No other non-Hebrew script, and no English words
   mixed into the Hebrew sentence.
-- Transliterate every proper name into Hebrew letters. You may put the
-  English original in parentheses after the Hebrew name, for example
-  ויווק רמאסוואמי (Vivek Ramaswamy). Never spell a name with Arabic letters.
-- Latin script is allowed only inside those parentheses, and for a ticker,
-  hashtag, @handle, or URL.
+- Transliterate every proper name into Hebrew letters, for example
+  ויווק רמאסוואמי, with no English in parentheses. Never spell a name with
+  Arabic letters.
+- Latin script is allowed only for a ticker, hashtag, @handle, or URL.
 - Keep every number exactly as written.
 - The Hebrew must be grammatical and fluent. Do not repeat a broken literal.
 `;

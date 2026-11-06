@@ -246,14 +246,15 @@ describe("exactly one welcome", () => {
 
   it("returns 500 and accepts a redelivery when the first attempt throws", async () => {
     const update = msg("/start", privateChat);
-    const state = {
-      get: (...args: Parameters<KVNamespace["get"]>) => env.STATE.get(...args),
-      getWithMetadata: (...args: Parameters<KVNamespace["getWithMetadata"]>) =>
-        env.STATE.getWithMetadata(...args),
-      list: (...args: Parameters<KVNamespace["list"]>) => env.STATE.list(...args),
-      put: () => Promise.reject(new Error("KV put() limit exceeded")),
-      delete: (...args: Parameters<KVNamespace["delete"]>) => env.STATE.delete(...args),
-    } as unknown as KVNamespace;
+    // State writes go to the Coordinator; make them fail like a storage outage.
+    const real = env.COORDINATOR.getByName("cron");
+    const failing = new Proxy(real, {
+      get: (t, prop) =>
+        prop === "statePut"
+          ? () => Promise.reject(new Error("storage put() failed"))
+          : (t as unknown as Record<string | symbol, unknown>)[prop],
+    });
+    const coordinator = { getByName: () => failing } as unknown as typeof env.COORDINATOR;
     const tg = telegram();
     const path = await webhookPath(SECRET);
     const failed = await handleWebhook(
@@ -262,7 +263,7 @@ describe("exactly one welcome", () => {
         headers: { "X-Telegram-Bot-Api-Secret-Token": SECRET, "Content-Type": "application/json" },
         body: JSON.stringify(update),
       }),
-      { ...env, STATE: state },
+      { ...env, COORDINATOR: coordinator },
       { fetch: tg.fetch },
     );
     expect(failed.status).toBe(500);
