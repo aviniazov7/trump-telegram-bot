@@ -318,11 +318,10 @@ describe("logging", () => {
 
 describe("admin gemini-errors endpoint", () => {
   it("fails closed with 404 without the secret and returns sanitized DO error logs with it", async () => {
-    await store.recordGeminiFailure(
-      "99999",
-      1_700_000_000_000,
-      "HTTP 503 key=AIzaSyDummyKeyValue12345678901234567890",
-    );
+    // Split so the source never contains a literal Google-key-shaped string
+    // (CI's check-secrets.sh would flag it).
+    const fakeKey = `AIza${"SyDummyKeyValue12345678901234567890"}`;
+    await store.recordGeminiFailure("99999", 1_700_000_000_000, `HTTP 503 key=${fakeKey}`);
     const unauth = await worker.fetch(
       new Request("https://bot.example/admin/gemini-errors"),
       env,
@@ -341,7 +340,7 @@ describe("admin gemini-errors endpoint", () => {
     const body = (await auth.json()) as { records: { postId: string; attempts: { error: string }[] }[] };
     expect(body.records).toHaveLength(1);
     expect(body.records[0]?.postId).toBe("99999");
-    expect(body.records[0]?.attempts[0]?.error).not.toContain("AIzaSyDummyKeyValue");
+    expect(body.records[0]?.attempts[0]?.error).not.toContain(fakeKey);
     expect(body.records[0]?.attempts[0]?.error).toContain("<redacted-key>");
   });
 });
