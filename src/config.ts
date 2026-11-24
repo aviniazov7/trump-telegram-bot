@@ -27,6 +27,10 @@ export interface Config {
   workersAiModel: string;
   /** Per Gemini call, so one slow call can't eat the run. */
   geminiTimeoutMs: number;
+  /** Per Workers AI call (GLM-4.7-Flash needs ~20-30s on longer posts). */
+  workersAiTimeoutMs: number;
+  /** Last-resort chunked web translation fallback after Gemini + Workers AI fail. */
+  webTranslateFallback: boolean;
   /** Keep retrying Gemini (each run) this long before sending in English. */
   geminiRetryMs: number;
   staleAlertMinutes: number;
@@ -64,6 +68,8 @@ export function loadConfig(env: Env): Config {
       env.GEMINI_FALLBACK_MODEL === undefined ? "gemini-3.5-flash-lite" : str(env.GEMINI_FALLBACK_MODEL),
     workersAiModel: env.WORKERS_AI_MODEL === undefined ? DEFAULT_WORKERS_AI_MODEL : str(env.WORKERS_AI_MODEL),
     geminiTimeoutMs: int(env.GEMINI_TIMEOUT_SECONDS, 12) * 1000,
+    workersAiTimeoutMs: int(env.WORKERS_AI_TIMEOUT_SECONDS, 35) * 1000,
+    webTranslateFallback: str(env.WEB_TRANSLATE_FALLBACK).toLowerCase() === "true",
     geminiRetryMs: int(env.GEMINI_RETRY_MINUTES, 15) * 60_000,
     staleAlertMinutes: int(env.STALE_ALERT_MINUTES, 35),
     sourceFailureAlertRuns: int(env.SOURCE_FAILURE_ALERT_RUNS, 10),

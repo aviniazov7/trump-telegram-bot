@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chatGone, sendMessage, telegramCall } from "../src/telegram";
+import { chatGone, deleteMessage, editMessage, sendMessage, telegramCall } from "../src/telegram";
 import { TELEGRAM, json, testCtx, timeout } from "./helpers";
 
 const tgError = (code: number, description: string, parameters?: Record<string, unknown>) =>
@@ -34,7 +34,9 @@ describe("telegramCall", () => {
   });
 
   it("waits retry_after on 429, then retries", async () => {
-    const ctx = testCtx({ [TELEGRAM]: (_c, n) => (n === 0 ? tgError(429, "Too Many Requests", { retry_after: 7 }) : tgOk()) });
+    const ctx = testCtx({
+      [TELEGRAM]: (_c, n) => (n === 0 ? tgError(429, "Too Many Requests", { retry_after: 7 }) : tgOk()),
+    });
     expect((await telegramCall(ctx, "sendMessage", {})).ok).toBe(true);
     expect(ctx.sleeps).toEqual([7000]);
   });
@@ -72,7 +74,9 @@ describe("telegramCall", () => {
   });
 
   it("never logs the token or chat IDs", async () => {
-    const ctx = testCtx({ [TELEGRAM]: () => tgError(400, "Bad Request: upgraded", { migrate_to_chat_id: -1001234567890 }) });
+    const ctx = testCtx({
+      [TELEGRAM]: () => tgError(400, "Bad Request: upgraded", { migrate_to_chat_id: -1001234567890 }),
+    });
     const r = await telegramCall(ctx, "sendMessage", { chat_id: "5551234567" });
     expect(r.migrateTo).toBe("-1001234567890");
     const logs = ctx.log.lines.join("\n");
@@ -85,7 +89,11 @@ describe("telegramCall", () => {
 describe("sendMessage", () => {
   it("sends HTML with link previews off and the forum topic", async () => {
     const ctx = testCtx({ [TELEGRAM]: tgOk });
-    expect(await sendMessage(ctx, "1", "hi", { threadId: "77" })).toEqual({ status: "ok", migratedTo: "" });
+    expect(await sendMessage(ctx, "1", "hi", { threadId: "77" })).toEqual({
+      status: "ok",
+      migratedTo: "",
+      messageIds: [1],
+    });
     const body = JSON.parse(ctx.calls[0]?.body ?? "{}");
     expect(body).toMatchObject({ chat_id: "1", parse_mode: "HTML", message_thread_id: 77 });
     expect(ctx.calls[0]?.url).toBe("https://api.telegram.org/bottest-bot-token/sendMessage");
@@ -96,9 +104,13 @@ describe("sendMessage", () => {
     ["timed out", timeout, "uncertain"],
     ["5xx", () => tgError(500, "Internal"), "uncertain"],
     ["bad request", () => tgError(400, "Bad Request: can't parse entities"), "failed"],
-    ["network error", () => {
-      throw new TypeError("Network connection lost");
-    }, "retry"],
+    [
+      "network error",
+      () => {
+        throw new TypeError("Network connection lost");
+      },
+      "retry",
+    ],
     ["long 429", () => tgError(429, "Too Many Requests", { retry_after: 600 }), "retry"],
   ])("maps %s to %s", async (_name, handler, status) => {
     const ctx = testCtx({ [TELEGRAM]: handler });
@@ -107,14 +119,23 @@ describe("sendMessage", () => {
 
   it("follows a group migration and resends there once", async () => {
     const ctx = testCtx({
-      [TELEGRAM]: (_c, n) => (n === 0 ? tgError(400, "Bad Request: group chat was upgraded", { migrate_to_chat_id: -100777 }) : tgOk()),
+      [TELEGRAM]: (_c, n) =>
+        n === 0
+          ? tgError(400, "Bad Request: group chat was upgraded", { migrate_to_chat_id: -100777 })
+          : tgOk(),
     });
-    expect(await sendMessage(ctx, "-5", "hi")).toEqual({ status: "ok", migratedTo: "-100777" });
+    expect(await sendMessage(ctx, "-5", "hi")).toEqual({
+      status: "ok",
+      migratedTo: "-100777",
+      messageIds: [1],
+    });
     expect(JSON.parse(ctx.calls[1]?.body ?? "{}").chat_id).toBe("-100777");
   });
 
   it("marks a long message cut short as uncertain, so it isn't resent", async () => {
-    const ctx = testCtx({ [TELEGRAM]: (_c, n) => (n === 0 ? tgOk() : tgError(429, "Too Many Requests", { retry_after: 600 })) });
+    const ctx = testCtx({
+      [TELEGRAM]: (_c, n) => (n === 0 ? tgOk() : tgError(429, "Too Many Requests", { retry_after: 600 })),
+    });
     expect((await sendMessage(ctx, "1", "a\n".repeat(5000))).status).toBe("uncertain");
   });
 
@@ -122,5 +143,32 @@ describe("sendMessage", () => {
     const ctx = testCtx({ [TELEGRAM]: tgOk }, { maxSubrequests: 2 });
     expect((await sendMessage(ctx, "1", "hi", { reserve: 2 })).status).toBe("retry");
     expect(ctx.calls).toHaveLength(0);
+  });
+});
+
+describe("editMessage & deleteMessage", () => {
+  it("edits a message and treats message-is-not-modified as ok", async () => {
+    const okCtx = testCtx({ [TELEGRAM]: tgOk });
+    expect(await editMessage(okCtx, "1", 42, "updated")).toBe("ok");
+    expect(JSON.parse(okCtx.calls[0]?.body ?? "{}")).toMatchObject({
+      chat_id: "1",
+      message_id: 42,
+      text: "updated",
+    });
+
+    const sameCtx = testCtx({ [TELEGRAM]: () => tgError(400, "Bad Request: message is not modified") });
+    expect(await editMessage(sameCtx, "1", 42, "same")).toBe("ok");
+  });
+
+  it("maps gone, retry, and failed edit responses properly", async () => {
+    const goneCtx = testCtx({ [TELEGRAM]: () => tgError(400, "Bad Request: message to edit not found") });
+    expect(await editMessage(goneCtx, "1", 42, "x")).toBe("gone");
+
+    const retryCtx = testCtx({ [TELEGRAM]: () => tgError(429, "Too Many Requests", { retry_after: 600 }) });
+    expect(await editMessage(retryCtx, "1", 42, "x")).toBe("retry");
+
+    const delCtx = testCtx({ [TELEGRAM]: tgOk });
+    await deleteMessage(delCtx, "1", 43);
+    expect(delCtx.calls[0]?.url).toContain("/deleteMessage");
   });
 });

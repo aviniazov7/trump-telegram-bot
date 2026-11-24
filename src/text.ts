@@ -20,7 +20,8 @@ const NAMED_ENTITIES: Record<string, string> = {
 export function htmlUnescape(text: string): string {
   return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, body: string) => {
     if (body[0] === "#") {
-      const code = body[1] === "x" || body[1] === "X" ? Number.parseInt(body.slice(2), 16) : Number(body.slice(1));
+      const code =
+        body[1] === "x" || body[1] === "X" ? Number.parseInt(body.slice(2), 16) : Number(body.slice(1));
       return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : match;
     }
     return NAMED_ENTITIES[body.toLowerCase()] ?? match;
@@ -54,7 +55,10 @@ export function isRepostBoilerplateLine(line: string): boolean {
 /** Drop re-post labels, leaving any real commentary on the other lines. */
 export function stripRepostBoilerplate(text: string): string {
   const kept = text.split("\n").filter((line) => !isRepostBoilerplateLine(line));
-  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return kept
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 /** Remove HTML tags and URLs from a feed post, keeping line structure. */

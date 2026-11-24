@@ -22,8 +22,8 @@ import type { Ctx } from "./runtime";
 import { contains, fetchPosts, type Post, pureRepostIds, sameMediaRepostIds } from "./sources";
 import { KvWriteError, type Meta, type Store, type Subscriber } from "./store";
 import { analyzePost, type PostAnalysis } from "./tagging";
-import { sendMessage, telegramCall } from "./telegram";
-import { htmlEscape, isMeaningfulText, splitForTelegram } from "./text";
+import { deleteMessage, editMessage, sendMessage, telegramCall } from "./telegram";
+import { isMeaningfulText, splitForTelegram } from "./text";
 
 /** Give up on chats still failing this long after a post was first attempted. */
 export const POST_RETRY_WINDOW_MS = 60 * 60 * 1000;
@@ -66,9 +66,22 @@ interface Prepared {
   post: Post;
   message: string;
   impact: PostAnalysis["impact"];
+  translated: boolean;
 }
 
 type DeliveryOutcome = "done" | "retry-later" | "out-of-budget";
+interface DeliveredMessage {
+  chatId: string;
+  threadId: string | null;
+  messageIds: number[];
+}
+interface DeliveryResult {
+  outcome: DeliveryOutcome;
+  delivered: DeliveredMessage[];
+}
+const REPAIR_WINDOW_MS = 24 * 60 * 60 * 1000;
+const REPAIR_MAX_ATTEMPTS = 20;
+const REPAIR_MAX_PER_RUN = 2;
 
 /** A post with no words needs no translation, tags or Gemini call. */
 const MEDIA_ONLY: PostAnalysis = {
@@ -105,13 +118,13 @@ async function deliverPost(
   store: Store,
   item: Prepared,
   targets: Target[],
-): Promise<DeliveryOutcome> {
+): Promise<DeliveryResult> {
   const id = item.post.id;
   const perSend = splitForTelegram(item.message).length;
   const room = Math.floor(
     (ctx.budget.maxSubrequests - ctx.budget.subrequestsUsed - RESERVED_SUBREQUESTS) / perSend,
   );
-  if (room <= 0 || ctx.budget.timeUp()) return "out-of-budget";
+  if (room <= 0 || ctx.budget.timeUp()) return { outcome: "out-of-budget", delivered: [] };
 
   const claimed = new Set(
     await store.claimSends(
@@ -121,7 +134,7 @@ async function deliverPost(
     ),
   );
   const todo = targets.filter((t) => claimed.has(t.logKey));
-  if (!todo.length) return "done";
+  if (!todo.length) return { outcome: "done", delivered: [] };
   const batch = todo.slice(0, room);
 
   const updates: Record<string, string | null> = {};
@@ -130,6 +143,7 @@ async function deliverPost(
   let retryLater = false;
   let stopped = false;
   let kvError: KvWriteError | null = null;
+  const delivered: DeliveredMessage[] = [];
   for (const target of batch) {
     if (stopped || ctx.budget.timeUp()) {
       // Claimed but not attempted: release it for the next run.
@@ -146,6 +160,13 @@ async function deliverPost(
       retryLater = true;
     } else {
       updates[target.logKey] = result.status;
+      if (result.status === "ok" && result.messageIds.length) {
+        delivered.push({
+          chatId: result.migratedTo || target.chatId,
+          threadId: target.threadId,
+          messageIds: result.messageIds,
+        });
+      }
     }
     try {
       if (!ctx.cfg.dryRun && result.migratedTo) {
@@ -172,8 +193,8 @@ async function deliverPost(
   await store.recordSends(id, updates, ctx.now()); // KV mirror throws KvWriteError; the claim stands
   if (kvError) throw kvError;
 
-  if (stopped || batch.length < todo.length) return "out-of-budget";
-  return retryLater ? "retry-later" : "done";
+  if (stopped || batch.length < todo.length) return { outcome: "out-of-budget", delivered };
+  return { outcome: retryLater ? "retry-later" : "done", delivered };
 }
 
 /** Who receives posts this run. In dry run: only the admin, as a preview. */
@@ -273,8 +294,10 @@ async function runSteps(ctx: Ctx, store: Store, meta: Meta, persist: () => Promi
   }
 
   const todo = fresh.filter((p) => !meta.sentAhead.includes(p.id));
+  const justSent = new Set<string>();
   if (todo.length || meta.openDigest.length)
-    await deliverNewPosts(ctx, store, meta, todo, chronological, posts, persist);
+    await deliverNewPosts(ctx, store, meta, todo, chronological, posts, persist, justSent);
+  await repairPendingMessages(ctx, store, justSent);
   await recordSuccess(ctx, store, meta);
 }
 
@@ -299,6 +322,7 @@ async function deliverNewPosts(
   chronological: string[],
   allPosts: Post[],
   persist: () => Promise<void>,
+  justSent: Set<string>,
 ) {
   const readable = (post: Post) => isMeaningfulText(translatableText(post));
   const textual = todo.filter(readable);
@@ -342,7 +366,10 @@ async function deliverNewPosts(
         // Waiting is pointless when every model is out of daily quota.
         // An echo will not become Hebrew on the next run. A 429 or a 5xx might,
         // and so might Workers AI, so those keep the retry window.
-        if (ctx.cfg.geminiApiKey && !fresh.quotaExhausted && !fresh.deterministic && waited < ctx.cfg.geminiRetryMs) {
+        // A daily-quota 429 also waits one retry window: the fallback model or a
+        // quota reset may answer next run, and subscribers prefer Hebrew late
+        // over English now. Only an echo (deterministic) is sent at once.
+        if (ctx.cfg.geminiApiKey && !fresh.deterministic && waited < ctx.cfg.geminiRetryMs) {
           ctx.log.warn(
             `Post ${post.id}: no translation yet (${fresh.geminiError}) — retrying next run ` +
               `(${Math.floor(waited / 60_000)}/${ctx.cfg.geminiRetryMs / 60_000} min)`,
@@ -366,7 +393,7 @@ async function deliverNewPosts(
     }
     let message = buildMessage(post, analysis);
     if (ctx.cfg.dryRun) message = `🧪 <b>DRY RUN</b> — היה נשלח ל-${subscriberCount} מנויים:\n\n${message}`;
-    prepared.push({ post, message, impact: analysis.impact });
+    prepared.push({ post, message, impact: analysis.impact, translated: analysis.translated });
   }
   const quotaOut = gaveUp.filter((g) => g.quota);
   if (quotaOut.length) {
@@ -382,18 +409,14 @@ async function deliverNewPosts(
   const otherFailures = gaveUp.filter((g) => !g.quota);
   if (otherFailures.length) {
     const [first] = otherFailures;
-    const triedWorkersAi = otherFailures.some((failure) => failure.error.includes("workers-ai"));
-    const who = triedWorkersAi ? "Gemini ו-Workers AI" : "Gemini";
-    const span = otherFailures.every((failure) => failure.immediate)
-      ? "בניסיון אחד"
-      : `במשך ${ctx.cfg.geminiRetryMs / 60_000} דק׳`;
+    // Raw provider errors stay in the log, never in a Telegram chat.
+    ctx.log.error(`Translation gave up on ${first?.id}: ${scrub(first?.error ?? "")}`);
     await alertAdmin(
       ctx,
       store,
       "translation",
-      `⚠️ ${who} נכשל ${span} ב-${otherFailures.length} פוסט(ים) — הם נשלחים באנגלית בלבד.\n` +
-        `סיבה אחרונה: <code>${htmlEscape(scrub(first?.error ?? "").slice(0, 300))}</code>\n` +
-        `פרטים: <code>npm run gemini-errors</code> (מפתח gemini-error:${first?.id} ב-KV).`,
+      `⚠️ התרגום לעברית נכשל ב-${otherFailures.length} פוסט(ים), והם נשלחו באנגלית.\n` +
+        "הפרטים הטכניים נשמרו בלוג ב-Cloudflare.",
     );
   }
 
@@ -403,7 +426,21 @@ async function deliverNewPosts(
     meta.pending[id] ??= ctx.now();
     if (item.impact === "high") ctx.log.info(`Post ${id} is high-impact — sending first`);
 
-    const outcome = await deliverPost(ctx, store, item, targets);
+    const { outcome, delivered } = await deliverPost(ctx, store, item, targets);
+    if (!item.translated && delivered.length) {
+      justSent.add(id);
+      const existing = await store.getRepair(id);
+      const messages = { ...(existing?.messages ?? {}) };
+      for (const d of delivered) messages[d.chatId] = { threadId: d.threadId, messageIds: d.messageIds };
+      await store.putRepair({
+        post: item.post,
+        dryRun: ctx.cfg.dryRun,
+        subscriberCount,
+        sentAt: existing?.sentAt ?? ctx.now(),
+        attempts: existing?.attempts ?? 0,
+        messages,
+      });
+    }
 
     const expired = ctx.now() - (meta.pending[id] ?? ctx.now()) > POST_RETRY_WINDOW_MS;
     if (outcome === "done" || (outcome === "retry-later" && expired)) {
@@ -486,12 +523,13 @@ async function deliverTextless(
     post: { id: digestId, text: "", createdAt: chosen[0]?.createdAt ?? "", url: "" },
     message,
     impact: null,
+    translated: true,
   };
   if (meta.pending[digestId] === undefined) {
     meta.pending[digestId] = ctx.now();
     await persist();
   }
-  const outcome = await deliverPost(ctx, store, item, targets);
+  const { outcome } = await deliverPost(ctx, store, item, targets);
   const expired = ctx.now() - (meta.pending[digestId] ?? ctx.now()) > POST_RETRY_WINDOW_MS;
   if (outcome === "done" || (outcome === "retry-later" && expired)) {
     if (outcome !== "done")
@@ -502,5 +540,113 @@ async function deliverTextless(
     await persist();
   } else if (outcome === "out-of-budget") {
     ctx.log.info(`Run budget used up on media digest ${digestId} — continuing next run`);
+  }
+}
+
+/**
+ * Retry translation for posts that fell back to English earlier, and edit
+ * the sent Telegram messages in place with the Hebrew translation.
+ */
+async function repairPendingMessages(ctx: Ctx, store: Store, justSent: Set<string>): Promise<void> {
+  const repairs = await store.listRepairs();
+  if (!repairs.length) return;
+
+  let handled = 0;
+  for (const repair of repairs) {
+    if (handled >= REPAIR_MAX_PER_RUN) break;
+    const id = repair.post.id;
+    if (
+      ctx.now() - repair.sentAt > REPAIR_WINDOW_MS ||
+      repair.attempts >= REPAIR_MAX_ATTEMPTS ||
+      !Object.keys(repair.messages).length
+    ) {
+      await store.deleteRepair(id);
+      continue;
+    }
+    if (justSent.has(id)) continue;
+    if (ctx.budget.timeUp() || !ctx.budget.canFetch(2 + RESERVED_SUBREQUESTS)) break;
+
+    const text = translatableText(repair.post);
+    if (!text) {
+      await store.deleteRepair(id);
+      continue;
+    }
+    handled += 1;
+    const prior = await store.getGeminiFailures(id);
+    const fresh = await analyzePost(
+      ctx,
+      text,
+      {
+        exhausted: (model) => store.geminiQuotaExhausted(model),
+        markExhausted: (model, reason, seconds) => store.markGeminiQuotaExhausted(model, reason, seconds),
+      },
+      prior?.attempts.at(-1)?.error ?? "",
+    );
+    if (fresh.outOfTime) break;
+    if (!fresh.translated) {
+      await store.recordGeminiFailure(id, ctx.now(), fresh.geminiError ?? "unknown");
+      repair.attempts += 1;
+      if (repair.attempts >= REPAIR_MAX_ATTEMPTS || fresh.deterministic) {
+        await store.deleteRepair(id);
+      } else {
+        await store.putRepair(repair);
+      }
+      continue;
+    }
+
+    if (fresh.geminiError) await store.recordGeminiFailure(id, ctx.now(), fresh.geminiError);
+    await store.putAnalysis(id, fresh);
+
+    let message = buildMessage(repair.post, fresh);
+    if (repair.dryRun)
+      message = `🧪 <b>DRY RUN</b> — היה נשלח ל-${repair.subscriberCount} מנויים:\n\n${message}`;
+    const chunks = splitForTelegram(message);
+
+    for (const [chatId, info] of Object.entries(repair.messages)) {
+      if (ctx.budget.timeUp() || !ctx.budget.canFetch(chunks.length + RESERVED_SUBREQUESTS)) break;
+      if (chunks.length > info.messageIds.length) {
+        delete repair.messages[chatId];
+        continue;
+      }
+      let allDone = true;
+      let stoppedOnBudget = false;
+      for (const [i, chunk] of chunks.entries()) {
+        const messageId = info.messageIds[i];
+        if (messageId === undefined) {
+          allDone = false;
+          break;
+        }
+        const status = await editMessage(ctx, chatId, messageId, chunk, { reserve: RESERVED_SUBREQUESTS });
+        if (status === "retry") {
+          allDone = false;
+          stoppedOnBudget = true;
+          break;
+        }
+        if (status === "gone") {
+          delete repair.messages[chatId];
+          allDone = false;
+          break;
+        }
+        if (status === "failed") {
+          allDone = false;
+        }
+      }
+      if (allDone) {
+        for (const extraId of info.messageIds.slice(chunks.length)) {
+          await deleteMessage(ctx, chatId, extraId);
+        }
+        delete repair.messages[chatId];
+        await ctx.sleep(40);
+      } else if (stoppedOnBudget) {
+        break;
+      }
+    }
+
+    if (Object.keys(repair.messages).length === 0) {
+      await store.deleteRepair(id);
+      ctx.log.info(`Repaired English post ${id} with Hebrew translation`);
+    } else {
+      await store.putRepair(repair);
+    }
   }
 }

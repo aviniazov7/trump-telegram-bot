@@ -17,8 +17,9 @@ You translate Donald Trump's Truth Social posts into natural, fluent Israeli Heb
 Translate the whole post completely. Do not summarize, omit, add, or comment.
 Do not translate word for word. "I am pleased to announce" is "אני שמח להודיע".
 The translation is Hebrew only. Never use Arabic or any other non-Hebrew script.
-Transliterate proper names into Hebrew (Donald Trump = דונלד טראמפ). You may add the English original in parentheses.
-Do not mix English words into the Hebrew except for those parentheses, tickers, hashtags, @handles, and URLs.
+Transliterate proper names into Hebrew (Donald Trump = דונלד טראמפ), with no English in parentheses.
+Attorney General = התובע הכללי; M.D. = ד"ר before the name; NO TAX ON TIPS = ביטול המס על טיפים; the signature DONALD J. TRUMP = דונלד ג'יי טראמפ (President Donald J. Trump = הנשיא דונלד ג'יי טראמפ).
+Do not mix English words into the Hebrew except for tickers, hashtags, @handles, and URLs. Translate to the end.
 Keep line breaks, numbers, and dates unchanged, and keep every name and number accurate.
 Return only the Hebrew translation. No JSON, no quotes, no preamble.
 `;
@@ -33,8 +34,8 @@ export function bindWorkersAi(ai: Ai): WorkersAiClient {
         messages: input.messages,
         temperature: input.temperature,
         max_completion_tokens: input.max_completion_tokens,
-        chat_template_kwargs: input.chat_template_kwargs,
       };
+      if (input.chat_template_kwargs !== undefined) body.chat_template_kwargs = input.chat_template_kwargs;
       return ai.run(model, body, options);
     },
   };
@@ -98,11 +99,16 @@ export function extractWorkersAiText(result: unknown): { text: string; truncated
  * Translate one post. Throws WorkersAiError on timeout, truncation, or a
  * missing binding. The caller decides whether that is fatal.
  */
-export async function workersAiTranslate(ctx: Ctx, text: string): Promise<string> {
+const THINKING_AI_MODEL_RE = /glm-4|qwen3|gemma-4|deepseek/i;
+
+export async function workersAiTranslate(
+  ctx: Ctx,
+  text: string,
+  model = ctx.cfg.workersAiModel.split(",")[0]?.trim() ?? "",
+): Promise<string> {
   const ai = ctx.ai;
-  const model = ctx.cfg.workersAiModel;
   if (!ai || !model) throw new WorkersAiError("Workers AI is not configured");
-  const timeoutMs = Math.min(ctx.cfg.geminiTimeoutMs, ctx.budget.msLeft() - TIME_RESERVE_MS);
+  const timeoutMs = Math.min(ctx.cfg.workersAiTimeoutMs, ctx.budget.msLeft() - TIME_RESERVE_MS);
   if (timeoutMs < 2_000 || !ctx.budget.canFetch()) throw new WorkersAiError("no time left in this run");
   let result: unknown;
   try {
@@ -116,9 +122,9 @@ export async function workersAiTranslate(ctx: Ctx, text: string): Promise<string
         ],
         temperature: 0.2,
         max_completion_tokens: WORKERS_AI_MAX_TOKENS,
-        // On by default for this model. The chain of thought is not the
-        // translation, and it spends the free neuron allowance.
-        chat_template_kwargs: { enable_thinking: false },
+        // Disable chain-of-thought on reasoning models so they stay fast and
+        // inside the free daily neuron allowance.
+        ...(THINKING_AI_MODEL_RE.test(model) ? { chat_template_kwargs: { enable_thinking: false } } : {}),
       },
       { signal: AbortSignal.timeout(timeoutMs) },
     );

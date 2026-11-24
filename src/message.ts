@@ -139,14 +139,7 @@ export function buildMessage(post: Post, parts: MessageParts): string {
     .join("\n\n");
   const hebrewBlock = parts.translated
     ? `🇮🇱 <b>תרגום לעברית:</b>\n${htmlEscape(parts.hebrew)}\n`
-    : "⚠️ <b>התרגום לעברית נכשל כרגע — הפוסט מוצג באנגלית בלבד.</b>\n";
+    : "⚠️ התרגום לעברית אינו זמין כרגע.\n";
   const tagLine = buildTagLine(parts.categories, parts.impact);
-  return (
-    (tagLine ? `${tagLine}\n` : "") +
-    header +
-    `${original}\n\n` +
-    "━━━━━━━━━━━━━━━\n\n" +
-    hebrewBlock +
-    link
-  );
+  return `${tagLine ? `${tagLine}\n` : ""}${header}${original}\n\n━━━━━━━━━━━━━━━\n\n${hebrewBlock}${link}`;
 }

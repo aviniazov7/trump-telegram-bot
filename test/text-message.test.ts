@@ -63,17 +63,24 @@ describe("buildMessage", () => {
     expect(lines[1]).toBe("🕐 10/10/2026 21:59"); // UTC+3 in October
     expect(msg).toContain("Tariffs &lt;now&gt; &amp; &quot;forever&quot;");
     expect(msg).toContain("🇮🇱 <b>תרגום לעברית:</b>\nמכסים &lt;עכשיו&gt;");
-    expect(msg.endsWith('<a href="https://truthsocial.com/@realDonaldTrump/1?a=1&amp;b=2">לפוסט המקורי</a>')).toBe(true);
+    expect(
+      msg.endsWith('<a href="https://truthsocial.com/@realDonaldTrump/1?a=1&amp;b=2">לפוסט המקורי</a>'),
+    ).toBe(true);
   });
 
   it("shows a notice instead of English under the Hebrew heading", () => {
     const msg = buildMessage(POST, { hebrew: POST.text, translated: false });
     expect(msg).not.toContain("תרגום לעברית:");
-    expect(msg).toContain("התרגום לעברית נכשל");
+    expect(msg).toContain("התרגום לעברית אינו זמין");
   });
 
   it("puts the tag line first", () => {
-    const msg = buildMessage(POST, { hebrew: "x", translated: true, categories: ["china", "tariffs"], impact: "high" });
+    const msg = buildMessage(POST, {
+      hebrew: "x",
+      translated: true,
+      categories: ["china", "tariffs"],
+      impact: "high",
+    });
     expect(msg.split("\n")[0]).toBe("🔴 <b>השפעה גבוהה על השווקים</b> · #סין #מכסים");
   });
 
@@ -123,7 +130,11 @@ describe("splitting", () => {
 
   it("falls back to spaces, then a hard cut", () => {
     expect(splitForTelegram(Array(500).fill("word").join(" "), 100).every((c) => c.length <= 100)).toBe(true);
-    expect(splitForTelegram("x".repeat(250), 100)).toEqual(["x".repeat(100), "x".repeat(100), "x".repeat(50)]);
+    expect(splitForTelegram("x".repeat(250), 100)).toEqual([
+      "x".repeat(100),
+      "x".repeat(100),
+      "x".repeat(50),
+    ]);
   });
 
   it("never cuts through an HTML tag in a long post", () => {
@@ -146,8 +157,14 @@ describe("splitting", () => {
   });
 
   it("splitText prefers newlines, then sentences, then a hard cut", () => {
-    expect(splitText(`${"a".repeat(60)}\n${"b".repeat(60)}`, 100)).toEqual([`${"a".repeat(60)}\n`, "b".repeat(60)]);
-    expect(splitText(`${"a".repeat(60)}. ${"b".repeat(60)}`, 100)).toEqual([`${"a".repeat(60)}.`, "b".repeat(60)]);
+    expect(splitText(`${"a".repeat(60)}\n${"b".repeat(60)}`, 100)).toEqual([
+      `${"a".repeat(60)}\n`,
+      "b".repeat(60),
+    ]);
+    expect(splitText(`${"a".repeat(60)}. ${"b".repeat(60)}`, 100)).toEqual([
+      `${"a".repeat(60)}.`,
+      "b".repeat(60),
+    ]);
     expect(splitText("x".repeat(250), 100)).toEqual(["x".repeat(100), "x".repeat(100), "x".repeat(50)]);
   });
 });

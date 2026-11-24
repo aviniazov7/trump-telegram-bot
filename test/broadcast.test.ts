@@ -19,7 +19,7 @@ import {
 } from "./helpers";
 
 const NOW = 1_800_000_000_000;
-const store = openStore(env);
+const store = openStore(env, env.STATE);
 
 beforeEach(async () => {
   for (const { name } of (await env.STATE.list()).keys) await env.STATE.delete(name);
@@ -30,6 +30,8 @@ beforeEach(async () => {
 /** A fake Telegram that records sends and can misbehave per chat. */
 class FakeTelegram {
   sent: { chat: string; text: string; thread?: number }[] = [];
+  edited: { chat: string; messageId: number; text: string }[] = [];
+  deleted: { chat: string; messageId: number }[] = [];
   behavior = new Map<string, (n: number) => Response>();
   methods: string[] = [];
   private counts = new Map<string, number>();
@@ -37,6 +39,16 @@ class FakeTelegram {
   handler: Handler = (call) => {
     const method = call.url.split("/").pop() ?? "";
     this.methods.push(method);
+    if (method === "editMessageText") {
+      const body = JSON.parse(call.body) as { chat_id: string; message_id: number; text: string };
+      this.edited.push({ chat: body.chat_id, messageId: body.message_id, text: body.text });
+      return json({ ok: true, result: { message_id: body.message_id } });
+    }
+    if (method === "deleteMessage") {
+      const body = JSON.parse(call.body) as { chat_id: string; message_id: number };
+      this.deleted.push({ chat: body.chat_id, messageId: body.message_id });
+      return json({ ok: true, result: true });
+    }
     if (method !== "sendMessage") return json({ ok: true, result: true });
     const body = JSON.parse(call.body) as { chat_id: string; text: string; message_thread_id?: number };
     const n = this.counts.get(body.chat_id) ?? 0;
@@ -182,7 +194,7 @@ describe("Gemini failures", () => {
     return json(geminiAnswer({ hebrew: `תרגום של פוסט number-${id}`, categories: ["other"], impact: "low" }));
   };
   const alerts = (tg: FakeTelegram) =>
-    tg.sent.filter((s) => s.chat === "999" && s.text.includes("Gemini נכשל"));
+    tg.sent.filter((s) => s.chat === "999" && s.text.includes("התרגום לעברית נכשל"));
   const runAt = async (minutes: number, gemini: Handler) => {
     const s = setup({ feed: ["2", "1"], now: NOW + minutes * MIN, gemini });
     await s.run();
@@ -197,9 +209,11 @@ describe("Gemini failures", () => {
     }
     const last = await runAt(15, fail);
     expect(last.tg.postsTo("a")).toEqual(["2"]);
-    expect(last.tg.sent.find((s) => s.chat === "a")?.text).toContain("התרגום לעברית נכשל");
+    expect(last.tg.sent.find((s) => s.chat === "a")?.text).toContain("התרגום לעברית אינו זמין");
     expect(alerts(last.tg)).toHaveLength(1);
-    expect(alerts(last.tg)[0]?.text).toContain("overloaded");
+    // The raw provider error stays in the log, not in the chat.
+    expect(alerts(last.tg)[0]?.text).not.toContain("overloaded");
+    expect(alerts(last.tg)[0]?.text).not.toMatch(/HTTP|\b429\b|skipped/);
 
     const record = await store.getGeminiFailures("2");
     expect(record?.firstFailureAt).toBe(NOW);
@@ -295,7 +309,9 @@ describe("caption-less videos", () => {
     const ctx = testCtx(
       {
         [RSS_HOST]: () =>
-          new Response(videoRss([videoItem("2", "Wed, 14 Oct 2026 05:18:04 +0000"), textItem("1", "Older post")])),
+          new Response(
+            videoRss([videoItem("2", "Wed, 14 Oct 2026 05:18:04 +0000"), textItem("1", "Older post")]),
+          ),
         [TELEGRAM]: tg.handler,
         [CNN_HOST]: () => new Response("[]"),
       },
@@ -339,7 +355,8 @@ describe("caption-less videos", () => {
     expect(text).toContain("14/10/2026 08:18–08:20");
     expect(text).not.toContain("ללא טקסט");
     expect(text).not.toContain("View video");
-    for (const id of ["2", "3", "4", "5"]) expect(text).toContain(`https://truthsocial.com/@realDonaldTrump/${id}`);
+    for (const id of ["2", "3", "4", "5"])
+      expect(text).toContain(`https://truthsocial.com/@realDonaldTrump/${id}`);
     expect(ctx.hosts()).not.toContain(GEMINI);
     expect((await store.getMeta()).lastSeen).toBe("5");
     expect((await store.getMeta()).openDigest).toEqual([]);
@@ -511,13 +528,18 @@ describe("content-less reposts", () => {
     const { tg, ctx } = await deliverBoost(() => new Response("overloaded", { status: 503 }));
     expect(tg.sent.filter((s) => s.chat === "a" || s.chat === "999")).toEqual([]);
     expect(ctx.hosts()).not.toContain(GEMINI);
-    expect(tg.sent.some((s) => s.text.includes("התרגום לעברית נכשל"))).toBe(false);
+    expect(tg.sent.some((s) => s.text.includes("התרגום לעברית אינו זמין"))).toBe(false);
   });
 
   it("translates quoted words when the original post is not in the window", async () => {
     await seed("1", ["a"]);
     const xml = videoRss([
-      boostItem("201", "999", "<p>The Democrats are destroying our country.</p>", "Wed, 14 Oct 2026 06:19:28 +0000"),
+      boostItem(
+        "201",
+        "999",
+        "<p>The Democrats are destroying our country.</p>",
+        "Wed, 14 Oct 2026 06:19:28 +0000",
+      ),
       textItem("1", "Older post"),
     ]);
     const tg = new FakeTelegram();
@@ -530,7 +552,13 @@ describe("content-less reposts", () => {
           const text = JSON.parse(call.body).contents[0].parts[0].text as string;
           expect(text).toContain("The Democrats are destroying our country.");
           expect(text).not.toContain("Reposted");
-          return json(geminiAnswer({ hebrew: "הדמוקרטים הורסים את המדינה שלנו.", categories: ["other"], impact: "low" }));
+          return json(
+            geminiAnswer({
+              hebrew: "הדמוקרטים הורסים את המדינה שלנו.",
+              categories: ["other"],
+              impact: "low",
+            }),
+          );
         },
       },
       { maxSubrequests: 200 },
@@ -541,7 +569,7 @@ describe("content-less reposts", () => {
     expect(text).toContain("The Democrats are destroying our country.");
     expect(text).toContain("הדמוקרטים הורסים את המדינה שלנו.");
     expect(text).not.toContain("Reposted");
-    expect(text).not.toContain("התרגום לעברית נכשל");
+    expect(text).not.toContain("התרגום לעברית אינו זמין");
   });
 });
 
@@ -579,7 +607,7 @@ describe("Workers AI fallback", () => {
     await run();
     const text = tg.sent.find((s) => s.chat === "a")?.text ?? "";
     expect(text).toContain(HEBREW);
-    expect(text).not.toContain("התרגום לעברית נכשל");
+    expect(text).not.toContain("התרגום לעברית אינו זמין");
     expect(tg.sent.filter((s) => s.chat === "999")).toEqual([]);
     expect(workers.count()).toBe(1);
     expect(await store.getAnalysis("2")).toMatchObject({ provider: "workers-ai", translated: true });
@@ -591,7 +619,7 @@ describe("Workers AI fallback", () => {
     const { tg, run } = setup({ feed: ["2", "1"], gemini: daily, ai: workers.ai });
     await run();
     expect(tg.sent.find((s) => s.chat === "a")?.text).toContain(HEBREW);
-    expect(tg.sent.some((s) => s.text.includes("התרגום לעברית נכשל"))).toBe(false);
+    expect(tg.sent.some((s) => s.text.includes("התרגום לעברית אינו זמין"))).toBe(false);
     expect(tg.sent.some((s) => s.text.includes("המכסה היומית"))).toBe(false);
     expect(workers.count()).toBe(1);
   });
@@ -602,10 +630,10 @@ describe("Workers AI fallback", () => {
     const { tg, run } = setup({ feed: ["2", "1"], gemini: echo, ai: workers.ai });
     await run();
     const text = tg.sent.find((s) => s.chat === "a")?.text ?? "";
-    expect(text).toContain("התרגום לעברית נכשל");
+    expect(text).toContain("התרגום לעברית אינו זמין");
     const alert = tg.sent.find((s) => s.chat === "999");
-    expect(alert?.text).toContain("Workers AI");
-    expect(alert?.text).toContain("untranslated text");
+    expect(alert?.text).toContain("התרגום לעברית נכשל");
+    expect(alert?.text).not.toContain("untranslated text");
     expect(workers.count()).toBe(1);
     expect((await store.getMeta()).lastSeen).toBe("2");
   });
@@ -974,6 +1002,11 @@ describe("KV write failures", () => {
       claimUpdate: (updateId, now) => real.claimUpdate(updateId, now),
       releaseUpdate: (updateId) => real.releaseUpdate(updateId),
       reset: () => real.reset(),
+      stateGet: (k, now) => real.stateGet(k, now),
+      statePut: (k, e) => real.statePut(k, e),
+      stateList: (p, now) => real.stateList(p, now),
+      stateImported: (f) => real.stateImported(f),
+      stateImport: (f, e) => real.stateImport(f, e),
     };
     const { tg, ctx } = setup({ feed: ["2", "1"] });
     await expect(runCron(ctx, new Store(env.STATE, lock))).rejects.toThrow(/coordinator unavailable/);
@@ -1072,5 +1105,47 @@ describe("overlapping runs and pure re-posts", () => {
     expect(to("b")).toHaveLength(0);
     expect((await store.getMeta()).lastSeen).toBe(repost);
     expect((await store.getSendLog(repost)).a).toBeUndefined();
+  });
+});
+
+describe("post-send Hebrew repair", () => {
+  const MIN = 60_000;
+  const fail503 = () =>
+    new Response('{"error":{"code":503,"message":"The model is overloaded."}}', { status: 503 });
+
+  it("edits already-sent English fallback messages into Hebrew when translation recovers on a later run", async () => {
+    await seed("1", ["a", "b"]);
+    const first = setup({ feed: ["2", "1"], now: NOW, gemini: fail503 });
+    await first.run();
+    expect(first.tg.sent).toEqual([]);
+
+    // Past the 15-min retry window: sends English fallback and queues repair:2.
+    const second = setup({ feed: ["2", "1"], now: NOW + 15 * MIN, gemini: fail503 });
+    await second.run();
+    expect(second.tg.postsTo("a")).toEqual(["2"]);
+    expect(second.tg.postsTo("b")).toEqual(["2"]);
+    expect(second.tg.sent.find((s) => s.chat === "a")?.text).toContain("⚠️ התרגום לעברית אינו זמין כרגע.");
+    expect(second.tg.edited).toEqual([]);
+    const queued = await store.getRepair("2");
+    expect(queued).not.toBeNull();
+    expect(Object.keys(queued?.messages ?? {}).sort()).toEqual(["a", "b"]);
+
+    // Next cron run (idle feed, Gemini recovered): edits both messages in place without re-sending.
+    const third = setup({
+      feed: ["2", "1"],
+      now: NOW + 30 * MIN,
+      gemini: () =>
+        json(geminiAnswer({ hebrew: "תרגום משוחזר בעברית", categories: ["tariffs"], impact: "high" })),
+    });
+    await third.run();
+    expect(third.tg.sent).toEqual([]);
+    expect(third.tg.edited).toHaveLength(2);
+    for (const ed of third.tg.edited) {
+      expect(ed.text).toContain("תרגום משוחזר בעברית");
+      expect(ed.text).toContain("🔴");
+      expect(ed.text).not.toContain("⚠️ התרגום לעברית אינו זמין כרגע.");
+    }
+    expect(await store.getRepair("2")).toBeNull();
+    expect((await store.getAnalysis("2"))?.translated).toBe(true);
   });
 });

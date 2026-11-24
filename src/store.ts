@@ -1,5 +1,6 @@
 /**
- * Bot state in Workers KV.
+ * Bot state. Stored in the Coordinator Durable Object through a KV-shaped
+ * adapter (do-kv.ts); legacy Workers KV keys are only read, never written.
  *
  * Keys:
  *   meta                    cursor (lastSeen, sentAhead), posts in progress,
@@ -35,8 +36,10 @@
  * stops the run's sends immediately (see broadcast.ts).
  */
 import { RUN_LOCK_NAME, type RunLock } from "./coordinator";
+import { DoKV } from "./do-kv";
 import type { Env } from "./env";
 import type { Cursor } from "./posts";
+import type { Post } from "./sources";
 import type { PostAnalysis } from "./tagging";
 import type { SendStatus } from "./telegram";
 
@@ -97,6 +100,15 @@ export const GEMINI_ERROR_TTL_S = 7 * DAY_S;
 /** Attempts kept per post (newest last). */
 const GEMINI_ERROR_MAX_ATTEMPTS = 20;
 
+export interface PendingRepair {
+  post: Post;
+  dryRun: boolean;
+  subscriberCount: number;
+  sentAt: number;
+  attempts: number;
+  messages: Record<string, { threadId: string | null; messageIds: number[] }>;
+}
+
 export interface GeminiFailureRecord {
   postId: string;
   /** First failed attempt (ms) — the retry window counts from here. */
@@ -108,8 +120,14 @@ export interface GeminiFailureRecord {
 /** KV's minimum expirationTtl. */
 const MIN_TTL_S = 60;
 
-export function openStore(env: Env, kv: KVNamespace = env.STATE): Store {
-  return new Store(kv, env.COORDINATOR.getByName(RUN_LOCK_NAME));
+/**
+ * Default: state in the Coordinator Durable Object, with read-only fallback
+ * to legacy KV keys (see do-kv.ts). Passing `kv` uses that namespace directly
+ * (tests).
+ */
+export function openStore(env: Env, kv?: KVNamespace): Store {
+  const lock = env.COORDINATOR.getByName(RUN_LOCK_NAME);
+  return new Store(kv ?? (new DoKV(lock, env.STATE) as unknown as KVNamespace), lock);
 }
 
 export class Store {
@@ -235,6 +253,48 @@ export class Store {
     await this.write("analysis", () =>
       this.kv.put(`analysis:${postId}`, JSON.stringify(analysis), { expirationTtl: ANALYSIS_TTL_S }),
     );
+  }
+
+  async getRepair(postId: string): Promise<PendingRepair | null> {
+    return this.kv.get<PendingRepair>(`repair:${postId}`, "json");
+  }
+
+  async putRepair(repair: PendingRepair): Promise<void> {
+    await this.write("repair", () =>
+      this.kv.put(`repair:${repair.post.id}`, JSON.stringify(repair), { expirationTtl: GEMINI_ERROR_TTL_S }),
+    );
+  }
+
+  async deleteRepair(postId: string): Promise<void> {
+    await this.write("repair delete", () => this.kv.delete(`repair:${postId}`));
+  }
+
+  async listRepairs(): Promise<PendingRepair[]> {
+    const out: PendingRepair[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.kv.list({ prefix: "repair:", cursor });
+      for (const key of page.keys) {
+        const entry = await this.kv.get<PendingRepair>(key.name, "json");
+        if (entry) out.push(entry);
+      }
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+    return out.sort((a, b) => a.sentAt - b.sentAt);
+  }
+
+  async listGeminiFailures(): Promise<GeminiFailureRecord[]> {
+    const out: GeminiFailureRecord[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.kv.list({ prefix: "gemini-error:", cursor });
+      for (const key of page.keys) {
+        const entry = await this.kv.get<GeminiFailureRecord>(key.name, "json");
+        if (entry) out.push(entry);
+      }
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+    return out.sort((a, b) => b.firstFailureAt - a.firstFailureAt);
   }
 
   async getGeminiFailures(postId: string): Promise<GeminiFailureRecord | null> {

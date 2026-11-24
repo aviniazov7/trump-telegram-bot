@@ -246,14 +246,15 @@ describe("exactly one welcome", () => {
 
   it("returns 500 and accepts a redelivery when the first attempt throws", async () => {
     const update = msg("/start", privateChat);
-    const state = {
-      get: (...args: Parameters<KVNamespace["get"]>) => env.STATE.get(...args),
-      getWithMetadata: (...args: Parameters<KVNamespace["getWithMetadata"]>) =>
-        env.STATE.getWithMetadata(...args),
-      list: (...args: Parameters<KVNamespace["list"]>) => env.STATE.list(...args),
-      put: () => Promise.reject(new Error("KV put() limit exceeded")),
-      delete: (...args: Parameters<KVNamespace["delete"]>) => env.STATE.delete(...args),
-    } as unknown as KVNamespace;
+    // State writes go to the Coordinator; make them fail like a storage outage.
+    const real = env.COORDINATOR.getByName("cron");
+    const failing = new Proxy(real, {
+      get: (t, prop) =>
+        prop === "statePut"
+          ? () => Promise.reject(new Error("storage put() failed"))
+          : (t as unknown as Record<string | symbol, unknown>)[prop],
+    });
+    const coordinator = { getByName: () => failing } as unknown as typeof env.COORDINATOR;
     const tg = telegram();
     const path = await webhookPath(SECRET);
     const failed = await handleWebhook(
@@ -262,7 +263,7 @@ describe("exactly one welcome", () => {
         headers: { "X-Telegram-Bot-Api-Secret-Token": SECRET, "Content-Type": "application/json" },
         body: JSON.stringify(update),
       }),
-      { ...env, STATE: state },
+      { ...env, COORDINATOR: coordinator },
       { fetch: tg.fetch },
     );
     expect(failed.status).toBe(500);
@@ -312,5 +313,34 @@ describe("logging", () => {
     const output = logs.join("\n");
     expect(output).toContain("chat#");
     for (const secret of ["5551234567", "test-bot-token", SECRET]) expect(output).not.toContain(secret);
+  });
+});
+
+describe("admin gemini-errors endpoint", () => {
+  it("fails closed with 404 without the secret and returns sanitized DO error logs with it", async () => {
+    // Split so the source never contains a literal Google-key-shaped string
+    // (CI's check-secrets.sh would flag it).
+    const fakeKey = `AIza${"SyDummyKeyValue12345678901234567890"}`;
+    await store.recordGeminiFailure("99999", 1_700_000_000_000, `HTTP 503 key=${fakeKey}`);
+    const unauth = await worker.fetch(
+      new Request("https://bot.example/admin/gemini-errors"),
+      env,
+      {} as ExecutionContext,
+    );
+    expect(unauth.status).toBe(404);
+
+    const auth = await worker.fetch(
+      new Request("https://bot.example/admin/gemini-errors", {
+        headers: { "X-Telegram-Bot-Api-Secret-Token": SECRET },
+      }),
+      env,
+      {} as ExecutionContext,
+    );
+    expect(auth.status).toBe(200);
+    const body = (await auth.json()) as { records: { postId: string; attempts: { error: string }[] }[] };
+    expect(body.records).toHaveLength(1);
+    expect(body.records[0]?.postId).toBe("99999");
+    expect(body.records[0]?.attempts[0]?.error).not.toContain(fakeKey);
+    expect(body.records[0]?.attempts[0]?.error).toContain("<redacted-key>");
   });
 });

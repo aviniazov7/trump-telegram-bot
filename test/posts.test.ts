@@ -188,8 +188,7 @@ describe("sources", () => {
         <blockquote>${quote}</blockquote>]]></description>
         <truth:originalId>${id}</truth:originalId>
         <archive:reference originalId="${original}"></archive:reference></item>`;
-    const video =
-      `<item><title>Video post from October 14, 2026</title>
+    const video = `<item><title>Video post from October 14, 2026</title>
         <description><![CDATA[<p></p><p><a href="${file}">View video</a></p>]]></description>
         <truth:originalId>${original}</truth:originalId></item>`;
     const wordless = parseRss(
@@ -336,7 +335,9 @@ describe("fetchPosts", () => {
   });
 
   it("keeps a caption the other source has when the first copy is a bare video", () => {
-    const rss = [{ ...post("2"), text: "", media: ["video" as const], mediaUrls: ["https://archive.example/a.mp4"] }];
+    const rss = [
+      { ...post("2"), text: "", media: ["video" as const], mediaUrls: ["https://archive.example/a.mp4"] },
+    ];
     const cnn = [{ ...post("2"), text: "Caption from the archive" }];
     expect(mergePosts(rss, cnn)[0]?.text).toBe("Caption from the archive");
     expect(mergePosts(rss, cnn)[0]?.mediaUrls).toEqual(["https://archive.example/a.mp4"]);

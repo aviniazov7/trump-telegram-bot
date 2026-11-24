@@ -59,7 +59,13 @@ async function request(ctx: Ctx, method: string, payload: unknown): Promise<TgRe
   try {
     data = (await res.json()) as Record<string, unknown>;
   } catch {
-    return { ...empty, ok: false, errorCode: res.status, description: "non-JSON response", uncertain: res.status >= 500 };
+    return {
+      ...empty,
+      ok: false,
+      errorCode: res.status,
+      description: "non-JSON response",
+      uncertain: res.status >= 500,
+    };
   }
   const params = (data.parameters ?? {}) as Record<string, unknown>;
   const errorCode = Number(data.error_code ?? (res.ok ? 0 : res.status));
@@ -81,7 +87,14 @@ export async function telegramCall(
   payload: unknown,
   { idempotent = false, urgent = false } = {},
 ): Promise<TgResponse> {
-  let resp: TgResponse = { ok: false, errorCode: 0, description: "budget", retryAfter: 0, migrateTo: "", uncertain: false };
+  let resp: TgResponse = {
+    ok: false,
+    errorCode: 0,
+    description: "budget",
+    retryAfter: 0,
+    migrateTo: "",
+    uncertain: false,
+  };
   for (let attempt = 1; attempt <= TELEGRAM_ATTEMPTS; attempt++) {
     if (!ctx.budget.canFetch(1, { urgent })) return resp;
     resp = await request(ctx, method, payload);
@@ -126,6 +139,7 @@ export type SendStatus = "ok" | "uncertain" | "gone" | "failed" | "retry";
 export interface SendResult {
   status: SendStatus;
   migratedTo: string;
+  messageIds: number[];
 }
 
 export interface SendOptions {
@@ -137,13 +151,20 @@ export interface SendOptions {
   urgent?: boolean;
 }
 
-export async function sendMessage(ctx: Ctx, chatId: string, text: string, opts: SendOptions = {}): Promise<SendResult> {
+export async function sendMessage(
+  ctx: Ctx,
+  chatId: string,
+  text: string,
+  opts: SendOptions = {},
+): Promise<SendResult> {
   const chunks = splitForTelegram(text);
   const urgent = opts.urgent ?? false;
-  if (!ctx.budget.canFetch(chunks.length + (opts.reserve ?? 0), { urgent })) return { status: "retry", migratedTo: "" };
+  if (!ctx.budget.canFetch(chunks.length + (opts.reserve ?? 0), { urgent }))
+    return { status: "retry", migratedTo: "", messageIds: [] };
 
   let target = chatId;
   let migratedTo = "";
+  const messageIds: number[] = [];
   for (const [i, chunk] of chunks.entries()) {
     const payload: Record<string, unknown> = {
       chat_id: target,
@@ -163,7 +184,11 @@ export async function sendMessage(ctx: Ctx, chatId: string, text: string, opts: 
       payload.chat_id = target;
       resp = await telegramCall(ctx, "sendMessage", payload, { urgent });
     }
-    if (resp.ok) continue;
+    if (resp.ok) {
+      const messageId = (resp.result as { message_id?: unknown } | undefined)?.message_id;
+      if (typeof messageId === "number") messageIds.push(messageId);
+      continue;
+    }
 
     // A later chunk failing means earlier ones arrived: resending would
     // duplicate them, so the whole message counts as uncertain.
@@ -174,7 +199,47 @@ export async function sendMessage(ctx: Ctx, chatId: string, text: string, opts: 
     else if (resp.errorCode === 0 || resp.errorCode === 429) status = "retry";
     else status = "failed";
     ctx.log.warn(`Send to ${await ctx.log.chat(target)} chunk ${i + 1}/${chunks.length}: ${status}`);
-    return { status, migratedTo };
+    return { status, migratedTo, messageIds };
   }
-  return { status: "ok", migratedTo };
+  return { status: "ok", migratedTo, messageIds };
+}
+
+export type EditStatus = "ok" | "gone" | "retry" | "failed";
+
+const UNEDITABLE_400 = ["message to edit not found", "message can't be edited", "message_id_invalid"];
+
+/** Edit an already-sent message in place (used to replace an English fallback with Hebrew later). */
+export async function editMessage(
+  ctx: Ctx,
+  chatId: string,
+  messageId: number,
+  text: string,
+  opts: { reserve?: number; urgent?: boolean } = {},
+): Promise<EditStatus> {
+  const urgent = opts.urgent ?? false;
+  if (!ctx.budget.canFetch(1 + (opts.reserve ?? 0), { urgent })) return "retry";
+  const resp = await telegramCall(
+    ctx,
+    "editMessageText",
+    {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+    },
+    { idempotent: true, urgent },
+  );
+  if (resp.ok) return "ok";
+  const d = resp.description.toLowerCase();
+  if (resp.errorCode === 400 && d.includes("message is not modified")) return "ok";
+  if (chatGone(resp) || (resp.errorCode === 400 && UNEDITABLE_400.some((s) => d.includes(s)))) return "gone";
+  if (resp.errorCode === 0 || resp.errorCode === 429 || resp.uncertain) return "retry";
+  return "failed";
+}
+
+/** Best-effort removal of trailing chunks when an edited Hebrew message is shorter than the English one. */
+export async function deleteMessage(ctx: Ctx, chatId: string, messageId: number): Promise<void> {
+  if (!ctx.budget.canFetch(1)) return;
+  await telegramCall(ctx, "deleteMessage", { chat_id: chatId, message_id: messageId }, { idempotent: true });
 }

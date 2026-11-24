@@ -34,7 +34,9 @@ export class Logger {
   ) {}
 
   private emit(level: Level, parts: unknown[]): void {
-    const line = scrub(parts.map((p) => (p instanceof Error ? `${p.name}: ${p.message}` : String(p))).join(" "));
+    const line = scrub(
+      parts.map((p) => (p instanceof Error ? `${p.name}: ${p.message}` : String(p))).join(" "),
+    );
     if (this.keep) this.lines.push(`[${level}] ${line}`);
     this.sink(level, line);
   }
@@ -62,7 +64,11 @@ export class Logger {
       false,
       ["sign"],
     );
-    const sig = await crypto.subtle.sign("HMAC", await this.keyPromise, new TextEncoder().encode(String(chatId)));
+    const sig = await crypto.subtle.sign(
+      "HMAC",
+      await this.keyPromise,
+      new TextEncoder().encode(String(chatId)),
+    );
     return `chat#${toHex(sig).slice(0, 10)}`;
   }
 }
