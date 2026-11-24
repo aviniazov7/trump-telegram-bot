@@ -46,7 +46,11 @@ export class DoKV {
     return { value: typeOf(type) === "json" ? JSON.parse(value) : value, metadata };
   }
 
-  async put(key: string, value: string, opts?: { expirationTtl?: number; metadata?: unknown }): Promise<void> {
+  async put(
+    key: string,
+    value: string,
+    opts?: { expirationTtl?: number; metadata?: unknown },
+  ): Promise<void> {
     const entry: StateEntry = { value };
     if (opts?.metadata !== undefined) entry.metadata = opts.metadata;
     if (opts?.expirationTtl) entry.expiresAt = this.now() + opts.expirationTtl * 1000;

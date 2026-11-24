@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chatGone, sendMessage, telegramCall } from "../src/telegram";
+import { chatGone, deleteMessage, editMessage, sendMessage, telegramCall } from "../src/telegram";
 import { TELEGRAM, json, testCtx, timeout } from "./helpers";
 
 const tgError = (code: number, description: string, parameters?: Record<string, unknown>) =>
@@ -89,7 +89,11 @@ describe("telegramCall", () => {
 describe("sendMessage", () => {
   it("sends HTML with link previews off and the forum topic", async () => {
     const ctx = testCtx({ [TELEGRAM]: tgOk });
-    expect(await sendMessage(ctx, "1", "hi", { threadId: "77" })).toEqual({ status: "ok", migratedTo: "" });
+    expect(await sendMessage(ctx, "1", "hi", { threadId: "77" })).toEqual({
+      status: "ok",
+      migratedTo: "",
+      messageIds: [1],
+    });
     const body = JSON.parse(ctx.calls[0]?.body ?? "{}");
     expect(body).toMatchObject({ chat_id: "1", parse_mode: "HTML", message_thread_id: 77 });
     expect(ctx.calls[0]?.url).toBe("https://api.telegram.org/bottest-bot-token/sendMessage");
@@ -120,7 +124,11 @@ describe("sendMessage", () => {
           ? tgError(400, "Bad Request: group chat was upgraded", { migrate_to_chat_id: -100777 })
           : tgOk(),
     });
-    expect(await sendMessage(ctx, "-5", "hi")).toEqual({ status: "ok", migratedTo: "-100777" });
+    expect(await sendMessage(ctx, "-5", "hi")).toEqual({
+      status: "ok",
+      migratedTo: "-100777",
+      messageIds: [1],
+    });
     expect(JSON.parse(ctx.calls[1]?.body ?? "{}").chat_id).toBe("-100777");
   });
 
@@ -135,5 +143,32 @@ describe("sendMessage", () => {
     const ctx = testCtx({ [TELEGRAM]: tgOk }, { maxSubrequests: 2 });
     expect((await sendMessage(ctx, "1", "hi", { reserve: 2 })).status).toBe("retry");
     expect(ctx.calls).toHaveLength(0);
+  });
+});
+
+describe("editMessage & deleteMessage", () => {
+  it("edits a message and treats message-is-not-modified as ok", async () => {
+    const okCtx = testCtx({ [TELEGRAM]: tgOk });
+    expect(await editMessage(okCtx, "1", 42, "updated")).toBe("ok");
+    expect(JSON.parse(okCtx.calls[0]?.body ?? "{}")).toMatchObject({
+      chat_id: "1",
+      message_id: 42,
+      text: "updated",
+    });
+
+    const sameCtx = testCtx({ [TELEGRAM]: () => tgError(400, "Bad Request: message is not modified") });
+    expect(await editMessage(sameCtx, "1", 42, "same")).toBe("ok");
+  });
+
+  it("maps gone, retry, and failed edit responses properly", async () => {
+    const goneCtx = testCtx({ [TELEGRAM]: () => tgError(400, "Bad Request: message to edit not found") });
+    expect(await editMessage(goneCtx, "1", 42, "x")).toBe("gone");
+
+    const retryCtx = testCtx({ [TELEGRAM]: () => tgError(429, "Too Many Requests", { retry_after: 600 }) });
+    expect(await editMessage(retryCtx, "1", 42, "x")).toBe("retry");
+
+    const delCtx = testCtx({ [TELEGRAM]: tgOk });
+    await deleteMessage(delCtx, "1", 43);
+    expect(delCtx.calls[0]?.url).toContain("/deleteMessage");
   });
 });

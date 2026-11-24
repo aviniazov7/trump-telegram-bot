@@ -12,7 +12,7 @@
  */
 import { loadConfig } from "./config";
 import type { Env } from "./env";
-import { toHex } from "./log";
+import { scrub, toHex } from "./log";
 import { type Ctx, type Fetcher, makeCtx } from "./runtime";
 import { openStore, type Store } from "./store";
 import { sendMessage, telegramCall } from "./telegram";
@@ -246,4 +246,30 @@ export async function handleUpdate(ctx: Ctx, store: Store, update: Update): Prom
   }
   ctx.log.info(`Subscribed ${await ctx.log.chat(chatId)} (/${command}${threadId ? " in a topic" : ""})`);
   await welcome(ctx, chatId, chatType, threadId);
+}
+
+/**
+ * Read-only diagnostic endpoint for Gemini translation errors (stored in the
+ * Coordinator Durable Object). Protected by TELEGRAM_WEBHOOK_SECRET in constant
+ * time; fails closed with 404 just like the webhook route.
+ */
+export async function handleAdminGeminiErrors(request: Request, env: Env): Promise<Response> {
+  const cfg = loadConfig(env);
+  if (cfg.webhookSecret.length < MIN_SECRET_LENGTH) return notFound();
+  const header = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
+  if (request.method !== "GET" || !timingSafeEqual(header, cfg.webhookSecret)) return notFound();
+  const store = openStore(env);
+  const postId = new URL(request.url).searchParams.get("postId")?.trim() ?? "";
+  const records = postId
+    ? (await store.getGeminiFailures(postId))
+      ? [await store.getGeminiFailures(postId)]
+      : []
+    : await store.listGeminiFailures();
+  const sanitized = records
+    .filter((r): r is NonNullable<typeof r> => Boolean(r))
+    .map((r) => ({
+      ...r,
+      attempts: r.attempts.map((a) => ({ ...a, error: scrub(a.error) })),
+    }));
+  return Response.json({ records: sanitized });
 }

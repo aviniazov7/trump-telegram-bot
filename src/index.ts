@@ -9,14 +9,18 @@ import { loadConfig } from "./config";
 import type { Env } from "./env";
 import { makeCtx } from "./runtime";
 import { openStore } from "./store";
-import { handleWebhook } from "./webhook";
+import { handleAdminGeminiErrors, handleWebhook } from "./webhook";
 import { bindWorkersAi } from "./workers-ai";
 
 export { Coordinator } from "./coordinator";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    if (new URL(request.url).pathname.startsWith("/telegram/")) {
+    const url = new URL(request.url);
+    if (url.pathname === "/admin/gemini-errors") {
+      return handleAdminGeminiErrors(request, env);
+    }
+    if (url.pathname.startsWith("/telegram/")) {
       // Answer Telegram before the send. A slow sendMessage used to hold the
       // response, and a late or non-200 answer is what makes Telegram retry.
       return handleWebhook(request, env, { waitUntil: (promise) => ctx.waitUntil(promise) });
