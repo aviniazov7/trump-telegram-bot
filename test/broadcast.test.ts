@@ -30,6 +30,8 @@ beforeEach(async () => {
 /** A fake Telegram that records sends and can misbehave per chat. */
 class FakeTelegram {
   sent: { chat: string; text: string; thread?: number }[] = [];
+  edited: { chat: string; messageId: number; text: string }[] = [];
+  deleted: { chat: string; messageId: number }[] = [];
   behavior = new Map<string, (n: number) => Response>();
   methods: string[] = [];
   private counts = new Map<string, number>();
@@ -37,6 +39,16 @@ class FakeTelegram {
   handler: Handler = (call) => {
     const method = call.url.split("/").pop() ?? "";
     this.methods.push(method);
+    if (method === "editMessageText") {
+      const body = JSON.parse(call.body) as { chat_id: string; message_id: number; text: string };
+      this.edited.push({ chat: body.chat_id, messageId: body.message_id, text: body.text });
+      return json({ ok: true, result: { message_id: body.message_id } });
+    }
+    if (method === "deleteMessage") {
+      const body = JSON.parse(call.body) as { chat_id: string; message_id: number };
+      this.deleted.push({ chat: body.chat_id, messageId: body.message_id });
+      return json({ ok: true, result: true });
+    }
     if (method !== "sendMessage") return json({ ok: true, result: true });
     const body = JSON.parse(call.body) as { chat_id: string; text: string; message_thread_id?: number };
     const n = this.counts.get(body.chat_id) ?? 0;
@@ -1093,5 +1105,47 @@ describe("overlapping runs and pure re-posts", () => {
     expect(to("b")).toHaveLength(0);
     expect((await store.getMeta()).lastSeen).toBe(repost);
     expect((await store.getSendLog(repost)).a).toBeUndefined();
+  });
+});
+
+describe("post-send Hebrew repair", () => {
+  const MIN = 60_000;
+  const fail503 = () =>
+    new Response('{"error":{"code":503,"message":"The model is overloaded."}}', { status: 503 });
+
+  it("edits already-sent English fallback messages into Hebrew when translation recovers on a later run", async () => {
+    await seed("1", ["a", "b"]);
+    const first = setup({ feed: ["2", "1"], now: NOW, gemini: fail503 });
+    await first.run();
+    expect(first.tg.sent).toEqual([]);
+
+    // Past the 15-min retry window: sends English fallback and queues repair:2.
+    const second = setup({ feed: ["2", "1"], now: NOW + 15 * MIN, gemini: fail503 });
+    await second.run();
+    expect(second.tg.postsTo("a")).toEqual(["2"]);
+    expect(second.tg.postsTo("b")).toEqual(["2"]);
+    expect(second.tg.sent.find((s) => s.chat === "a")?.text).toContain("⚠️ התרגום לעברית אינו זמין כרגע.");
+    expect(second.tg.edited).toEqual([]);
+    const queued = await store.getRepair("2");
+    expect(queued).not.toBeNull();
+    expect(Object.keys(queued?.messages ?? {}).sort()).toEqual(["a", "b"]);
+
+    // Next cron run (idle feed, Gemini recovered): edits both messages in place without re-sending.
+    const third = setup({
+      feed: ["2", "1"],
+      now: NOW + 30 * MIN,
+      gemini: () =>
+        json(geminiAnswer({ hebrew: "תרגום משוחזר בעברית", categories: ["tariffs"], impact: "high" })),
+    });
+    await third.run();
+    expect(third.tg.sent).toEqual([]);
+    expect(third.tg.edited).toHaveLength(2);
+    for (const ed of third.tg.edited) {
+      expect(ed.text).toContain("תרגום משוחזר בעברית");
+      expect(ed.text).toContain("🔴");
+      expect(ed.text).not.toContain("⚠️ התרגום לעברית אינו זמין כרגע.");
+    }
+    expect(await store.getRepair("2")).toBeNull();
+    expect((await store.getAnalysis("2"))?.translated).toBe(true);
   });
 });

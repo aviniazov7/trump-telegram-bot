@@ -315,3 +315,33 @@ describe("logging", () => {
     for (const secret of ["5551234567", "test-bot-token", SECRET]) expect(output).not.toContain(secret);
   });
 });
+
+describe("admin gemini-errors endpoint", () => {
+  it("fails closed with 404 without the secret and returns sanitized DO error logs with it", async () => {
+    await store.recordGeminiFailure(
+      "99999",
+      1_700_000_000_000,
+      "HTTP 503 key=AIzaSyDummyKeyValue12345678901234567890",
+    );
+    const unauth = await worker.fetch(
+      new Request("https://bot.example/admin/gemini-errors"),
+      env,
+      {} as ExecutionContext,
+    );
+    expect(unauth.status).toBe(404);
+
+    const auth = await worker.fetch(
+      new Request("https://bot.example/admin/gemini-errors", {
+        headers: { "X-Telegram-Bot-Api-Secret-Token": SECRET },
+      }),
+      env,
+      {} as ExecutionContext,
+    );
+    expect(auth.status).toBe(200);
+    const body = (await auth.json()) as { records: { postId: string; attempts: { error: string }[] }[] };
+    expect(body.records).toHaveLength(1);
+    expect(body.records[0]?.postId).toBe("99999");
+    expect(body.records[0]?.attempts[0]?.error).not.toContain("AIzaSyDummyKeyValue");
+    expect(body.records[0]?.attempts[0]?.error).toContain("<redacted-key>");
+  });
+});

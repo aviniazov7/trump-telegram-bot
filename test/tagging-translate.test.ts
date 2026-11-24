@@ -10,7 +10,7 @@ import {
   sanitizeArabicWords,
 } from "../src/translate";
 import { bindWorkersAi, extractWorkersAiText } from "../src/workers-ai";
-import { type Call, GEMINI, GTX, geminiAnswer, json, testCtx } from "./helpers";
+import { CLIENTS5, type Call, GEMINI, GTX, MYMEMORY, geminiAnswer, json, testCtx } from "./helpers";
 
 const ENGLISH = "I am raising Tariffs on China to 100%, effective November 1st!";
 const HEBREW = "אני מעלה את המכסים על סין ל-100%, החל מ-1 בנובמבר!";
@@ -594,5 +594,123 @@ describe("Workers AI answers", () => {
     });
     expect(seen[0]?.model).toBe("@cf/zai-org/glm-4.7-flash");
     expect(seen[0]?.input.chat_template_kwargs).toEqual({ enable_thinking: false });
+  });
+});
+
+describe("expanded fallbacks & resilience", () => {
+  it("tries comma-separated Gemini fallback models in order", async () => {
+    const ctx = testCtx(
+      {
+        [GEMINI]: (call) => {
+          const m = modelOf(call);
+          if (m === "gemini-3.8-flash") {
+            return new Response(
+              JSON.stringify({
+                error: {
+                  code: 429,
+                  details: [{ quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }],
+                },
+              }),
+              { status: 429 },
+            );
+          }
+          if (m === "gemini-3.6-flash") return fail503();
+          return good();
+        },
+      },
+      { geminiFallbackModel: "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite" },
+    );
+    const res = await analyzePost(ctx, ENGLISH);
+    expect(res).toMatchObject({ translated: true, provider: "gemini", model: "gemini-3.5-flash-lite" });
+    expect(ctx.calls.map(modelOf)).toEqual([
+      "gemini-3.8-flash",
+      "gemini-3.6-flash",
+      "gemini-3.6-flash",
+      "gemini-3.5-flash-lite",
+    ]);
+  });
+
+  it("stops calling other Gemini models on location-unsupported 400 and falls back to Workers AI", async () => {
+    const workers = fakeAi(() => aiReply(HEBREW));
+    const ctx = testCtx(
+      {
+        [GEMINI]: () =>
+          new Response(
+            JSON.stringify({
+              error: {
+                code: 400,
+                message: "User location is not supported for the API use.",
+                status: "FAILED_PRECONDITION",
+              },
+            }),
+            { status: 400 },
+          ),
+      },
+      { geminiFallbackModel: "gemini-3.6-flash,gemini-3.5-flash-lite" },
+      { ai: workers.ai },
+    );
+    const res = await analyzePost(ctx, ENGLISH);
+    expect(res).toMatchObject({ translated: true, provider: "workers-ai" });
+    expect(ctx.calls.map(modelOf)).toEqual(["gemini-3.8-flash"]);
+  });
+
+  it("uses workersAiTimeoutMs and falls back across comma-separated Workers AI models without thinking kwargs on non-thinking models", async () => {
+    const seen: { model: string; input: WorkersAiChatInput }[] = [];
+    const t = 0;
+    const ai = {
+      async run(model: string, input: WorkersAiChatInput, options?: { signal?: AbortSignal }) {
+        seen.push({ model, input });
+        expect(options?.signal).toBeDefined();
+        if (model === "@cf/zai-org/glm-4.7-flash") {
+          throw new DOMException("Timed out", "TimeoutError");
+        }
+        return aiReply(HEBREW);
+      },
+    };
+    const ctx = testCtx(
+      { [GEMINI]: fail503 },
+      {
+        geminiTimeoutMs: 12_000,
+        workersAiTimeoutMs: 35_000,
+        workersAiModel: "@cf/zai-org/glm-4.7-flash,@cf/mistralai/mistral-small-3.1-24b-instruct",
+      },
+      { ai, now: () => t },
+    );
+    const res = await analyzePost(ctx, ENGLISH);
+    expect(res).toMatchObject({
+      translated: true,
+      provider: "workers-ai",
+      model: "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    });
+    expect(seen.map((s) => s.model)).toEqual([
+      "@cf/zai-org/glm-4.7-flash",
+      "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    ]);
+    expect(seen[0]?.input.chat_template_kwargs).toEqual({ enable_thinking: false });
+    expect(seen[1]?.input.chat_template_kwargs).toBeUndefined();
+  });
+
+  it("uses chunked web translation fallback when enabled and Gemini + Workers AI fail", async () => {
+    const longPost = `${"Tariffs on China are working great for American workers. ".repeat(12)}MAGA!`;
+    const ctx = testCtx(
+      {
+        [GEMINI]: fail503,
+        [MYMEMORY]: () =>
+          json({
+            responseStatus: 200,
+            responseData: {
+              translatedText: "MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE TRANSLATIONS FOR TODAY",
+            },
+          }),
+        [GTX]: () => json([[["המכסים על סין עובדים מצוין. "]]]),
+        [CLIENTS5]: () => json(["לא צריך"]),
+      },
+      { webTranslateFallback: true, geminiFallbackModel: "" },
+    );
+    const res = await analyzePost(ctx, longPost);
+    expect(res).toMatchObject({ translated: true, provider: "web", model: "gtx" });
+    expect(res.hebrew).toContain("המכסים על סין עובדים מצוין.");
+    expect(res.categories).toContain("tariffs");
+    expect(ctx.hosts()).toContain(GTX);
   });
 });
