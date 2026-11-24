@@ -30,6 +30,8 @@ export interface Env {
   /** "" disables the Workers AI fallback. Default: @cf/zai-org/glm-4.7-flash. */
   WORKERS_AI_MODEL?: string;
   GEMINI_TIMEOUT_SECONDS?: string;
+  WORKERS_AI_TIMEOUT_SECONDS?: string;
+  WEB_TRANSLATE_FALLBACK?: string;
   GEMINI_RETRY_MINUTES?: string;
   STALE_ALERT_MINUTES?: string;
   SOURCE_FAILURE_ALERT_RUNS?: string;
