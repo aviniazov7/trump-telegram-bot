@@ -136,6 +136,8 @@ export const GEMINI_TIME_RESERVE_MS = 8_000;
 export class GeminiError extends Error {
   /** Set when the model's daily (per-day) free-tier quota is used up. */
   dailyQuota = false;
+  /** Set when this Cloudflare edge PoP is in a region Google Gemini blocks. */
+  locationUnsupported = false;
 }
 
 export interface QuotaInfo {
@@ -266,6 +268,11 @@ async function request(ctx: Ctx, model: string, payload: Record<string, unknown>
       ctx.log.warn(`Gemini HTTP ${res.status} — retrying once`);
       await ctx.sleep(GEMINI_5XX_RETRY_MS);
       continue;
+    }
+    if (res.status === 400 && /location is not supported/i.test(fullBody)) {
+      const err = new GeminiError(`HTTP 400: ${detail}`);
+      err.locationUnsupported = true;
+      throw err;
     }
     const quota = res.status === 429 ? parseQuotaInfo(fullBody) : null;
     throw new GeminiError(

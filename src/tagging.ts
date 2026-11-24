@@ -12,6 +12,7 @@ import {
 import type { Ctx } from "./runtime";
 import { isMeaningfulText } from "./text";
 import { hasArabicScript, looksTranslated, needsTranslation, sanitizeArabicWords } from "./translate";
+import { webTranslate } from "./web-translate";
 import { workersAiTranslate } from "./workers-ai";
 
 /** Machine keys → Hebrew hashtag labels, in display order. */
@@ -204,7 +205,11 @@ export async function analyzePost(
   if (!ctx.cfg.geminiApiKey) return untranslated("GEMINI_API_KEY not set");
   if (text.length > GEMINI_MAX_CHARS) return untranslated(`post longer than ${GEMINI_MAX_CHARS} chars`);
 
-  const models = [...new Set([ctx.cfg.geminiModel, ctx.cfg.geminiFallbackModel].filter(Boolean))];
+  const fallbackModels = ctx.cfg.geminiFallbackModel
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const models = [...new Set([ctx.cfg.geminiModel, ...fallbackModels].filter(Boolean))];
   const echoed = echoedProviders(priorError);
   const errors: string[] = [];
   let outOfQuota = 0;
@@ -248,7 +253,7 @@ export async function analyzePost(
       await quota.markExhausted(model, err.message, msUntilQuotaReset(ctx.now()) / 1000);
       ctx.log.warn(`Gemini ${model}: daily quota used up — skipping it until the reset (midnight Pacific)`);
     }
-    return "continue";
+    return err.locationUnsupported ? "break" : "continue";
   };
 
   const consider = (
@@ -319,16 +324,29 @@ export async function analyzePost(
     }
   }
 
-  const aiModel = ctx.cfg.workersAiModel;
-  const aiReady = Boolean(ctx.ai && aiModel);
+  const aiModels = [
+    ...new Set(
+      ctx.cfg.workersAiModel
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+  ];
+  const aiReady = Boolean(ctx.ai && aiModels.length);
   if (aiReady && echoed.has("workers-ai")) {
     errors.push("workers-ai: skipped — earlier untranslated text");
   } else if (aiReady) {
-    if (ctx.budget.timeUp() || !ctx.budget.canFetch()) {
-      errors.push("workers-ai: no time left in this run");
-    } else {
+    for (const aiModel of aiModels) {
+      if (echoed.has(`workers-ai(${aiModel})`)) {
+        errors.push(`workers-ai(${aiModel}): skipped — earlier untranslated text`);
+        continue;
+      }
+      if (ctx.budget.timeUp() || !ctx.budget.canFetch()) {
+        errors.push("workers-ai: no time left in this run");
+        break;
+      }
       try {
-        let hebrew = await workersAiTranslate(ctx, text);
+        let hebrew = await workersAiTranslate(ctx, text, aiModel);
         if (hasArabicScript(hebrew)) {
           const repaired = sanitizeArabicWords(hebrew);
           if (looksTranslated(text, repaired) && !hasArabicScript(repaired)) {
@@ -336,7 +354,7 @@ export async function analyzePost(
             hebrew = repaired;
           } else {
             errors.push("workers-ai: arabic script in translation");
-            ctx.log.warn(`Workers AI failed — ${errors.at(-1)}`);
+            ctx.log.warn(`Workers AI (${aiModel}) failed — ${errors.at(-1)}`);
             hebrew = "";
           }
         }
@@ -357,13 +375,34 @@ export async function analyzePost(
         }
         if (hebrew || !errors.at(-1)?.endsWith("arabic script in translation")) {
           errors.push(`workers-ai: ${hebrew ? "untranslated text" : "no answer"}`);
-          ctx.log.warn(`Workers AI failed — ${errors.at(-1)}`);
+          ctx.log.warn(`Workers AI (${aiModel}) failed — ${errors.at(-1)}`);
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         errors.push(`workers-ai: ${message}`.slice(0, 300));
-        ctx.log.warn(`Workers AI failed — ${errors.at(-1)}`);
+        ctx.log.warn(`Workers AI (${aiModel}) failed — ${errors.at(-1)}`);
       }
+    }
+  }
+
+  if (ctx.cfg.webTranslateFallback && !ctx.budget.timeUp() && ctx.budget.canFetch()) {
+    try {
+      const web = await webTranslate(ctx, text);
+      const { categories, impact } = finalTags([], null, text);
+      ctx.log.info(`Translated post via web (${web.provider}): ${categories.join(",")}, impact=${impact}`);
+      return {
+        hebrew: web.hebrew,
+        translated: true,
+        categories,
+        impact,
+        provider: "web",
+        model: web.provider,
+        ...(errors.length ? { geminiError: errors.join(" | ") } : {}),
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      errors.push(`web: ${message}`.slice(0, 300));
+      ctx.log.warn(`Web translation fallback failed — ${errors.at(-1)}`);
     }
   }
 
