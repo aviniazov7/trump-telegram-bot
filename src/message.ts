@@ -141,7 +141,5 @@ export function buildMessage(post: Post, parts: MessageParts): string {
     ? `🇮🇱 <b>תרגום לעברית:</b>\n${htmlEscape(parts.hebrew)}\n`
     : "⚠️ התרגום לעברית אינו זמין כרגע.\n";
   const tagLine = buildTagLine(parts.categories, parts.impact);
-  return (
-    (tagLine ? `${tagLine}\n` : "") + header + `${original}\n\n` + "━━━━━━━━━━━━━━━\n\n" + hebrewBlock + link
-  );
+  return `${tagLine ? `${tagLine}\n` : ""}${header}${original}\n\n━━━━━━━━━━━━━━━\n\n${hebrewBlock}${link}`;
 }
