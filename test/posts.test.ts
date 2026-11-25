@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { advanceCursor, type Cursor, filterNewPosts, mediaDigestId, sendOrder } from "../src/posts";
+import { advanceCursor, type Cursor, filterNewPosts, hasGap, mediaDigestId, sendOrder } from "../src/posts";
 import {
   CNN_FRESH_BYTES,
   CNN_READ_BYTES,
@@ -45,6 +45,24 @@ describe("filterNewPosts", () => {
   it("handles an empty feed", () => {
     expect(filterNewPosts([], "1")).toEqual([]);
   });
+
+  it("returns [] and reports no gap when sources lag behind lastSeen", () => {
+    const posts = feed("100", "99");
+    expect(hasGap(posts, "105")).toBe(false);
+    expect(filterNewPosts(posts, "105")).toEqual([]);
+  });
+
+  it("handles a deleted lastSeen inside the window without skipping newer posts or reporting a gap", () => {
+    const posts = feed("105", "104", "100");
+    expect(hasGap(posts, "102")).toBe(false);
+    expect(ids(filterNewPosts(posts, "102"))).toEqual(["104", "105"]);
+  });
+
+  it("reports a real gap when the oldest post in the window is still newer than lastSeen", () => {
+    const posts = feed("200", "199");
+    expect(hasGap(posts, "100")).toBe(true);
+    expect(ids(filterNewPosts(posts, "100"))).toEqual(["200"]);
+  });
 });
 
 describe("advanceCursor", () => {
@@ -77,6 +95,18 @@ describe("advanceCursor", () => {
     const c = cursor("1", ["99"]);
     advanceCursor(c, chrono);
     expect(c).toEqual(cursor("1"));
+  });
+
+  it("never moves lastSeen backwards when chronologicalIds are older", () => {
+    const c = cursor("105");
+    advanceCursor(c, ["100"], "100");
+    expect(c).toEqual(cursor("105"));
+  });
+
+  it("advances past a deleted numeric lastSeen", () => {
+    const c = cursor("102");
+    advanceCursor(c, ["104", "105"], "104");
+    expect(c).toEqual(cursor("104"));
   });
 });
 
@@ -351,6 +381,15 @@ describe("fetchPosts", () => {
   it("falls back to the archive when the RSS fails", async () => {
     const ctx = testCtx({ [RSS_HOST]: () => new Response("down", { status: 503 }), [CNN_HOST]: cnn("4") });
     expect(ids(await fetchPosts(ctx, "1"))).toEqual(["4"]);
+  });
+
+  it("does not deep-scan the CNN archive when RSS fails and CNN already lags behind lastSeen", async () => {
+    const ctx = testCtx({
+      [RSS_HOST]: () => new Response("rate limited", { status: 429 }),
+      [CNN_HOST]: cnn("100", "99"),
+    });
+    expect(ids(await fetchPosts(ctx, "105"))).toEqual(["100", "99"]);
+    expect(ctx.calls.filter((c) => c.host === CNN_HOST)).toHaveLength(1);
   });
 
   it("returns [] when every source fails", async () => {
