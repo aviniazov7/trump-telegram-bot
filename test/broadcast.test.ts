@@ -865,20 +865,97 @@ describe("monitoring", () => {
     expect(await store.heartbeat()).toBe(NOW + 10 * 60_000);
   });
 
-  it("alerts when lastSeen fell out of the scanned window", async () => {
+  it("alerts at most once when lastSeen fell out of the scanned window", async () => {
     await seed("1", ["a"]);
     const tg = new FakeTelegram();
-    const ctx = testCtx(
+    const fail503 = () => new Response("unavailable", { status: 503 });
+    const runAt = async (now: number) => {
+      const ctx = testCtx(
+        {
+          [RSS_HOST]: () => new Response(rssFeed(["9", "8"], (id) => `Post number-${id}`)),
+          [TELEGRAM]: tg.handler,
+          [CNN_HOST]: () => new Response("[]"),
+          [GEMINI]: fail503,
+        },
+        {
+          geminiRetryMs: 24 * 60 * 60_000,
+          workersAiModel: "",
+          webTranslateFallback: false,
+          staleAlertMinutes: 180,
+        },
+        { now: () => now },
+      );
+      await runCron(ctx, store);
+    };
+    await runAt(NOW);
+    expect(adminAlerts(tg)).toHaveLength(1);
+    expect(adminAlerts(tg)[0]?.text).toContain("ייתכן שפוסטים הוחמצו");
+
+    // Even past ALERT_REPEAT_MINUTES (60m), the same gap incident must not re-alert.
+    await runAt(NOW + 90 * 60_000);
+    expect(adminAlerts(tg)).toHaveLength(1);
+  });
+
+  it("does not alert or roll back cursor when RSS 429s and CNN lags behind lastSeen", async () => {
+    await seed("104", ["a"]);
+    const tg = new FakeTelegram();
+    const rssWithVimeoPlaceholder =
+      "<rss><channel>" +
+      "<item><title>Post from November 25, 2026</title>" +
+      '<description><![CDATA[<p><a href="https://vimeo.com/1249782646/7e27022b54">https://vimeo.com/1249782646/7e27022b54</a></p>]]></description>' +
+      "<pubDate>Wed, 25 Nov 2026 01:02:33 +0000</pubDate>" +
+      "<truth:originalId>106</truth:originalId></item>" +
+      "<item><title>Real post</title><description><![CDATA[<p>Post number-105</p>]]></description>" +
+      "<pubDate>Wed, 25 Nov 2026 01:00:00 +0000</pubDate>" +
+      "<truth:originalId>105</truth:originalId></item>" +
+      "<item><title>Older</title><description><![CDATA[<p>Post number-104</p>]]></description>" +
+      "<pubDate>Wed, 25 Nov 2026 00:50:00 +0000</pubDate>" +
+      "<truth:originalId>104</truth:originalId></item>" +
+      "</channel></rss>";
+
+    let geminiCalls = 0;
+    const run1 = testCtx(
       {
-        [RSS_HOST]: () => new Response(rssFeed(["9", "8"], (id) => `Post number-${id}`)),
+        [RSS_HOST]: () => new Response(rssWithVimeoPlaceholder),
+        [CNN_HOST]: () => new Response(JSON.stringify([{ id: "104", content: "Post number-104" }])),
         [TELEGRAM]: tg.handler,
-        [CNN_HOST]: () => new Response("[]"),
+        [GEMINI]: () => {
+          geminiCalls += 1;
+          return json(geminiAnswer({ hebrew: "פוסט 105", categories: ["other"], impact: "low" }));
+        },
       },
-      { geminiApiKey: "" },
+      {},
       { now: () => NOW },
     );
-    await runCron(ctx, store);
-    expect(adminAlerts(tg)[0]?.text).toContain("ייתכן שפוסטים הוחמצו");
+    await runCron(run1, store);
+    // Only 105 is sent; 106 (Post from November 25, 2026 + bare Vimeo link) is skipped without calling Gemini.
+    expect(geminiCalls).toBe(1);
+    expect(tg.postsTo("a")).toEqual(["105"]);
+    expect((await store.getMeta()).lastSeen).toBe("105");
+
+    // Later runs: RSS returns 429 and CNN still lags at 104 (plus 106 bare link).
+    // No gap alert should fire, 104 must not resend, and lastSeen must remain 105.
+    for (const offsetMs of [45 * 60_000, 135 * 60_000]) {
+      const lagRun = testCtx(
+        {
+          [RSS_HOST]: () => new Response("rate limited", { status: 429 }),
+          [CNN_HOST]: () =>
+            new Response(
+              JSON.stringify([
+                { id: "106", content: "https://vimeo.com/1249782646/7e27022b54" },
+                { id: "104", content: "Post number-104" },
+              ]),
+            ),
+          [TELEGRAM]: tg.handler,
+        },
+        { staleAlertMinutes: 180 },
+        { now: () => NOW + offsetMs },
+      );
+      await runCron(lagRun, store);
+    }
+    expect(adminAlerts(tg)).toEqual([]);
+    expect(tg.postsTo("a")).toEqual(["105"]);
+    expect((await store.getMeta()).lastSeen).toBe("105");
   });
 
   it("pings the healthcheck URL after a successful run", async () => {

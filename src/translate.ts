@@ -30,9 +30,27 @@ export function latinWordCount(text: string): number {
 
 export const needsTranslation = (text: string): boolean => latinWordCount(text) > 0;
 
-/** Reject empty answers and answers that are still English (echoes, refusals). */
+const REFUSAL_PATTERNS: RegExp[] = [
+  /(?:^|[\s.,:])(?:אין(?:\s+כרגע)?\s+פוסטים(?:\s+(?:זמינים|חדשים|מתאריך|לצפייה|להצגה))?|לא\s+נמצאו\s+פוסטים)/,
+  /(?:^|[\s.,:])(?:איני|אני\s+(?:לא|איני))\s+יכול(?:ה)?\s+(?:לתרגם|לגשת|לצפות|לאחזר)/,
+  /לא\s+ניתן\s+(?:לתרגם|לאחזר|לגשת\s+לפוסט)/,
+  /(?:כמודל\s+שפה|אני\s+מודל\s+(?:שפה|AI)|מודל\s+בינה\s+מלאכותית)/i,
+  /(?:לא\s+סופק|אין)\s+טקסט\s+(?:לתרגם|לתרגום)|אנא\s+(?:ספק|שלח|הדבק)\s+(?:את\s+)?הטקסט/,
+  /אין\s+לי\s+גישה\s+(?:לפוסטים|לרשת|לאינטרנט|למידע|לתוכן)/,
+  /\b(?:no\s+posts?\s+available|there\s+are\s+no\s+posts|no\s+posts?\s+(?:found|for\s+this\s+date))\b/i,
+  /\b(?:i\s+(?:can'?t|cannot|am\s+unable\s+to)\s+(?:translate|access|retrieve|fetch)|unable\s+to\s+translate|no\s+text\s+(?:to\s+translate|provided)|please\s+provide\s+(?:the\s+)?text|as\s+an?\s+(?:ai|language\s+model))\b/i,
+];
+
+/** True when a translator returned a meta-answer or refusal instead of a translation. */
+export function looksLikeRefusal(text: string): boolean {
+  const trimmed = text.trim();
+  return Boolean(trimmed) && REFUSAL_PATTERNS.some((re) => re.test(trimmed));
+}
+
+/** Reject empty answers, LLM refusals/meta-answers, and answers that are still English (echoes). */
 export function looksTranslated(source: string, candidate: string | null | undefined): boolean {
   if (!candidate?.trim()) return false;
+  if (looksLikeRefusal(candidate)) return false;
   if (latinWordCount(source) < MIN_LATIN_WORDS_FOR_HEBREW_CHECK) return true;
   return HEBREW_RE.test(candidate);
 }

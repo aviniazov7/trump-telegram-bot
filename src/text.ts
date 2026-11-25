@@ -86,8 +86,10 @@ export function isMeaningfulText(text: string): boolean {
   if (!cleaned) return false;
   if (/^RT:\s*https?:\/\/\S+$/.test(cleaned)) return false;
   if (cleaned.startsWith("[No Title]")) return false;
-  if (/^(?:video|image|quote|media)\s+post\s+from\b/i.test(cleaned)) return false;
+  if (/^(?:video|image|quote|media|audio)\s+post\s+from\b/i.test(cleaned)) return false;
+  if (/^post\s+from\s+\w+\s+\d{1,2},\s+\d{4}\.?$/i.test(cleaned)) return false;
   if (/^view\s+(?:image|video|media)$/i.test(cleaned)) return false;
+  if (!cleaned.replace(/https?:\/\/\S+/g, "").trim()) return false;
   return true;
 }
 

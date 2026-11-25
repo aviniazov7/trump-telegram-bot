@@ -4,6 +4,7 @@ import { analyzePost, keywordCategories, parseMarketTags } from "../src/tagging"
 import {
   hasArabicScript,
   isArabicCodePoint,
+  looksLikeRefusal,
   looksTranslated,
   needsTranslation,
   repairArabicScript,
@@ -712,5 +713,36 @@ describe("expanded fallbacks & resilience", () => {
     expect(res.hebrew).toContain("המכסים על סין עובדים מצוין.");
     expect(res.categories).toContain("tariffs");
     expect(ctx.hosts()).toContain(GTX);
+  });
+});
+
+describe("placeholder and refusal guards", () => {
+  it("detects LLM refusals and meta-answers in Hebrew and English", () => {
+    expect(looksLikeRefusal("אין כרגע פוסטים זמינים מתאריך 25 בנובמבר 2026.")).toBe(true);
+    expect(looksLikeRefusal("לא נמצאו פוסטים")).toBe(true);
+    expect(looksLikeRefusal("איני יכול לתרגם ללא טקסט")).toBe(true);
+    expect(looksLikeRefusal("No posts available from November 25, 2026.")).toBe(true);
+    expect(looksLikeRefusal("I cannot translate without text.")).toBe(true);
+    expect(looksLikeRefusal("אין מס על טיפים! אנחנו לא יכולים לתת לסין לנצח.")).toBe(false);
+    expect(looksTranslated(ENGLISH, "אין כרגע פוסטים זמינים מתאריך 25 בנובמבר 2026.")).toBe(false);
+  });
+
+  it("skips translation completely for 'Post from <Date>' placeholders", async () => {
+    const ctx = testCtx({ [GEMINI]: () => json(geminiAnswer({ hebrew: "אין כרגע פוסטים זמינים" })) });
+    const res = await analyzePost(ctx, "Post from November 25, 2026");
+    expect(res).toMatchObject({ provider: "none", translated: true });
+    expect(ctx.calls).toHaveLength(0);
+  });
+
+  it("rejects refusal output from Gemini rather than accepting hallucinated Hebrew", async () => {
+    const ctx = testCtx(
+      {
+        [GEMINI]: () => json(geminiAnswer({ hebrew: "אין כרגע פוסטים זמינים מתאריך 25 בנובמבר 2026." })),
+      },
+      { geminiFallbackModel: "", webTranslateFallback: false },
+    );
+    const res = await analyzePost(ctx, ENGLISH);
+    expect(res.translated).toBe(false);
+    expect(res.deterministic).toBe(true);
   });
 });
