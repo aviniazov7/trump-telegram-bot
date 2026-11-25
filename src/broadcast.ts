@@ -17,7 +17,7 @@ import { RUN_LEASE_MS } from "./coordinator";
 import { scrub, toHex } from "./log";
 import { buildMediaDigest, buildMessage, translatableText } from "./message";
 import { alertAdmin, checkHeartbeat, recordSourceFailure, recordSuccess } from "./monitor";
-import { advanceCursor, filterNewPosts, mediaDigestId, sendOrder } from "./posts";
+import { advanceCursor, filterNewPosts, hasGap, mediaDigestId, sendOrder } from "./posts";
 import type { Ctx } from "./runtime";
 import { contains, fetchPosts, type Post, pureRepostIds, sameMediaRepostIds } from "./sources";
 import { KvWriteError, type Meta, type Store, type Subscriber } from "./store";
@@ -264,13 +264,21 @@ async function runSteps(ctx: Ctx, store: Store, meta: Meta, persist: () => Promi
     await recordSourceFailure(ctx, store, meta);
     return;
   }
-  if (meta.lastSeen && !contains(posts, meta.lastSeen)) {
-    await alertAdmin(
-      ctx,
-      store,
-      "gap",
-      `⚠️ הפוסט האחרון שנשלח לא נמצא ב-${posts.length} הפוסטים האחרונים — ייתכן שפוסטים הוחמצו. נשלח רק הפוסט החדש ביותר.`,
-    );
+  if (hasGap(posts, meta.lastSeen)) {
+    if (meta.lastGapCursor !== meta.lastSeen) {
+      const sent = await alertAdmin(
+        ctx,
+        store,
+        "gap",
+        `⚠️ הפוסט האחרון שנשלח לא נמצא ב-${posts.length} הפוסטים האחרונים — ייתכן שפוסטים הוחמצו. נשלח רק הפוסט החדש ביותר.`,
+      );
+      if (sent) {
+        meta.lastGapCursor = meta.lastSeen;
+        await persist();
+      }
+    }
+  } else if (meta.lastGapCursor !== undefined) {
+    delete meta.lastGapCursor;
   }
 
   const fresh = filterNewPosts(posts, meta.lastSeen);
@@ -284,13 +292,16 @@ async function runSteps(ctx: Ctx, store: Store, meta: Meta, persist: () => Promi
     ctx.log.info(`Skipping ${skipping.length} pure re-post(s) already covered by the original`);
   for (const post of skipping) if (!meta.sentAhead.includes(post.id)) meta.sentAhead.push(post.id);
   const chronological = fresh.map((p) => p.id);
-  advanceCursor(meta, chronological);
-  // Forget progress on posts that are no longer pending (stale entries).
-  // A media digest id is not a status id, so it is kept until that digest finishes.
-  const digestKey = meta.openDigest.length ? mediaDigestId(meta.openDigest) : "";
-  for (const id of Object.keys(meta.pending)) {
-    if (id === digestKey) continue;
-    if (!chronological.includes(id)) delete meta.pending[id];
+  const cursorCovered = fresh.length > 0 || contains(posts, meta.lastSeen);
+  if (cursorCovered) {
+    advanceCursor(meta, chronological);
+    // Forget progress on posts that are no longer pending (stale entries).
+    // A media digest id is not a status id, so it is kept until that digest finishes.
+    const digestKey = meta.openDigest.length ? mediaDigestId(meta.openDigest) : "";
+    for (const id of Object.keys(meta.pending)) {
+      if (id === digestKey) continue;
+      if (!chronological.includes(id)) delete meta.pending[id];
+    }
   }
 
   const todo = fresh.filter((p) => !meta.sentAhead.includes(p.id));

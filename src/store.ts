@@ -75,6 +75,8 @@ export interface Meta extends Cursor {
    * a post that arrived later (that would deliver the earlier ones twice).
    */
   openDigest: string[];
+  /** Cursor `lastSeen` for which a real gap alert was already sent. */
+  lastGapCursor?: string;
 }
 
 export const emptyMeta = (): Meta => ({

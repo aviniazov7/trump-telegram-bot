@@ -2,6 +2,7 @@
  * Post sources: trumpstruth.org RSS (primary) and the CNN Truth Social archive
  * (fallback, and deep scan when the RSS window doesn't reach last_seen).
  */
+import { hasGap } from "./posts";
 import type { Ctx } from "./runtime";
 import { htmlUnescape, isMeaningfulText, isRepostBoilerplateLine, stripHtml } from "./text";
 
@@ -488,7 +489,7 @@ export async function fetchPosts(ctx: Ctx, lastSeen: string): Promise<Post[]> {
   if (cnnOnly.length) ctx.log.info(`${cnnOnly.length} post(s) seen first in the CNN archive (RSS lagging)`);
 
   const posts = mergePosts(rssPosts, cnnPosts);
-  if (posts.length && (!lastSeen || contains(posts, lastSeen))) return posts;
+  if (posts.length && (!lastSeen || contains(posts, lastSeen) || !hasGap(posts, lastSeen))) return posts;
   if (posts.length)
     ctx.log.warn(`last_seen not in the ${posts.length} newest posts — reading deeper into the CNN archive`);
 

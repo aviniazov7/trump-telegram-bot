@@ -36,6 +36,11 @@ describe("html helpers", () => {
     expect(isMeaningfulText("RT: https://truthsocial.com/x")).toBe(false);
     expect(isMeaningfulText("[No Title] - Post from ...")).toBe(false);
     expect(isMeaningfulText("Video post from October 14, 2026")).toBe(false);
+    expect(isMeaningfulText("Post from November 25, 2026")).toBe(false);
+    expect(isMeaningfulText("Post from Nov 25, 2026.")).toBe(false);
+    expect(isMeaningfulText("Audio post from October 14, 2026")).toBe(false);
+    expect(isMeaningfulText("https://vimeo.com/1249782646/7e27022b54")).toBe(false);
+    expect(isMeaningfulText("Post from Florida: Great crowd!")).toBe(true);
     expect(isMeaningfulText("View video")).toBe(false);
     expect(isMeaningfulText("  ")).toBe(false);
     expect(isMeaningfulText("MAKE AMERICA GREAT AGAIN!")).toBe(true);
@@ -86,6 +91,17 @@ describe("buildMessage", () => {
 
   it("omits the link when there is no URL", () => {
     expect(buildMessage({ ...POST, url: "" }, { hebrew: "x", translated: true })).not.toContain("<a ");
+  });
+
+  it("renders placeholder text as a media/empty notice without translation block", () => {
+    const msg = buildMessage(
+      { ...POST, text: "Post from November 25, 2026" },
+      { hebrew: "should not appear", translated: true },
+    );
+    expect(msg).toContain("פוסט ללא טקסט");
+    expect(msg).not.toContain("Post from November 25, 2026");
+    expect(msg).not.toContain("should not appear");
+    expect(msg).not.toContain("תרגום לעברית");
   });
 });
 
