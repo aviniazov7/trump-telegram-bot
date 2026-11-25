@@ -8,14 +8,51 @@ import type { Post } from "./sources";
  * than the scan window), only the newest post is returned — the safe cap that
  * keeps subscribers from being flooded.
  */
-export function filterNewPosts(posts: Post[], lastSeen: string): Post[] {
-  if (!lastSeen || !posts.some((p) => p.id === lastSeen)) return posts.slice(0, 1);
-  const fresh: Post[] = [];
+export const isNumericId = (id: string): boolean => /^\d+$/.test(id);
+
+function oldestNumericId(posts: Post[]): bigint | null {
+  if (!posts.length || !posts.every((p) => isNumericId(p.id))) return null;
+  let min: bigint | null = null;
   for (const post of posts) {
-    if (post.id === lastSeen) break;
-    fresh.push(post);
+    const id = BigInt(post.id);
+    if (min === null || id < min) min = id;
   }
-  return fresh.reverse();
+  return min;
+}
+
+/**
+ * True when `lastSeen` fell completely behind the scanned window — i.e., even
+ * the oldest post we fetched is still newer than `lastSeen`. False when
+ * `lastSeen` is in `posts`, when the source is lagging behind `lastSeen`, or
+ * when `lastSeen` was deleted inside the window.
+ */
+export function hasGap(posts: Post[], lastSeen: string): boolean {
+  if (!lastSeen || !posts.length) return false;
+  if (posts.some((p) => p.id === lastSeen)) return false;
+  if (isNumericId(lastSeen)) {
+    const oldest = oldestNumericId(posts);
+    if (oldest !== null) return oldest > BigInt(lastSeen);
+  }
+  return true;
+}
+
+export function filterNewPosts(posts: Post[], lastSeen: string): Post[] {
+  if (!posts.length) return [];
+  if (!lastSeen) return posts.slice(0, 1);
+  if (posts.some((p) => p.id === lastSeen)) {
+    const fresh: Post[] = [];
+    for (const post of posts) {
+      if (post.id === lastSeen) break;
+      fresh.push(post);
+    }
+    return fresh.reverse();
+  }
+  if (isNumericId(lastSeen) && posts.every((p) => isNumericId(p.id))) {
+    if (hasGap(posts, lastSeen)) return posts.slice(0, 1);
+    const cursorId = BigInt(lastSeen);
+    return posts.filter((p) => BigInt(p.id) > cursorId).reverse();
+  }
+  return posts.slice(0, 1);
 }
 
 export interface Cursor {
@@ -38,14 +75,19 @@ export function advanceCursor(cursor: Cursor, chronologicalIds: string[], doneId
   if (doneId) done.add(doneId);
   let ids = chronologicalIds;
   const at = ids.indexOf(cursor.lastSeen);
-  if (at >= 0) ids = ids.slice(at + 1);
+  if (at >= 0) {
+    ids = ids.slice(at + 1);
+  } else if (isNumericId(cursor.lastSeen)) {
+    const cur = BigInt(cursor.lastSeen);
+    ids = ids.filter((id) => !isNumericId(id) || BigInt(id) > cur);
+  }
   for (const id of ids) {
     if (!done.has(id)) break;
     cursor.lastSeen = id;
     done.delete(id);
   }
   // Keep only IDs still ahead of the cursor; anything else is stale.
-  cursor.sentAhead = chronologicalIds.filter((id) => done.has(id));
+  cursor.sentAhead = ids.filter((id) => done.has(id));
 }
 
 /**

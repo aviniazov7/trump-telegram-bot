@@ -1,7 +1,7 @@
 /** Telegram message layout (HTML parse mode). */
 import type { Post } from "./sources";
 import { IMPACT_MARKERS, MARKET_CATEGORIES } from "./tagging";
-import { htmlEscape } from "./text";
+import { htmlEscape, isMeaningfulText } from "./text";
 
 const ISRAEL_TIME = new Intl.DateTimeFormat("en-GB", {
   timeZone: "Asia/Jerusalem",
@@ -127,7 +127,7 @@ export function buildMessage(post: Post, parts: MessageParts): string {
   const header = `🇺🇸 <b>טראמפ — פוסט חדש</b>\n🕐 ${formatTimestamp(post.createdAt)}\n\n`;
   const link = post.url ? `\n🔗 <a href="${htmlEscape(post.url)}">לפוסט המקורי</a>` : "";
 
-  if (!translatableText(post)) return `${header}${mediaOnlyLine(post)}\n${link}`;
+  if (!isMeaningfulText(translatableText(post))) return `${header}${mediaOnlyLine(post)}\n${link}`;
 
   const original = [
     post.text ? htmlEscape(post.text) : "",
